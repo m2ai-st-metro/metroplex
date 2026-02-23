@@ -29,12 +29,14 @@ L5 autonomy layer for the ST Metro ecosystem. Closes all three human gates in th
 
 ## Phase 4: Live Deployment
 
-- [ ] Move from `generations/metroplex/` to `projects/metroplex/`
-- [ ] Initialize git repo and push to GitHub org
-- [ ] Recreate venv with proper `python3.12-venv` and install requirements
-- [ ] Run `metroplex.py run-all --cycles 1` (live, single cycle)
-- [ ] Verify Linear issues created, spec generated, build queued
-- [ ] Verify audit log (`data/decisions.log`) has structured entries
+- [x] Moved from `generations/metroplex/` to `projects/metroplex/`
+- [x] Cleaned build artifacts, fresh git repo on `main`
+- [x] Pushed to `m2ai-portfolio/metroplex` (private)
+- [x] Fresh venv, 135 tests passing
+- [x] `run-all --cycles 1` (live) — 0 triage, 0 builds, 2 patches skipped (no ops), 0 errors
+- [x] Audit log (`data/decisions.log`) — structured JSON lines: cycle start/end, patch skip decisions
+- [x] State DB (`data/metroplex.db`) — cycles, gate status, patch applications recorded
+- [ ] **Deferred**: Linear issues + build queueing require scored ideas in IdeaForge (pipeline not yet run)
 
 ## Phase 5: Continuous Operation
 
