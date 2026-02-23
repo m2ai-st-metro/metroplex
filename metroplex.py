@@ -113,7 +113,8 @@ def initialize_components(config: Config):
         cycle_caps=cycle_caps,
         shutdown_handler=shutdown_handler,
         state_db=state_db,
-        audit_logger=audit_logger
+        audit_logger=audit_logger,
+        cycle_sleep_seconds=config.cycle_sleep_seconds
     )
 
     return orchestrator, state_db, circuit_breaker

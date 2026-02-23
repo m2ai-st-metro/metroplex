@@ -1,0 +1,25 @@
+[Unit]
+Description=Metroplex - ST Metro Autonomous Build Layer
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=%h/projects/metroplex/venv/bin/python %h/projects/metroplex/metroplex.py run-all --cycles 0
+WorkingDirectory=%h/projects/metroplex
+EnvironmentFile=-%h/.env.shared
+
+# Shutdown: SIGTERM → ShutdownHandler → finish current cycle + git ops
+KillSignal=SIGTERM
+TimeoutStopSec=90
+
+# Restart on crashes, but not on clean SIGTERM exit
+Restart=on-failure
+RestartSec=30
+
+# Logging to journalctl
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=metroplex
+
+[Install]
+WantedBy=default.target

@@ -40,11 +40,13 @@ L5 autonomy layer for the ST Metro ecosystem. Closes all three human gates in th
 
 ## Phase 5: Continuous Operation
 
-- [ ] Set up cron or systemd timer for `metroplex.py run-all --cycles 0`
-- [ ] Monitor circuit breaker behavior under real failure conditions
-- [ ] Validate per-cycle caps (max 3 approvals, max 5 patches) in production
-- [ ] Confirm SIGTERM graceful shutdown works under systemd
-- [ ] Connect to Sky-Lynx feedback loop for closed-loop observation
+- [x] systemd user service (`deploy/metroplex.service`) + installer (`deploy/install.sh`)
+- [x] `cycle_sleep_seconds` configurable via `METROPLEX_CYCLE_SLEEP_SECONDS` (default 60, warning if < 10)
+- [x] Circuit breaker persistence validated across DB reconnections (file-based DB)
+- [x] Per-cycle caps tested: triage max 3 approvals, patch max 5 per cycle
+- [x] SIGTERM graceful shutdown confirmed via subprocess test
+- [x] Sky-Lynx data contract (`DATA_CONTRACT.md`) — stable read interface for `metroplex.db` and `decisions.log`
+- [x] 12 new tests in `tests/test_continuous.py` + 3 in `tests/test_config.py`
 
 ## Architecture
 

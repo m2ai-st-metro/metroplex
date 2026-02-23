@@ -32,6 +32,10 @@ class TestConfigDefaults:
         config = Config()
         assert config.circuit_breaker_threshold == 3
 
+    def test_default_cycle_sleep_seconds(self):
+        config = Config()
+        assert config.cycle_sleep_seconds == 60
+
     def test_default_build_model(self):
         config = Config()
         assert config.build_model == "opus"
@@ -81,6 +85,11 @@ class TestConfigEnvOverrides:
             config = Config()
             assert config.build_model == "sonnet"
 
+    def test_override_cycle_sleep_seconds(self):
+        with patch.dict(os.environ, {"METROPLEX_CYCLE_SLEEP_SECONDS": "120"}):
+            config = Config()
+            assert config.cycle_sleep_seconds == 120
+
     def test_invalid_int_env_keeps_default(self):
         with patch.dict(os.environ, {"METROPLEX_APPROVE_THRESHOLD": "not_a_number"}):
             config = Config()
@@ -118,6 +127,12 @@ class TestConfigValidation:
 
         warnings = config.validate()
         assert any("between 0 and 100" in w for w in warnings)
+
+    def test_validate_cycle_sleep_below_10(self):
+        config = Config()
+        config.cycle_sleep_seconds = 5
+        warnings = config.validate()
+        assert any("cycle_sleep_seconds" in w for w in warnings)
 
     def test_validate_existing_paths_no_warnings(self, tmp_path):
         db_file = tmp_path / "test.db"

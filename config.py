@@ -36,6 +36,9 @@ class Config:
     # Circuit breaker
     circuit_breaker_threshold: int = field(default=3)
 
+    # Continuous operation
+    cycle_sleep_seconds: int = field(default=60)
+
     def __post_init__(self):
         """Load values from environment variables."""
         self.ideaforge_db = os.environ.get("METROPLEX_IDEAFORGE_DB", self.ideaforge_db)
@@ -71,6 +74,11 @@ class Config:
         except ValueError:
             pass
 
+        try:
+            self.cycle_sleep_seconds = int(os.environ.get("METROPLEX_CYCLE_SLEEP_SECONDS", self.cycle_sleep_seconds))
+        except ValueError:
+            pass
+
     def validate(self) -> list[str]:
         """
         Validate configuration settings.
@@ -102,5 +110,8 @@ class Config:
 
         if not (0 <= self.reject_threshold <= 100):
             warnings.append(f"reject_threshold ({self.reject_threshold}) must be between 0 and 100")
+
+        if self.cycle_sleep_seconds < 10:
+            warnings.append(f"cycle_sleep_seconds ({self.cycle_sleep_seconds}) is below 10 — may cause excessive resource usage")
 
         return warnings
