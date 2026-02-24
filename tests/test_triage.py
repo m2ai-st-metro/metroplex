@@ -126,11 +126,11 @@ def test_triage_gate_basic_decision_logic(
     """
     # Create IdeaForge DB with test ideas
     ideas_data = [
-        (1, "High Score Idea", 9.0, "scored"),     # 90 -> approve
-        (2, "Good Score Idea", 7.5, "scored"),     # 75 -> approve
-        (3, "Medium Score Idea", 5.0, "scored"),   # 50 -> defer
-        (4, "Low Score Idea", 3.5, "scored"),      # 35 -> reject
-        (5, "Very Low Score Idea", 2.0, "scored"), # 20 -> reject
+        (1, "High Score Idea", 9.0, "classified"),     # 90 -> approve
+        (2, "Good Score Idea", 7.5, "classified"),     # 75 -> approve
+        (3, "Medium Score Idea", 5.0, "classified"),   # 50 -> defer
+        (4, "Low Score Idea", 3.5, "classified"),      # 35 -> reject
+        (5, "Very Low Score Idea", 2.0, "classified"), # 20 -> reject
     ]
     db_path = create_ideaforge_db(ideas_data)
 
@@ -201,11 +201,11 @@ def test_triage_gate_per_cycle_cap(
     """
     # Create IdeaForge DB with 5 ideas all scoring 8.0 (scaled = 80)
     ideas_data = [
-        (1, "Idea 1", 8.0, "scored"),
-        (2, "Idea 2", 8.0, "scored"),
-        (3, "Idea 3", 8.0, "scored"),
-        (4, "Idea 4", 8.0, "scored"),
-        (5, "Idea 5", 8.0, "scored"),
+        (1, "Idea 1", 8.0, "classified"),
+        (2, "Idea 2", 8.0, "classified"),
+        (3, "Idea 3", 8.0, "classified"),
+        (4, "Idea 4", 8.0, "classified"),
+        (5, "Idea 5", 8.0, "classified"),
     ]
     db_path = create_ideaforge_db(ideas_data)
 
@@ -291,8 +291,8 @@ def test_triage_gate_dry_run_no_db_write(
     """
     # Create IdeaForge DB with test ideas
     ideas_data = [
-        (1, "Test Idea 1", 8.0, "scored"),
-        (2, "Test Idea 2", 3.0, "scored"),
+        (1, "Test Idea 1", 8.0, "classified"),
+        (2, "Test Idea 2", 3.0, "classified"),
     ]
     db_path = create_ideaforge_db(ideas_data)
 
@@ -348,8 +348,8 @@ def test_triage_gate_non_dry_run_writes_to_db(
     """
     # Create IdeaForge DB with test ideas
     ideas_data = [
-        (1, "Test Idea 1", 8.0, "scored"),
-        (2, "Test Idea 2", 3.0, "scored"),
+        (1, "Test Idea 1", 8.0, "classified"),
+        (2, "Test Idea 2", 3.0, "classified"),
     ]
     db_path = create_ideaforge_db(ideas_data)
 
@@ -440,10 +440,10 @@ def test_triage_gate_score_scaling(
     """
     # Create IdeaForge DB with various scores
     ideas_data = [
-        (1, "Score 10.0", 10.0, "scored"),  # -> 100.0
-        (2, "Score 5.0", 5.0, "scored"),     # -> 50.0
-        (3, "Score 0.0", 0.0, "scored"),     # -> 0.0
-        (4, "Score 7.25", 7.25, "scored"),   # -> 72.5
+        (1, "Score 10.0", 10.0, "classified"),  # -> 100.0
+        (2, "Score 5.0", 5.0, "classified"),     # -> 50.0
+        (3, "Score 0.0", 0.0, "classified"),     # -> 0.0
+        (4, "Score 7.25", 7.25, "classified"),   # -> 72.5
     ]
     db_path = create_ideaforge_db(ideas_data)
 
@@ -489,7 +489,7 @@ def test_triage_gate_format_decision(
     Test _format_decision method output format.
     """
     # Create minimal IdeaForge DB
-    ideas_data = [(1, "Test Idea", 8.0, "scored")]
+    ideas_data = [(1, "Test Idea", 8.0, "classified")]
     db_path = create_ideaforge_db(ideas_data)
 
     try:
@@ -530,10 +530,10 @@ def test_triage_gate_boundary_conditions(
     # Create IdeaForge DB with boundary scores
     # approve_threshold=70, reject_threshold=40
     ideas_data = [
-        (1, "Exactly 70", 7.0, "scored"),   # 70.0 -> approve (>=)
-        (2, "Just below 70", 6.9, "scored"), # 69.0 -> defer
-        (3, "Exactly 40", 4.0, "scored"),   # 40.0 -> defer (not <)
-        (4, "Just below 40", 3.9, "scored"), # 39.0 -> reject (<)
+        (1, "Exactly 70", 7.0, "classified"),   # 70.0 -> approve (>=)
+        (2, "Just below 70", 6.9, "classified"), # 69.0 -> defer
+        (3, "Exactly 40", 4.0, "classified"),   # 40.0 -> defer (not <)
+        (4, "Just below 40", 3.9, "classified"), # 39.0 -> reject (<)
     ]
     db_path = create_ideaforge_db(ideas_data)
 

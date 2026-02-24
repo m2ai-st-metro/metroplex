@@ -42,11 +42,11 @@ def ideaforge_test_db():
     # Insert test ideas with different scores
     test_ideas = [
         (1, "AI Task Scheduler", "AI-powered task scheduling", "Users struggle with scheduling",
-         "Busy professionals", 8.5, 9.0, 8.0, 8.5, 9.0, 7.5, "tool", 15, "scored"),
+         "Busy professionals", 8.5, 9.0, 8.0, 8.5, 9.0, 7.5, "tool", 15, "classified"),
         (2, "Code Review Bot", "Automated code review assistant", "Manual reviews are slow",
-         "Software teams", 7.2, 7.5, 7.0, 7.2, 7.0, 7.0, "agent", 10, "scored"),
+         "Software teams", 7.2, 7.5, 7.0, 7.2, 7.0, 7.0, "agent", 10, "classified"),
         (3, "Meeting Summarizer", "AI meeting summary generator", "Notes are incomplete",
-         "Remote workers", 9.1, 9.5, 9.0, 8.5, 9.0, 8.0, "product", 20, "scored"),
+         "Remote workers", 9.1, 9.5, 9.0, 8.5, 9.0, 8.0, "product", 20, "classified"),
         (4, "Unscored Idea", "This idea has no score", "Some problem",
          "Some audience", None, None, None, None, None, None, "tool", 5, "draft"),
         (5, "Draft Idea", "This idea is not scored yet", "Another problem",
@@ -100,7 +100,7 @@ def test_ideaforge_get_unprocessed_ideas(ideaforge_test_db):
 
     ideas = reader.get_unprocessed_ideas()
 
-    # Should return only scored ideas with non-null weighted_score
+    # Should return only classified ideas with non-null weighted_score
     assert len(ideas) == 3
 
     # Should be sorted by weighted_score DESC
@@ -122,7 +122,7 @@ def test_ideaforge_get_unprocessed_ideas(ideaforge_test_db):
     assert first_idea["title"] == "Meeting Summarizer"
     assert first_idea["artifact_type"] == "product"
     assert first_idea["signal_count"] == 20
-    assert first_idea["status"] == "scored"
+    assert first_idea["status"] == "classified"
 
     reader.close()
 

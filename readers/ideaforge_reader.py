@@ -47,10 +47,11 @@ class IdeaForgeReader:
 
     def get_unprocessed_ideas(self) -> list[dict]:
         """
-        Get all scored ideas ready for processing.
+        Get classified ideas ready for triage.
 
-        Returns ideas where status = 'scored' AND weighted_score IS NOT NULL.
-        Results sorted by weighted_score DESC (highest scores first).
+        Returns ideas where status = 'classified' AND weighted_score IS NOT NULL.
+        These have passed through IdeaForge's full pipeline (score + classify)
+        and were not dismissed. Results sorted by weighted_score DESC.
 
         Returns:
             List of idea dictionaries with fields:
@@ -89,7 +90,7 @@ class IdeaForgeReader:
                 signal_count,
                 status
             FROM ideas
-            WHERE status = 'scored'
+            WHERE status = 'classified'
                 AND weighted_score IS NOT NULL
             ORDER BY weighted_score DESC
         """)
