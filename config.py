@@ -1,10 +1,20 @@
 """
 Metroplex Configuration
 Loads all settings from environment variables with fallback defaults.
+Sources .env file if present in project root.
 """
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
+
+# Load .env from project root if it exists
+_env_file = Path(__file__).parent / ".env"
+if _env_file.exists():
+    for line in _env_file.read_text().splitlines():
+        line = line.strip()
+        if line and not line.startswith("#") and "=" in line:
+            key, _, value = line.partition("=")
+            os.environ.setdefault(key.strip(), value.strip())
 
 
 @dataclass
