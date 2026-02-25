@@ -113,7 +113,6 @@ class CycleOrchestrator:
         # Start cycle
         cycle_result = self.state_db.start_cycle(cycle_id)
         self.audit_logger.log_cycle_start(cycle_id)
-        self.notifier.notify(f"Metroplex cycle {cycle_id} started")
 
         triage_count = 0
         build_count = 0
@@ -201,11 +200,12 @@ class CycleOrchestrator:
         self.state_db.end_cycle(cycle_id, triage_count, build_count, patch_count, errors)
         self.audit_logger.log_cycle_end(cycle_id, triage_count, build_count, patch_count, errors)
 
-        # Cycle summary notification
-        error_text = f", {len(errors)} errors" if errors else ""
-        self.notifier.notify(
-            f"Cycle {cycle_id} complete: {triage_count} triaged, {build_count} built, {patch_count} patched{error_text}"
-        )
+        # Only notify on cycles with actual activity or errors (suppress empty cycle noise)
+        if errors or build_count > 0:
+            error_text = f", {len(errors)} errors" if errors else ""
+            self.notifier.notify(
+                f"Metroplex: {triage_count} triaged, {build_count} built, {patch_count} patched{error_text}"
+            )
 
         # Update cycle result
         cycle_result.completed_at = datetime.now()
