@@ -16,6 +16,7 @@ from gates.triage import TriageGate
 from gates.build import SpecGenerator, BuildOrchestrator
 from gates.patcher import PatchGate
 from orchestrator import CycleOrchestrator
+from notifier import create_notifier
 from readers.ideaforge_reader import IdeaForgeReader
 from readers.stfactory_reader import STFactoryReader
 
@@ -103,6 +104,9 @@ def initialize_components(config: Config):
         audit_logger=audit_logger
     )
 
+    # Initialize notifier
+    notifier = create_notifier(config.telegram_bot_token, config.telegram_chat_id)
+
     # Initialize orchestrator
     orchestrator = CycleOrchestrator(
         config=config,
@@ -114,7 +118,8 @@ def initialize_components(config: Config):
         shutdown_handler=shutdown_handler,
         state_db=state_db,
         audit_logger=audit_logger,
-        cycle_sleep_seconds=config.cycle_sleep_seconds
+        cycle_sleep_seconds=config.cycle_sleep_seconds,
+        notifier=notifier
     )
 
     return orchestrator, state_db, circuit_breaker
@@ -322,6 +327,48 @@ def cmd_run_all(args, config: Config):
         state_db.close()
 
 
+def cmd_queue(args, config: Config):
+    """Show priority queue contents."""
+    state_db = StateDB()
+    state_db.init_db()
+
+    try:
+        summary = state_db.get_queue_summary()
+
+        print(f"{'='*60}")
+        print("PRIORITY QUEUE")
+        print(f"{'='*60}\n")
+
+        print(f"Total items: {summary.get('total', 0)}")
+        for s in ("pending", "dispatched", "completed", "failed"):
+            if summary.get(s, 0) > 0:
+                print(f"  {s.capitalize()}: {summary[s]}")
+
+        # Show pending items
+        state_db.connect()
+        cursor = state_db.conn.cursor()
+        cursor.execute("""
+            SELECT id, source, source_id, title, priority_score, status, created_at
+            FROM priority_queue
+            ORDER BY priority_score DESC
+            LIMIT 20
+        """)
+        rows = cursor.fetchall()
+
+        if rows:
+            print(f"\nAll items (by priority):")
+            for row in rows:
+                status_icon = {"pending": " ", "dispatched": "~", "completed": "+", "failed": "x"}.get(row["status"], "?")
+                print(f"  [{status_icon}] #{row['id']} [{row['source']}:{row['source_id']}] score={row['priority_score']:.1f} {row['title']}")
+
+        return 0
+    except Exception as e:
+        print(f"ERROR: {e}")
+        return 1
+    finally:
+        state_db.close()
+
+
 def cmd_status(args, config: Config):
     """
     Show current system status.
@@ -352,6 +399,25 @@ def cmd_status(args, config: Config):
 
         # Pending items
         print(f"\nPending Builds: {status['pending_builds']}")
+
+        # Priority queue
+        queue = status.get("priority_queue", {})
+        if queue:
+            print(f"\nPriority Queue:")
+            print(f"  Total: {queue.get('total', 0)}")
+            for s in ("pending", "dispatched", "completed", "failed"):
+                if queue.get(s, 0) > 0:
+                    print(f"  {s.capitalize()}: {queue[s]}")
+
+        # Runner status
+        runner = status.get("runner_active", False)
+        print(f"\nYCE Runner: {'ACTIVE' if runner else 'idle'}")
+
+        # Schedule
+        sched = status.get("schedule", {})
+        if sched:
+            in_window = "YES" if sched.get("currently_in_window") else "NO"
+            print(f"\nSchedule: {sched.get('start', 0)}:00-{sched.get('end', 24)}:00, days={sched.get('active_days', 'all')}, in_window={in_window}")
 
         # Recent cycles
         print(f"\nRecent Cycles ({len(status['recent_cycles'])}):")
@@ -437,6 +503,9 @@ def main():
     run_all_parser.add_argument("--dry-run", action="store_true", help="Run in dry-run mode")
     run_all_parser.add_argument("--cycles", type=int, default=1, help="Number of cycles (0=infinite)")
 
+    # queue command
+    queue_parser = subparsers.add_parser("queue", help="Show priority queue contents")
+
     # status command
     status_parser = subparsers.add_parser("status", help="Show current system status")
 
@@ -468,6 +537,8 @@ def main():
         sys.exit(cmd_patch(args, config))
     elif args.command == "run-all":
         sys.exit(cmd_run_all(args, config))
+    elif args.command == "queue":
+        sys.exit(cmd_queue(args, config))
     elif args.command == "status":
         sys.exit(cmd_status(args, config))
     elif args.command == "reset":

@@ -1,12 +1,14 @@
 """
 Triage Gate - Gate 1
 Reads scored ideas from IdeaForge, applies threshold-based decisions.
+Approved ideas are enqueued into the priority queue for build dispatch.
 """
+import json
 from datetime import datetime
 from typing import TYPE_CHECKING
 
 from config import Config
-from models import TriageDecision
+from models import TriageDecision, PriorityItem
 from db import StateDB
 from audit import AuditLogger
 from readers.ideaforge_reader import IdeaForgeReader
@@ -102,6 +104,19 @@ class TriageGate:
             else:
                 # Record decision in state DB
                 self.state_db.record_triage_decision(triage_decision)
+
+                # Enqueue approved ideas into priority queue
+                if decision == "approve":
+                    priority_score = scaled_score * self.config.ideaforge_weight
+                    item = PriorityItem(
+                        source="ideaforge",
+                        source_id=str(idea["id"]),
+                        title=idea["title"],
+                        description=idea.get("description", idea["title"]),
+                        priority_score=priority_score,
+                        idea_data=json.dumps(idea, default=str),
+                    )
+                    self.state_db.enqueue_item(item)
 
                 # Log decision in audit log
                 self.audit_logger.log_decision(

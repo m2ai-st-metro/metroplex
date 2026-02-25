@@ -56,3 +56,18 @@ class GateStatus(BaseModel):
     consecutive_failures: int = 0
     halted: bool = False
     last_error: str | None = None
+
+
+class PriorityItem(BaseModel):
+    """Item in the Metroplex priority queue. Represents a task from any input stream."""
+    id: int | None = None  # DB-assigned
+    source: Literal["ideaforge", "skylynx", "linear"]
+    source_id: str  # ID within the source system (e.g. IdeaForge idea ID)
+    title: str
+    description: str
+    priority_score: float  # Combined ranking score
+    status: Literal["pending", "dispatched", "completed", "failed"] = "pending"
+    idea_data: str = ""  # JSON string with full data needed for spec generation
+    created_at: datetime = Field(default_factory=datetime.now)
+    dispatched_at: datetime | None = None
+    completed_at: datetime | None = None

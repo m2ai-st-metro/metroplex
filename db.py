@@ -8,7 +8,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-from models import TriageDecision, BuildJob, PatchApplication, CycleResult, GateStatus
+from models import TriageDecision, BuildJob, PatchApplication, CycleResult, GateStatus, PriorityItem
 
 
 class StateDB:
@@ -107,11 +107,31 @@ class StateDB:
             )
         """)
 
+        # Priority queue table
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS priority_queue (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source TEXT NOT NULL CHECK(source IN ('ideaforge', 'skylynx', 'linear')),
+                source_id TEXT NOT NULL,
+                title TEXT NOT NULL,
+                description TEXT NOT NULL DEFAULT '',
+                priority_score REAL NOT NULL DEFAULT 0.0,
+                status TEXT NOT NULL CHECK(status IN ('pending', 'dispatched', 'completed', 'failed')) DEFAULT 'pending',
+                idea_data TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL,
+                dispatched_at TEXT,
+                completed_at TEXT
+            )
+        """)
+
         # Create indexes
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_triage_decisions_idea ON triage_decisions(idea_id)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_triage_decisions_decision ON triage_decisions(decision)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_build_jobs_status ON build_jobs(status)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_cycles_started ON cycles(started_at)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_priority_queue_status ON priority_queue(status)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_priority_queue_score ON priority_queue(priority_score DESC)")
+        cursor.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_priority_queue_source ON priority_queue(source, source_id)")
 
         # Initialize gate status for all gates
         for gate in ["triage", "build", "patch"]:
@@ -262,3 +282,88 @@ class StateDB:
         ))
 
         self.conn.commit()
+
+    # --- Priority Queue ---
+
+    def enqueue_item(self, item: PriorityItem) -> int:
+        """Add an item to the priority queue. Returns the row ID. Skips duplicates."""
+        self.connect()
+        cursor = self.conn.cursor()
+
+        try:
+            cursor.execute("""
+                INSERT INTO priority_queue (source, source_id, title, description, priority_score, status, idea_data, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                item.source,
+                item.source_id,
+                item.title,
+                item.description,
+                item.priority_score,
+                item.status,
+                item.idea_data,
+                item.created_at.isoformat()
+            ))
+            self.conn.commit()
+            return cursor.lastrowid
+        except sqlite3.IntegrityError:
+            # Duplicate (source, source_id) -- skip silently
+            return 0
+
+    def get_next_pending(self) -> PriorityItem | None:
+        """Get the highest-priority pending item."""
+        self.connect()
+        cursor = self.conn.cursor()
+
+        cursor.execute("""
+            SELECT * FROM priority_queue
+            WHERE status = 'pending'
+            ORDER BY priority_score DESC
+            LIMIT 1
+        """)
+        row = cursor.fetchone()
+
+        if row:
+            return PriorityItem(
+                id=row["id"],
+                source=row["source"],
+                source_id=row["source_id"],
+                title=row["title"],
+                description=row["description"],
+                priority_score=row["priority_score"],
+                status=row["status"],
+                idea_data=row["idea_data"],
+                created_at=datetime.fromisoformat(row["created_at"]),
+                dispatched_at=datetime.fromisoformat(row["dispatched_at"]) if row["dispatched_at"] else None,
+                completed_at=datetime.fromisoformat(row["completed_at"]) if row["completed_at"] else None,
+            )
+        return None
+
+    def update_item_status(self, item_id: int, status: str, timestamp_field: str | None = None):
+        """Update a priority queue item's status and optional timestamp."""
+        self.connect()
+        cursor = self.conn.cursor()
+
+        if timestamp_field in ("dispatched_at", "completed_at"):
+            cursor.execute(f"""
+                UPDATE priority_queue SET status = ?, {timestamp_field} = ? WHERE id = ?
+            """, (status, datetime.now().isoformat(), item_id))
+        else:
+            cursor.execute("UPDATE priority_queue SET status = ? WHERE id = ?", (status, item_id))
+
+        self.conn.commit()
+
+    def get_queue_summary(self) -> dict:
+        """Get priority queue summary counts by status."""
+        self.connect()
+        cursor = self.conn.cursor()
+
+        cursor.execute("""
+            SELECT status, COUNT(*) as count FROM priority_queue GROUP BY status
+        """)
+        summary = {row["status"]: row["count"] for row in cursor.fetchall()}
+
+        cursor.execute("SELECT COUNT(*) as total FROM priority_queue")
+        summary["total"] = cursor.fetchone()["total"]
+
+        return summary

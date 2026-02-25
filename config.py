@@ -39,6 +39,20 @@ class Config:
     # Continuous operation
     cycle_sleep_seconds: int = field(default=60)
 
+    # Priority queue source weights
+    ideaforge_weight: float = field(default=1.0)
+    skylynx_weight: float = field(default=1.5)
+    linear_weight: float = field(default=2.0)
+
+    # Telegram notifications (optional)
+    telegram_bot_token: str = field(default="")
+    telegram_chat_id: str = field(default="")
+
+    # Schedule windows (24h clock, 0-23)
+    schedule_start: int = field(default=0)    # midnight
+    schedule_end: int = field(default=24)     # 24 = always on
+    active_days: str = field(default="0,1,2,3,4,5,6")  # 0=Mon, 6=Sun
+
     def __post_init__(self):
         """Load values from environment variables."""
         self.ideaforge_db = os.environ.get("METROPLEX_IDEAFORGE_DB", self.ideaforge_db)
@@ -78,6 +92,35 @@ class Config:
             self.cycle_sleep_seconds = int(os.environ.get("METROPLEX_CYCLE_SLEEP_SECONDS", self.cycle_sleep_seconds))
         except ValueError:
             pass
+
+        # Priority queue weights
+        try:
+            self.ideaforge_weight = float(os.environ.get("METROPLEX_IDEAFORGE_WEIGHT", self.ideaforge_weight))
+        except ValueError:
+            pass
+        try:
+            self.skylynx_weight = float(os.environ.get("METROPLEX_SKYLYNX_WEIGHT", self.skylynx_weight))
+        except ValueError:
+            pass
+        try:
+            self.linear_weight = float(os.environ.get("METROPLEX_LINEAR_WEIGHT", self.linear_weight))
+        except ValueError:
+            pass
+
+        # Telegram
+        self.telegram_bot_token = os.environ.get("METROPLEX_TELEGRAM_BOT_TOKEN", self.telegram_bot_token)
+        self.telegram_chat_id = os.environ.get("METROPLEX_TELEGRAM_CHAT_ID", self.telegram_chat_id)
+
+        # Schedule
+        try:
+            self.schedule_start = int(os.environ.get("METROPLEX_SCHEDULE_START", self.schedule_start))
+        except ValueError:
+            pass
+        try:
+            self.schedule_end = int(os.environ.get("METROPLEX_SCHEDULE_END", self.schedule_end))
+        except ValueError:
+            pass
+        self.active_days = os.environ.get("METROPLEX_ACTIVE_DAYS", self.active_days)
 
     def validate(self) -> list[str]:
         """

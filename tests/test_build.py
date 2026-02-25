@@ -568,8 +568,9 @@ class TestBuildOrchestrator:
         """Test run() with multiple approved ideas."""
         approved_ideas = [tool_idea, agent_idea]
 
-        with patch('subprocess.run') as mock_run:
-            # Mock successful subprocess calls
+        with patch('subprocess.run') as mock_run, \
+             patch.object(orchestrator, 'start_queue_background', return_value=True) as mock_start_bg:
+            # Mock successful subprocess calls (for queue_build "add" commands)
             mock_result = Mock()
             mock_result.returncode = 0
             mock_result.stdout = ""
@@ -589,9 +590,8 @@ class TestBuildOrchestrator:
             # Verify both jobs have queued status
             assert all(j.status == "queued" for j in jobs)
 
-            # Verify start_queue was called (at least once for "start" command)
-            start_calls = [call for call in mock_run.call_args_list if "start" in str(call)]
-            assert len(start_calls) > 0
+            # Verify start_queue_background was called
+            mock_start_bg.assert_called_once()
 
     def test_run_dry_run(self, orchestrator, mock_spec_generator, tool_idea, capsys):
         """Test run() with dry_run=True."""

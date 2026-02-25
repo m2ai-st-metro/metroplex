@@ -95,7 +95,7 @@ def mock_triage_gate():
 def mock_build_orchestrator():
     """Create mock build orchestrator."""
     orch = Mock(spec=BuildOrchestrator)
-    orch.run.return_value = [
+    build_jobs = [
         BuildJob(
             idea_id=1,
             title="Test Idea",
@@ -105,6 +105,9 @@ def mock_build_orchestrator():
             queued_at=datetime.now()
         )
     ]
+    orch.run.return_value = build_jobs
+    orch.run_from_queue.return_value = build_jobs
+    orch.is_runner_active.return_value = False
     return orch
 
 
@@ -162,7 +165,7 @@ class TestCycleOrchestrator:
 
         # Verify all gates were called
         mock_triage_gate.run.assert_called_once_with(dry_run=True)
-        mock_build_orchestrator.run.assert_called_once()
+        mock_build_orchestrator.run_from_queue.assert_called_once()
         mock_patch_gate.run.assert_called_once_with(dry_run=True)
 
         # Verify result

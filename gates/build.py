@@ -2,7 +2,11 @@
 Build Gate - Gate 2
 Generates yce-harness app spec files from approved ideas using Jinja2 templates.
 Orchestrates build queue via queue_runner.py subprocess calls.
+Supports background dispatch (Popen) and status polling.
 """
+import json
+import os
+import signal
 import sys
 import subprocess
 from pathlib import Path
@@ -11,9 +15,11 @@ from datetime import datetime
 from jinja2 import Environment, FileSystemLoader, Template, TemplateNotFound
 
 from config import Config
-from models import BuildJob
+from models import BuildJob, PriorityItem
 from db import StateDB
 from audit import AuditLogger
+
+RUNNER_PID_FILE = Path("data/runner.pid")
 
 
 class SpecGenerator:
@@ -47,21 +53,6 @@ class SpecGenerator:
     def generate_spec(self, idea: dict, output_dir: Path) -> Path:
         """
         Generate app spec file from idea data.
-
-        Process:
-        1. Load spec_templates/app_spec_template.md as Jinja2 template
-        2. Render with idea data: title, description, problem_statement,
-           target_audience, artifact_type, tech_stack hints
-        3. Write rendered spec to output_dir / f"app_spec_{idea['id']}.txt"
-        4. Return the output path
-
-        Template variables:
-        - title: Idea title
-        - description: Idea description
-        - problem_statement: Problem being solved
-        - target_audience: Who the app is for
-        - artifact_type: Type of artifact (tool, agent, product)
-        - tech_stack: Additional tech stack hints (optional)
 
         Args:
             idea: Idea dictionary with required fields:
@@ -141,14 +132,7 @@ class BuildOrchestrator:
 
     def queue_build(self, idea: dict, spec_path: Path, dry_run: bool = False) -> BuildJob | None:
         """
-        Queue a build job via queue_runner.py.
-
-        Process:
-        1. Build command: [sys.executable, queue_runner_path, "add", str(spec_path), "--id", job_id, "--model", config.build_model]
-        2. If dry_run: print command, return None
-        3. Run subprocess with capture_output=True, text=True, timeout=30
-        4. Check returncode. If 0: record BuildJob with status="queued". If non-zero: record as "failed", log error.
-        5. Return BuildJob
+        Queue a build job via queue_runner.py add.
 
         Args:
             idea: Idea dictionary with id and title
@@ -185,7 +169,6 @@ class BuildOrchestrator:
             queued_at = datetime.now()
 
             if result.returncode == 0:
-                # Success - record as queued
                 job = BuildJob(
                     idea_id=idea["id"],
                     title=idea["title"],
@@ -194,7 +177,6 @@ class BuildOrchestrator:
                     status="queued",
                     queued_at=queued_at
                 )
-
                 self.state_db.record_build_job(job)
                 self.audit_logger.log_decision(
                     gate="build",
@@ -206,10 +188,8 @@ class BuildOrchestrator:
                         "status": "queued"
                     }
                 )
-
                 return job
             else:
-                # Failed - record as failed
                 error_msg = result.stderr.strip() if result.stderr else "Unknown error"
                 job = BuildJob(
                     idea_id=idea["id"],
@@ -219,7 +199,6 @@ class BuildOrchestrator:
                     status="failed",
                     queued_at=queued_at
                 )
-
                 self.state_db.record_build_job(job)
                 self.audit_logger.log_error(
                     gate="build",
@@ -231,7 +210,6 @@ class BuildOrchestrator:
                         "stderr": error_msg
                     }
                 )
-
                 return job
 
         except subprocess.TimeoutExpired:
@@ -244,14 +222,8 @@ class BuildOrchestrator:
                 status="failed",
                 queued_at=datetime.now()
             )
-
             self.state_db.record_build_job(job)
-            self.audit_logger.log_error(
-                gate="build",
-                error=error_msg,
-                details={"idea_id": idea["id"], "job_id": job_id}
-            )
-
+            self.audit_logger.log_error(gate="build", error=error_msg, details={"idea_id": idea["id"], "job_id": job_id})
             return job
 
         except Exception as e:
@@ -264,25 +236,84 @@ class BuildOrchestrator:
                 status="failed",
                 queued_at=datetime.now()
             )
-
             self.state_db.record_build_job(job)
-            self.audit_logger.log_error(
-                gate="build",
-                error=error_msg,
-                details={"idea_id": idea["id"], "job_id": job_id}
+            self.audit_logger.log_error(gate="build", error=error_msg, details={"idea_id": idea["id"], "job_id": job_id})
+            return job
+
+    def is_runner_active(self) -> bool:
+        """Check if a queue_runner process is still running from a previous dispatch."""
+        if not RUNNER_PID_FILE.exists():
+            return False
+        try:
+            pid = int(RUNNER_PID_FILE.read_text().strip())
+            os.kill(pid, 0)  # Signal 0 = check if process exists
+            return True
+        except (ValueError, ProcessLookupError, PermissionError):
+            # Stale PID file -- clean up
+            RUNNER_PID_FILE.unlink(missing_ok=True)
+            return False
+
+    def start_queue_background(self, dry_run: bool = False) -> bool:
+        """
+        Start queue_runner.py as a background process (non-blocking).
+        Stores PID in data/runner.pid for later monitoring.
+
+        Args:
+            dry_run: If True, print command without executing
+
+        Returns:
+            True if started, False otherwise
+        """
+        command = [
+            sys.executable,
+            str(self.queue_runner_path),
+            "start"
+        ]
+
+        if dry_run:
+            print(f"[DRY RUN] Would execute (background): {' '.join(command)}")
+            return True
+
+        if self.is_runner_active():
+            print("Queue runner already active, skipping start")
+            return True
+
+        try:
+            log_path = Path("data/runner.log")
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            log_file = open(log_path, "a")
+
+            proc = subprocess.Popen(
+                command,
+                stdout=log_file,
+                stderr=subprocess.STDOUT,
+                cwd=str(Path(self.config.yce_dir)),
+                start_new_session=True,  # Detach from parent process group
             )
 
-            return job
+            # Write PID for later monitoring
+            RUNNER_PID_FILE.parent.mkdir(parents=True, exist_ok=True)
+            RUNNER_PID_FILE.write_text(str(proc.pid))
+
+            self.audit_logger.log_decision(
+                gate="build",
+                action="start_queue_background",
+                details={"pid": proc.pid, "log": str(log_path)}
+            )
+            print(f"Queue runner started (PID {proc.pid})")
+            return True
+
+        except Exception as e:
+            self.audit_logger.log_error(
+                gate="build",
+                error=f"Failed to start queue runner: {str(e)}",
+                details={}
+            )
+            return False
 
     def start_queue(self, dry_run: bool = False) -> bool:
         """
-        Start the queue runner.
-
-        Process:
-        1. Build command: [sys.executable, queue_runner_path, "start"]
-        2. If dry_run: print command, return True
-        3. Run subprocess (this is long-running — use timeout=None or very large timeout)
-        4. Return True if returncode==0
+        Start the queue runner (blocking, kept for backward compatibility / CLI use).
 
         Args:
             dry_run: If True, print command without executing
@@ -334,12 +365,7 @@ class BuildOrchestrator:
 
     def check_status(self) -> dict:
         """
-        Check queue status.
-
-        Process:
-        1. Run [sys.executable, queue_runner_path, "status", "--json"]
-        2. Parse JSON output
-        3. Return parsed dict
+        Check queue status via queue_runner.py status --json.
 
         Returns:
             Parsed status dict, or empty dict on error
@@ -360,7 +386,6 @@ class BuildOrchestrator:
             )
 
             if result.returncode == 0:
-                import json
                 return json.loads(result.stdout)
             else:
                 self.audit_logger.log_error(
@@ -378,14 +403,43 @@ class BuildOrchestrator:
             )
             return {}
 
+    def poll_and_sync_status(self) -> dict:
+        """
+        Poll queue_runner status and sync completed/failed jobs back to metroplex DB.
+
+        Returns:
+            dict with keys: running (bool), completed (list), failed (list)
+        """
+        result = {"running": False, "completed": [], "failed": []}
+
+        status = self.check_status()
+        if not status or "jobs" not in status:
+            # Runner not reachable or empty queue
+            if not self.is_runner_active():
+                RUNNER_PID_FILE.unlink(missing_ok=True)
+            return result
+
+        for job_data in status["jobs"]:
+            job_status = job_data.get("status", "")
+            job_id = job_data.get("id", "")
+
+            if job_status == "running":
+                result["running"] = True
+            elif job_status == "completed":
+                result["completed"].append(job_id)
+            elif job_status == "failed":
+                result["failed"].append(job_id)
+
+        # Clean up PID file if runner is no longer active
+        if not result["running"] and not self.is_runner_active():
+            RUNNER_PID_FILE.unlink(missing_ok=True)
+
+        return result
+
     def run(self, approved_ideas: list[dict], dry_run: bool = False) -> list[BuildJob]:
         """
-        Run build orchestration for all approved ideas.
-
-        Process:
-        1. For each approved idea: generate spec, queue build
-        2. If not dry_run and at least one job queued: start queue
-        3. Return list of BuildJob results
+        Run build orchestration for approved ideas.
+        Generates specs, queues builds, and starts runner as background process.
 
         Args:
             approved_ideas: List of approved idea dictionaries
@@ -396,19 +450,14 @@ class BuildOrchestrator:
         """
         jobs = []
 
-        # Check if spec generator is available
         if self.spec_generator is None:
             print("Warning: Spec generator not initialized (template directory not found)")
             return []
 
-        # Generate specs and queue builds
         for idea in approved_ideas:
             try:
-                # Generate spec (assuming output_dir is data/specs)
                 output_dir = Path("data/specs")
                 spec_path = self.spec_generator.generate_spec(idea, output_dir)
-
-                # Queue build
                 job = self.queue_build(idea, spec_path, dry_run=dry_run)
                 if job:
                     jobs.append(job)
@@ -420,8 +469,6 @@ class BuildOrchestrator:
                     error=error_msg,
                     details={"idea_id": idea.get("id")}
                 )
-
-                # Record failed job even if spec generation failed
                 job = BuildJob(
                     idea_id=idea.get("id", 0),
                     title=idea.get("title", "Unknown"),
@@ -433,10 +480,62 @@ class BuildOrchestrator:
                 self.state_db.record_build_job(job)
                 jobs.append(job)
 
-        # Start queue if any jobs were queued
+        # Start queue as background process (non-blocking)
         if not dry_run and jobs:
             queued_jobs = [j for j in jobs if j.status == "queued"]
             if queued_jobs:
-                self.start_queue(dry_run=dry_run)
+                self.start_queue_background(dry_run=dry_run)
 
         return jobs
+
+    def run_from_queue(self, state_db: StateDB, dry_run: bool = False) -> list[BuildJob]:
+        """
+        Pull items from the priority queue and dispatch builds.
+        This is the primary entry point for autonomous operation.
+
+        Args:
+            state_db: StateDB instance (for priority queue access)
+            dry_run: If True, only print commands without executing
+
+        Returns:
+            List of BuildJob results
+        """
+        # Check if runner is already active
+        if self.is_runner_active():
+            print("Queue runner still active from previous dispatch, polling status...")
+            sync = self.poll_and_sync_status()
+            if sync["running"]:
+                print("Build in progress, skipping new dispatch")
+                return []
+
+        # Pull pending items from priority queue
+        approved_ideas = []
+        for _ in range(self.config.max_approve_per_cycle):
+            item = state_db.get_next_pending()
+            if item is None:
+                break
+
+            # Parse idea data
+            try:
+                idea = json.loads(item.idea_data)
+            except (json.JSONDecodeError, TypeError):
+                idea = {
+                    "id": item.source_id,
+                    "title": item.title,
+                    "description": item.description,
+                    "problem_statement": item.description,
+                    "target_audience": "General",
+                    "artifact_type": "tool"
+                }
+
+            approved_ideas.append(idea)
+
+            # Mark as dispatched
+            if not dry_run and item.id:
+                state_db.update_item_status(item.id, "dispatched", "dispatched_at")
+
+        if not approved_ideas:
+            print("No pending items in priority queue")
+            return []
+
+        return self.run(approved_ideas, dry_run=dry_run)
