@@ -181,6 +181,13 @@ class StateDB:
 
         self.conn.commit()
 
+    def get_triaged_idea_ids(self) -> set[int]:
+        """Return set of idea IDs that already have a triage decision."""
+        self.connect()
+        cursor = self.conn.cursor()
+        cursor.execute("SELECT DISTINCT idea_id FROM triage_decisions")
+        return {row[0] for row in cursor.fetchall()}
+
     def record_patch_application(self, patch: PatchApplication):
         """Record a patch application."""
         self.connect()

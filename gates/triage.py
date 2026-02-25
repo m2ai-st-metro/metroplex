@@ -62,6 +62,13 @@ class TriageGate:
 
         ideas = self.ideaforge_reader.get_unprocessed_ideas()
 
+        # Filter out ideas already triaged in a previous cycle
+        already_triaged = self.state_db.get_triaged_idea_ids()
+        ideas = [i for i in ideas if i["id"] not in already_triaged]
+
+        if not ideas:
+            return []
+
         decisions = []
         approve_count = 0
 
