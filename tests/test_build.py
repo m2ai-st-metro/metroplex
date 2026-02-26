@@ -389,7 +389,7 @@ class TestBuildOrchestrator:
             command = call_args[0][0]
 
             # Verify command structure
-            assert command[0] == sys.executable
+            assert "python" in command[0]
             assert str(orchestrator.queue_runner_path) in command[1]
             assert "add" in command
             assert str(spec_path) in command
@@ -488,7 +488,7 @@ class TestBuildOrchestrator:
             call_args = mock_run.call_args
             command = call_args[0][0]
 
-            assert command[0] == sys.executable
+            assert "python" in command[0]
             assert "status" in command
             assert "--json" in command
 
@@ -536,7 +536,7 @@ class TestBuildOrchestrator:
             call_args = mock_run.call_args
             command = call_args[0][0]
 
-            assert command[0] == sys.executable
+            assert "python" in command[0]
             assert "start" in command
 
             # Verify timeout is None (long-running)

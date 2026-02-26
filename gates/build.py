@@ -129,6 +129,7 @@ class BuildOrchestrator:
         self.spec_generator = spec_generator
         self.audit_logger = audit_logger
         self.queue_runner_path = Path(config.yce_dir) / "queue_runner.py"
+        self.yce_python = Path(config.yce_dir) / "venv" / "bin" / "python"
 
     def queue_build(self, idea: dict, spec_path: Path, dry_run: bool = False) -> BuildJob | None:
         """
@@ -144,10 +145,10 @@ class BuildOrchestrator:
         """
         job_id = f"metroplex-{idea['id']}"
         command = [
-            sys.executable,
+            str(self.yce_python),
             str(self.queue_runner_path),
             "add",
-            str(spec_path),
+            str(spec_path.resolve()),
             "--id",
             job_id,
             "--model",
@@ -190,7 +191,7 @@ class BuildOrchestrator:
                 )
                 return job
             else:
-                error_msg = result.stderr.strip() if result.stderr else "Unknown error"
+                error_msg = result.stderr.strip() or result.stdout.strip() or "Unknown error"
                 job = BuildJob(
                     idea_id=idea["id"],
                     title=idea["title"],
@@ -265,7 +266,7 @@ class BuildOrchestrator:
             True if started, False otherwise
         """
         command = [
-            sys.executable,
+            str(self.yce_python),
             str(self.queue_runner_path),
             "start"
         ]
@@ -322,7 +323,7 @@ class BuildOrchestrator:
             True if successful, False otherwise
         """
         command = [
-            sys.executable,
+            str(self.yce_python),
             str(self.queue_runner_path),
             "start"
         ]
@@ -347,7 +348,7 @@ class BuildOrchestrator:
                 )
                 return True
             else:
-                error_msg = result.stderr.strip() if result.stderr else "Unknown error"
+                error_msg = result.stderr.strip() or result.stdout.strip() or "Unknown error"
                 self.audit_logger.log_error(
                     gate="build",
                     error=f"Failed to start queue: {error_msg}",
@@ -371,7 +372,7 @@ class BuildOrchestrator:
             Parsed status dict, or empty dict on error
         """
         command = [
-            sys.executable,
+            str(self.yce_python),
             str(self.queue_runner_path),
             "status",
             "--json"
@@ -456,7 +457,7 @@ class BuildOrchestrator:
 
         for idea in approved_ideas:
             try:
-                output_dir = Path("data/specs")
+                output_dir = Path(__file__).parent.parent / "data" / "specs"
                 spec_path = self.spec_generator.generate_spec(idea, output_dir)
                 job = self.queue_build(idea, spec_path, dry_run=dry_run)
                 if job:
@@ -530,12 +531,26 @@ class BuildOrchestrator:
 
             approved_ideas.append(idea)
 
-            # Mark as dispatched
+            # Mark as dispatched immediately (prevents get_next_pending re-selecting)
             if not dry_run and item.id:
                 state_db.update_item_status(item.id, "dispatched", "dispatched_at")
+                # Track item for rollback on failure
+                if not hasattr(self, '_dispatch_items'):
+                    self._dispatch_items = {}
+                self._dispatch_items[idea.get("id", idea.get("source_id"))] = item.id
 
         if not approved_ideas:
             print("No pending items in priority queue")
             return []
 
-        return self.run(approved_ideas, dry_run=dry_run)
+        jobs = self.run(approved_ideas, dry_run=dry_run)
+
+        # Rollback dispatched -> failed for any jobs that failed to queue
+        if not dry_run and hasattr(self, '_dispatch_items'):
+            for job in jobs:
+                if job.status == "failed" and job.idea_id in self._dispatch_items:
+                    item_id = self._dispatch_items[job.idea_id]
+                    state_db.update_item_status(item_id, "failed", "completed_at")
+            self._dispatch_items = {}
+
+        return jobs
