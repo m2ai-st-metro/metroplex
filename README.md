@@ -1,22 +1,41 @@
 # Metroplex
 
-Level 5 autonomy layer for the ST Metro ecosystem. Closes all three human gates in the feedback loop: idea triage, build orchestration, and persona patch application.
+Level 5 autonomy layer for the ST Metro ecosystem. Closes all three human gates in the feedback loop: idea triage, build orchestration, and persona patch application. Runs continuously as a systemd service with circuit breakers, per-cycle caps, Telegram notifications, and schedule windows.
 
 ## Architecture
 
 ```
-IdeaForge (signals+scores) --> Gate 1: Triage --> approve/reject/defer
-                                                       |
-                                                  approved ideas
-                                                       |
-                                                       v
-                                         Gate 2: Spec Gen + Build
-                                         Jinja2 template -> app spec
-                                         queue_runner.py subprocess
-                                                       |
-ST Factory (persona_patches) --> Gate 3: Patcher --> git clone/commit/push
-                                         YAML ops on Academy repo
+IdeaForge (signals+scores)
+    |
+    v
+Gate 1: Triage ──> approve / reject / defer
+    |                  (score scaling 0-10 -> 0-100)
+    | approved ideas
+    v
+Priority Queue ──> weighted intake from IdeaForge / Sky-Lynx / Linear
+    |                  (configurable source weights)
+    v
+Gate 2: Build ──> Jinja2 spec gen + queue_runner.py dispatch
+    |                  (background subprocess -> YCE Harness)
+    |
+ST Factory (persona_patches)
+    |
+    v
+Gate 3: Patcher ──> git clone / commit / push
+                       (YAML ops on Academy repo)
 ```
+
+### Priority Queue
+
+Gate 2 pulls work from a weighted priority queue rather than directly from triage results. Items are scored by source weight:
+
+| Source | Default Weight | Description |
+|--------|---------------|-------------|
+| IdeaForge | 1.0 | Approved ideas from triage |
+| Sky-Lynx | 1.5 | Improvement recommendations |
+| Linear | 2.0 | Manually created issues |
+
+Priority score = `scaled_score * source_weight`. Higher-priority items are dispatched first.
 
 ## Setup
 
@@ -46,6 +65,7 @@ python metroplex.py run-all --cycles 0                # Continuous (until SIGTER
 
 # Operations
 python metroplex.py status                            # Gate health, recent cycles, pending builds
+python metroplex.py queue                             # Priority queue status (pending/dispatched items)
 python metroplex.py reset --gate triage               # Reset circuit breaker for one gate
 python metroplex.py reset --gate all                  # Reset all circuit breakers
 ```
@@ -84,6 +104,14 @@ All settings via environment variables (prefix `METROPLEX_`). Set in `~/.env.sha
 | `METROPLEX_MAX_PATCHES_PER_CYCLE` | `5` | Max patches per cycle |
 | `METROPLEX_CIRCUIT_BREAKER_THRESHOLD` | `3` | Consecutive failures before gate halt |
 | `METROPLEX_CYCLE_SLEEP_SECONDS` | `60` | Sleep between cycles (warning if < 10) |
+| `METROPLEX_IDEAFORGE_WEIGHT` | `1.0` | Priority queue weight for IdeaForge items |
+| `METROPLEX_SKYLYNX_WEIGHT` | `1.5` | Priority queue weight for Sky-Lynx items |
+| `METROPLEX_LINEAR_WEIGHT` | `2.0` | Priority queue weight for Linear items |
+| `METROPLEX_TELEGRAM_BOT_TOKEN` | *(empty)* | Telegram Bot API token (optional) |
+| `METROPLEX_TELEGRAM_CHAT_ID` | *(empty)* | Telegram chat ID for notifications |
+| `METROPLEX_SCHEDULE_START` | `0` | Active window start hour (0-23) |
+| `METROPLEX_SCHEDULE_END` | `24` | Active window end hour (24 = always on) |
+| `METROPLEX_ACTIVE_DAYS` | `0,1,2,3,4,5,6` | Active days (0=Mon, 6=Sun) |
 
 ## Project Structure
 
@@ -96,6 +124,7 @@ metroplex/
 ├── models.py                   # Pydantic v2 data models
 ├── safety.py                   # Circuit breaker, caps, shutdown handler
 ├── audit.py                    # JSON Lines audit logger
+├── notifier.py                 # Pluggable notifications (Telegram + log fallback)
 ├── gates/
 │   ├── triage.py               # Gate 1: score + threshold decisions
 │   ├── build.py                # Gate 2: spec gen + queue_runner subprocess
@@ -134,6 +163,16 @@ pytest tests/test_continuous.py -v   # Phase 5 continuous operation tests
 - **Cycle Caps**: Max 3 approvals and 5 patches per cycle to prevent runaway behavior.
 - **Shutdown Handler**: Catches SIGTERM/SIGINT, finishes current cycle, then exits cleanly.
 - **Read-Only Upstream**: All upstream DB access uses `?mode=ro` (except one status write in ST Factory).
+- **Schedule Windows**: Restrict operation to specific hours and days (e.g., weekdays 9-17). Outside the window, cycles are skipped.
+
+## Notifications
+
+Metroplex supports pluggable notifications via the `Notifier` protocol:
+
+- **Telegram**: Real-time alerts to a Telegram chat (cycle results, errors, gate halts). Configured via `METROPLEX_TELEGRAM_BOT_TOKEN` and `METROPLEX_TELEGRAM_CHAT_ID`.
+- **Log fallback**: When Telegram is not configured, notifications are logged to stdout.
+
+Notification failures never crash the pipeline — they are logged and skipped.
 
 ## License
 
