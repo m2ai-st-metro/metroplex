@@ -128,7 +128,7 @@ class StateDB:
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS priority_queue (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                source TEXT NOT NULL CHECK(source IN ('ideaforge', 'skylynx', 'linear')),
+                source TEXT NOT NULL CHECK(source IN ('ideaforge', 'skylynx', 'linear', 'academy')),
                 source_id TEXT NOT NULL,
                 title TEXT NOT NULL,
                 description TEXT NOT NULL DEFAULT '',
