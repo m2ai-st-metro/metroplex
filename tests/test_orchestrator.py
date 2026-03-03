@@ -18,6 +18,7 @@ from gates.triage import TriageGate
 from gates.build import SpecGenerator, BuildOrchestrator
 from gates.patcher import PatchGate
 from orchestrator import CycleOrchestrator
+from notifier import LogNotifier
 from models import TriageDecision, BuildJob, PatchApplication
 
 
@@ -108,6 +109,11 @@ def mock_build_orchestrator():
     orch.run.return_value = build_jobs
     orch.run_from_queue.return_value = build_jobs
     orch.is_runner_active.return_value = False
+    orch.poll_and_sync_status.return_value = {
+        "running": [], "running_count": 0,
+        "completed": [], "failed": [],
+        "newly_synced": [],
+    }
     return orch
 
 
@@ -261,13 +267,16 @@ class TestCycleOrchestrator:
 class TestCLI:
     """Test CLI commands."""
 
+    METROPLEX_DIR = str(Path(__file__).parent.parent)
+
     def test_cli_triage_dry_run(self):
         """Test 'metroplex.py triage --dry-run' command."""
         result = subprocess.run(
             [sys.executable, "metroplex.py", "triage", "--dry-run"],
             capture_output=True,
             text=True,
-            timeout=30
+            timeout=30,
+            cwd=self.METROPLEX_DIR
         )
 
         # Should succeed (or fail gracefully if no IdeaForge DB)
@@ -280,7 +289,8 @@ class TestCLI:
             [sys.executable, "metroplex.py", "status"],
             capture_output=True,
             text=True,
-            timeout=30
+            timeout=30,
+            cwd=self.METROPLEX_DIR
         )
 
         # Should succeed
@@ -294,7 +304,8 @@ class TestCLI:
             [sys.executable, "metroplex.py", "run-all", "--dry-run", "--cycles", "1"],
             capture_output=True,
             text=True,
-            timeout=60
+            timeout=60,
+            cwd=self.METROPLEX_DIR
         )
 
         # Should succeed (or fail gracefully if no DBs)
@@ -307,7 +318,8 @@ class TestCLI:
             [sys.executable, "metroplex.py", "reset", "--gate", "triage"],
             capture_output=True,
             text=True,
-            timeout=30
+            timeout=30,
+            cwd=self.METROPLEX_DIR
         )
 
         # Should succeed
@@ -320,7 +332,8 @@ class TestCLI:
             [sys.executable, "metroplex.py", "reset", "--gate", "all"],
             capture_output=True,
             text=True,
-            timeout=30
+            timeout=30,
+            cwd=self.METROPLEX_DIR
         )
 
         # Should succeed
@@ -335,7 +348,8 @@ class TestCLI:
             [sys.executable, "metroplex.py", "--help"],
             capture_output=True,
             text=True,
-            timeout=30
+            timeout=30,
+            cwd=self.METROPLEX_DIR
         )
 
         assert result.returncode == 0
@@ -410,3 +424,520 @@ class TestShutdownHandlerIntegration:
         # Should have stopped gracefully before 100 cycles
         assert len(results) < 100
         assert all(r.completed_at is not None for r in results)
+
+
+class TestScheduleWindows:
+    """Test schedule window logic in CycleOrchestrator."""
+
+    def _make_orchestrator(self, config, state_db, audit_logger):
+        """Helper to create a minimal orchestrator for schedule tests."""
+        mock_triage = Mock(spec=TriageGate)
+        mock_triage.run.return_value = []
+        mock_build = Mock(spec=BuildOrchestrator)
+        mock_build.run_from_queue.return_value = []
+        mock_build.is_runner_active.return_value = False
+        mock_patch = Mock(spec=PatchGate)
+        mock_patch.run.return_value = []
+        cb = CircuitBreaker(threshold=3, state_db=state_db)
+        cc = CycleCaps(config)
+        sh = ShutdownHandler()
+
+        return CycleOrchestrator(
+            config=config,
+            triage_gate=mock_triage,
+            build_orchestrator=mock_build,
+            patch_gate=mock_patch,
+            circuit_breaker=cb,
+            cycle_caps=cc,
+            shutdown_handler=sh,
+            state_db=state_db,
+            audit_logger=audit_logger,
+        )
+
+    def test_always_on_schedule(self, config, state_db, audit_logger):
+        """schedule_end=24 means always on."""
+        config.schedule_start = 0
+        config.schedule_end = 24
+        config.active_days = "0,1,2,3,4,5,6"
+        orch = self._make_orchestrator(config, state_db, audit_logger)
+        assert orch.is_within_schedule() is True
+
+    def test_within_normal_range(self, config, state_db, audit_logger):
+        """9am-5pm range, current hour is noon."""
+        config.schedule_start = 9
+        config.schedule_end = 17
+        config.active_days = "0,1,2,3,4,5,6"
+        orch = self._make_orchestrator(config, state_db, audit_logger)
+
+        with patch("orchestrator.datetime") as mock_dt:
+            mock_now = MagicMock()
+            mock_now.hour = 12
+            mock_now.weekday.return_value = 2  # Wednesday
+            mock_dt.now.return_value = mock_now
+            assert orch.is_within_schedule() is True
+
+    def test_outside_normal_range(self, config, state_db, audit_logger):
+        """9am-5pm range, current hour is 8am -- outside."""
+        config.schedule_start = 9
+        config.schedule_end = 17
+        config.active_days = "0,1,2,3,4,5,6"
+        orch = self._make_orchestrator(config, state_db, audit_logger)
+
+        with patch("orchestrator.datetime") as mock_dt:
+            mock_now = MagicMock()
+            mock_now.hour = 8
+            mock_now.weekday.return_value = 2
+            mock_dt.now.return_value = mock_now
+            assert orch.is_within_schedule() is False
+
+    def test_overnight_range_evening(self, config, state_db, audit_logger):
+        """22:00-06:00 range, current hour is 23 -- inside."""
+        config.schedule_start = 22
+        config.schedule_end = 6
+        config.active_days = "0,1,2,3,4,5,6"
+        orch = self._make_orchestrator(config, state_db, audit_logger)
+
+        with patch("orchestrator.datetime") as mock_dt:
+            mock_now = MagicMock()
+            mock_now.hour = 23
+            mock_now.weekday.return_value = 1
+            mock_dt.now.return_value = mock_now
+            assert orch.is_within_schedule() is True
+
+    def test_overnight_range_morning(self, config, state_db, audit_logger):
+        """22:00-06:00 range, current hour is 3am -- inside."""
+        config.schedule_start = 22
+        config.schedule_end = 6
+        config.active_days = "0,1,2,3,4,5,6"
+        orch = self._make_orchestrator(config, state_db, audit_logger)
+
+        with patch("orchestrator.datetime") as mock_dt:
+            mock_now = MagicMock()
+            mock_now.hour = 3
+            mock_now.weekday.return_value = 1
+            mock_dt.now.return_value = mock_now
+            assert orch.is_within_schedule() is True
+
+    def test_overnight_range_outside(self, config, state_db, audit_logger):
+        """22:00-06:00 range, current hour is 12 noon -- outside."""
+        config.schedule_start = 22
+        config.schedule_end = 6
+        config.active_days = "0,1,2,3,4,5,6"
+        orch = self._make_orchestrator(config, state_db, audit_logger)
+
+        with patch("orchestrator.datetime") as mock_dt:
+            mock_now = MagicMock()
+            mock_now.hour = 12
+            mock_now.weekday.return_value = 1
+            mock_dt.now.return_value = mock_now
+            assert orch.is_within_schedule() is False
+
+    def test_wrong_day_rejected(self, config, state_db, audit_logger):
+        """Weekdays only (Mon-Fri), current is Saturday."""
+        config.schedule_start = 0
+        config.schedule_end = 24
+        config.active_days = "0,1,2,3,4"  # Mon-Fri
+        orch = self._make_orchestrator(config, state_db, audit_logger)
+
+        with patch("orchestrator.datetime") as mock_dt:
+            mock_now = MagicMock()
+            mock_now.hour = 12
+            mock_now.weekday.return_value = 5  # Saturday
+            mock_dt.now.return_value = mock_now
+            assert orch.is_within_schedule() is False
+
+    def test_invalid_active_days_defaults_to_all(self, config, state_db, audit_logger):
+        """Invalid active_days string falls back to all days."""
+        config.schedule_start = 0
+        config.schedule_end = 24
+        config.active_days = "invalid"
+        orch = self._make_orchestrator(config, state_db, audit_logger)
+        # Should not raise, falls back to all days
+        assert orch.is_within_schedule() is True
+
+
+class TestOrchestratorNotifications:
+    """Test notification integration in CycleOrchestrator."""
+
+    def test_cycle_notifies_on_triage_approval(
+        self, config, mock_triage_gate, mock_build_orchestrator,
+        mock_patch_gate, circuit_breaker, cycle_caps,
+        shutdown_handler, state_db, audit_logger
+    ):
+        """Test that approved ideas trigger a notification."""
+        mock_notifier = Mock()
+        mock_notifier.notify.return_value = True
+
+        orch = CycleOrchestrator(
+            config=config,
+            triage_gate=mock_triage_gate,
+            build_orchestrator=mock_build_orchestrator,
+            patch_gate=mock_patch_gate,
+            circuit_breaker=circuit_breaker,
+            cycle_caps=cycle_caps,
+            shutdown_handler=shutdown_handler,
+            state_db=state_db,
+            audit_logger=audit_logger,
+            notifier=mock_notifier,
+        )
+
+        orch.run_cycle(dry_run=True)
+
+        # Should have been called with triage approval
+        notify_calls = [str(c) for c in mock_notifier.notify.call_args_list]
+        approval_notified = any("approved" in c.lower() or "Triage" in c for c in notify_calls)
+        assert approval_notified, f"Expected triage approval notification, got: {notify_calls}"
+
+    def test_cycle_notifies_on_build_queued(
+        self, config, mock_triage_gate, mock_build_orchestrator,
+        mock_patch_gate, circuit_breaker, cycle_caps,
+        shutdown_handler, state_db, audit_logger
+    ):
+        """Test that queued builds trigger a notification."""
+        mock_notifier = Mock()
+        mock_notifier.notify.return_value = True
+
+        orch = CycleOrchestrator(
+            config=config,
+            triage_gate=mock_triage_gate,
+            build_orchestrator=mock_build_orchestrator,
+            patch_gate=mock_patch_gate,
+            circuit_breaker=circuit_breaker,
+            cycle_caps=cycle_caps,
+            shutdown_handler=shutdown_handler,
+            state_db=state_db,
+            audit_logger=audit_logger,
+            notifier=mock_notifier,
+        )
+
+        orch.run_cycle(dry_run=True)
+
+        # Check for build queued notification
+        notify_calls = [str(c) for c in mock_notifier.notify.call_args_list]
+        build_notified = any("Build queued" in c or "built" in c.lower() for c in notify_calls)
+        assert build_notified, f"Expected build notification, got: {notify_calls}"
+
+    def test_cycle_notifies_on_error(
+        self, config, mock_triage_gate, mock_build_orchestrator,
+        mock_patch_gate, circuit_breaker, cycle_caps,
+        shutdown_handler, state_db, audit_logger
+    ):
+        """Test that gate failures trigger an error notification."""
+        mock_triage_gate.run.side_effect = Exception("DB connection lost")
+
+        mock_notifier = Mock()
+        mock_notifier.notify.return_value = True
+
+        orch = CycleOrchestrator(
+            config=config,
+            triage_gate=mock_triage_gate,
+            build_orchestrator=mock_build_orchestrator,
+            patch_gate=mock_patch_gate,
+            circuit_breaker=circuit_breaker,
+            cycle_caps=cycle_caps,
+            shutdown_handler=shutdown_handler,
+            state_db=state_db,
+            audit_logger=audit_logger,
+            notifier=mock_notifier,
+        )
+
+        orch.run_cycle(dry_run=True)
+
+        # Should have been called with error notification
+        notify_calls = [str(c) for c in mock_notifier.notify.call_args_list]
+        error_notified = any("FAIL" in c or "error" in c.lower() for c in notify_calls)
+        assert error_notified, f"Expected error notification, got: {notify_calls}"
+
+    def test_cycle_suppresses_empty_cycle_notifications(
+        self, config, state_db, audit_logger
+    ):
+        """Empty cycles (no activity) should not send summary notifications."""
+        mock_triage = Mock(spec=TriageGate)
+        mock_triage.run.return_value = []  # No ideas
+        mock_build = Mock(spec=BuildOrchestrator)
+        mock_build.run_from_queue.return_value = []
+        mock_build.is_runner_active.return_value = False
+        mock_patch = Mock(spec=PatchGate)
+        mock_patch.run.return_value = []
+
+        mock_notifier = Mock()
+        mock_notifier.notify.return_value = True
+
+        cb = CircuitBreaker(threshold=3, state_db=state_db)
+        cc = CycleCaps(config)
+        sh = ShutdownHandler()
+
+        orch = CycleOrchestrator(
+            config=config,
+            triage_gate=mock_triage,
+            build_orchestrator=mock_build,
+            patch_gate=mock_patch,
+            circuit_breaker=cb,
+            cycle_caps=cc,
+            shutdown_handler=sh,
+            state_db=state_db,
+            audit_logger=audit_logger,
+            notifier=mock_notifier,
+        )
+
+        orch.run_cycle(dry_run=True)
+
+        # No activity, no errors -- should not send summary notification
+        # (but the implementation might send nothing at all for empty cycles)
+        summary_calls = [
+            c for c in mock_notifier.notify.call_args_list
+            if "triaged" in str(c).lower() and "built" in str(c).lower()
+        ]
+        assert len(summary_calls) == 0, "Empty cycles should suppress summary notifications"
+
+    def test_default_notifier_is_log(self, orchestrator):
+        """When no notifier is passed, default is LogNotifier."""
+        assert isinstance(orchestrator.notifier, LogNotifier)
+
+
+class TestGetStatusIncludesPriorityQueue:
+    """Test that get_status includes priority queue and schedule info."""
+
+    def test_status_includes_priority_queue(self, orchestrator, state_db):
+        """get_status should include priority_queue summary."""
+        orchestrator.run_cycle(dry_run=True)
+        status = orchestrator.get_status()
+
+        assert "priority_queue" in status
+        assert "total" in status["priority_queue"]
+
+    def test_status_includes_runner_active(self, orchestrator, state_db):
+        """get_status should include runner_active flag."""
+        status = orchestrator.get_status()
+        assert "runner_active" in status
+        assert isinstance(status["runner_active"], bool)
+
+    def test_status_includes_schedule(self, orchestrator, state_db):
+        """get_status should include schedule info."""
+        status = orchestrator.get_status()
+        assert "schedule" in status
+        assert "start" in status["schedule"]
+        assert "end" in status["schedule"]
+        assert "active_days" in status["schedule"]
+        assert "currently_in_window" in status["schedule"]
+
+
+class TestStandaloneStatusPolling:
+    """Test unconditional build status polling wired in run_cycle()."""
+
+    def test_run_cycle_calls_poll_and_sync(
+        self, orchestrator, mock_build_orchestrator
+    ):
+        """poll_and_sync_status is called every cycle, independent of run_from_queue."""
+        result = orchestrator.run_cycle(dry_run=True)
+        assert mock_build_orchestrator.poll_and_sync_status.called
+
+    def test_run_cycle_notifies_completed_builds(
+        self, config, mock_triage_gate, mock_build_orchestrator, mock_patch_gate,
+        circuit_breaker, cycle_caps, shutdown_handler, state_db, audit_logger
+    ):
+        """Completed builds from polling generate notifications."""
+        mock_build_orchestrator.poll_and_sync_status.return_value = {
+            "running": [], "running_count": 0,
+            "completed": ["metroplex-ideaforge-5"],
+            "failed": [],
+            "newly_synced": ["metroplex-ideaforge-5"],
+        }
+        mock_notifier = Mock()
+        mock_notifier.notify.return_value = True
+
+        orch = CycleOrchestrator(
+            config=config, triage_gate=mock_triage_gate,
+            build_orchestrator=mock_build_orchestrator, patch_gate=mock_patch_gate,
+            circuit_breaker=circuit_breaker, cycle_caps=cycle_caps,
+            shutdown_handler=shutdown_handler, state_db=state_db,
+            audit_logger=audit_logger, cycle_sleep_seconds=1,
+            notifier=mock_notifier,
+        )
+        orch.run_cycle(dry_run=True)
+
+        # Check that notifier was called with a "completed" message
+        notify_calls = [str(c) for c in mock_notifier.notify.call_args_list]
+        assert any("completed" in c.lower() or "Build completed" in c for c in notify_calls)
+
+    def test_run_cycle_poll_failure_nonfatal(
+        self, orchestrator, mock_build_orchestrator, mock_patch_gate, audit_logger
+    ):
+        """A polling failure doesn't prevent the rest of the cycle from running."""
+        mock_build_orchestrator.poll_and_sync_status.side_effect = Exception("poll error")
+
+        result = orchestrator.run_cycle(dry_run=True)
+
+        # Patch gate should still have been called
+        assert mock_patch_gate.run.called
+        # Cycle should complete without raising
+        assert result.completed_at is not None
+
+
+class TestSkyLynxIntake:
+    """Tests for Sky-Lynx recommendation intake in CycleOrchestrator."""
+
+    def test_ingest_skylynx_enqueues_recommendations(
+        self, config, mock_triage_gate, mock_build_orchestrator, mock_patch_gate,
+        circuit_breaker, cycle_caps, shutdown_handler, state_db, audit_logger
+    ):
+        """ingest_skylynx reads pending recs and enqueues them as PriorityItems."""
+        mock_reader = Mock()
+        mock_reader.get_pending_recommendations.return_value = [
+            {
+                "id": 1,
+                "recommendation_id": "sl-001",
+                "session_id": "sky-lynx-2026-02-08",
+                "recommendation_type": "pipeline_change",
+                "target_system": "pipeline",
+                "title": "Fix Session Tracking",
+                "priority": "high",
+                "scope": "all_personas",
+                "target_department": None,
+                "status": "pending",
+                "emitted_at": "2026-02-08T18:00:00",
+                "raw_json": {
+                    "description": "Session tracking is broken",
+                    "suggested_change": "Add tracking",
+                },
+            }
+        ]
+        mock_reader.priority_to_score.return_value = 85.0
+        mock_reader.recommendation_to_idea.return_value = {
+            "id": "sl-001", "title": "Fix Session Tracking",
+            "description": "Session tracking is broken", "artifact_type": "tool",
+        }
+        mock_reader.mark_dispatched.return_value = None
+
+        orch = CycleOrchestrator(
+            config=config, triage_gate=mock_triage_gate,
+            build_orchestrator=mock_build_orchestrator, patch_gate=mock_patch_gate,
+            circuit_breaker=circuit_breaker, cycle_caps=cycle_caps,
+            shutdown_handler=shutdown_handler, state_db=state_db,
+            audit_logger=audit_logger, cycle_sleep_seconds=1,
+            skylynx_reader=mock_reader,
+        )
+
+        count = orch.ingest_skylynx(dry_run=False)
+
+        assert count == 1
+        mock_reader.mark_dispatched.assert_called_once_with("sl-001")
+
+        # Verify item was enqueued in the priority queue
+        summary = state_db.get_queue_summary()
+        assert summary.get("pending", 0) == 1
+        assert summary.get("total", 0) == 1
+
+    def test_ingest_skylynx_applies_weight(
+        self, config, mock_triage_gate, mock_build_orchestrator, mock_patch_gate,
+        circuit_breaker, cycle_caps, shutdown_handler, state_db, audit_logger
+    ):
+        """Priority score is base_score * skylynx_weight."""
+        config.skylynx_weight = 1.5
+
+        mock_reader = Mock()
+        mock_reader.get_pending_recommendations.return_value = [
+            {
+                "id": 1, "recommendation_id": "sl-w01",
+                "recommendation_type": "pipeline_change", "target_system": "pipeline",
+                "title": "Weighted Test", "priority": "high",
+                "scope": "", "target_department": None,
+                "status": "pending", "emitted_at": "2026-02-08T18:00:00",
+                "raw_json": {"description": "Test"},
+            }
+        ]
+        mock_reader.priority_to_score.return_value = 85.0  # high
+        mock_reader.recommendation_to_idea.return_value = {"id": "sl-w01", "title": "Weighted Test"}
+        mock_reader.mark_dispatched.return_value = None
+
+        orch = CycleOrchestrator(
+            config=config, triage_gate=mock_triage_gate,
+            build_orchestrator=mock_build_orchestrator, patch_gate=mock_patch_gate,
+            circuit_breaker=circuit_breaker, cycle_caps=cycle_caps,
+            shutdown_handler=shutdown_handler, state_db=state_db,
+            audit_logger=audit_logger, skylynx_reader=mock_reader,
+        )
+        orch.ingest_skylynx(dry_run=False)
+
+        # Check the enqueued item's priority_score = 85.0 * 1.5 = 127.5
+        item = state_db.get_next_pending()
+        assert item is not None
+        assert item.priority_score == 85.0 * 1.5
+
+    def test_ingest_skylynx_dry_run_no_writes(
+        self, config, mock_triage_gate, mock_build_orchestrator, mock_patch_gate,
+        circuit_breaker, cycle_caps, shutdown_handler, state_db, audit_logger
+    ):
+        """Dry run counts items but does not enqueue or mark dispatched."""
+        mock_reader = Mock()
+        mock_reader.get_pending_recommendations.return_value = [
+            {
+                "id": 1, "recommendation_id": "sl-dry",
+                "recommendation_type": "claude_md_update", "target_system": "claude_md",
+                "title": "Dry Run Rec", "priority": "medium",
+                "scope": "", "target_department": None,
+                "status": "pending", "emitted_at": "2026-02-08T18:00:00",
+                "raw_json": {"description": "Dry run test"},
+            }
+        ]
+        mock_reader.priority_to_score.return_value = 70.0
+        mock_reader.recommendation_to_idea.return_value = {"id": "sl-dry", "title": "Dry Run Rec"}
+
+        orch = CycleOrchestrator(
+            config=config, triage_gate=mock_triage_gate,
+            build_orchestrator=mock_build_orchestrator, patch_gate=mock_patch_gate,
+            circuit_breaker=circuit_breaker, cycle_caps=cycle_caps,
+            shutdown_handler=shutdown_handler, state_db=state_db,
+            audit_logger=audit_logger, skylynx_reader=mock_reader,
+        )
+        count = orch.ingest_skylynx(dry_run=True)
+
+        assert count == 1
+        mock_reader.mark_dispatched.assert_not_called()
+        # Queue should be empty
+        summary = state_db.get_queue_summary()
+        assert summary.get("total", 0) == 0
+
+    def test_ingest_skylynx_no_reader_returns_zero(self, orchestrator):
+        """When skylynx_reader is None, ingest returns 0."""
+        assert orchestrator.skylynx_reader is None
+        count = orchestrator.ingest_skylynx(dry_run=False)
+        assert count == 0
+
+    def test_run_cycle_calls_ingest_skylynx(
+        self, config, mock_triage_gate, mock_build_orchestrator, mock_patch_gate,
+        circuit_breaker, cycle_caps, shutdown_handler, state_db, audit_logger
+    ):
+        """run_cycle invokes Sky-Lynx intake before triage."""
+        mock_reader = Mock()
+        mock_reader.get_pending_recommendations.return_value = []
+
+        orch = CycleOrchestrator(
+            config=config, triage_gate=mock_triage_gate,
+            build_orchestrator=mock_build_orchestrator, patch_gate=mock_patch_gate,
+            circuit_breaker=circuit_breaker, cycle_caps=cycle_caps,
+            shutdown_handler=shutdown_handler, state_db=state_db,
+            audit_logger=audit_logger, skylynx_reader=mock_reader,
+        )
+        orch.run_cycle(dry_run=True)
+
+        # Sky-Lynx reader should have been called
+        mock_reader.get_pending_recommendations.assert_called_once()
+
+
+class TestCLIQueue:
+    """Test CLI queue command."""
+
+    def test_cli_queue_command(self):
+        """Test 'metroplex.py queue' command."""
+        result = subprocess.run(
+            [sys.executable, "metroplex.py", "queue"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            cwd=str(Path(__file__).parent.parent),
+        )
+
+        assert result.returncode == 0
+        assert "PRIORITY QUEUE" in result.stdout
+        assert "Total items:" in result.stdout

@@ -181,6 +181,8 @@ class TestPatchGateCapEnforcement:
 class TestSIGTERMGracefulShutdown:
     """Test SIGTERM graceful shutdown of metroplex.py subprocess."""
 
+    METROPLEX_DIR = str(Path(__file__).parent.parent)
+
     def test_sigterm_stops_run_all_gracefully(self):
         """SIGTERM stops 'metroplex.py run-all --cycles 0 --dry-run' subprocess gracefully."""
         proc = subprocess.Popen(
@@ -188,6 +190,7 @@ class TestSIGTERMGracefulShutdown:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            cwd=self.METROPLEX_DIR,
         )
 
         # Give the process time to start and enter continuous mode

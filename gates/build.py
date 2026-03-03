@@ -1,10 +1,13 @@
 """
 Build Gate - Gate 2
-Generates yce-harness app spec files from approved ideas using Jinja2 templates.
+Generates yce-harness app spec files from approved ideas.
+Primary: LLM expansion via Claude for idea-specific specs.
+Fallback: Jinja2 template rendering for generic specs.
 Orchestrates build queue via queue_runner.py subprocess calls.
 Supports background dispatch (Popen) and status polling.
 """
 import json
+import logging
 import os
 import signal
 import sys
@@ -18,12 +21,15 @@ from config import Config
 from models import BuildJob, PriorityItem
 from db import StateDB
 from audit import AuditLogger
+from gates.llm_expander import LLMSpecExpander
 
-RUNNER_PID_FILE = Path("data/runner.pid")
+logger = logging.getLogger(__name__)
+
+RUNNER_PID_FILE = Path(__file__).parent.parent / "data" / "runner.pid"
 
 
 class SpecGenerator:
-    """Gate 2: Spec Generation - Jinja2 Template Rendering."""
+    """Gate 2: Spec Generation - LLM expansion with Jinja2 fallback."""
 
     def __init__(self, config: Config, template_dir: Path):
         """
@@ -42,7 +48,7 @@ class SpecGenerator:
         if not template_dir.exists():
             raise FileNotFoundError(f"Template directory not found at {template_dir}")
 
-        # Set up Jinja2 environment
+        # Set up Jinja2 environment (fallback)
         self.env = Environment(
             loader=FileSystemLoader(str(template_dir)),
             trim_blocks=True,
@@ -50,9 +56,28 @@ class SpecGenerator:
             keep_trailing_newline=True
         )
 
+        # Initialize LLM expander if configured
+        self.llm_expander: Optional[LLMSpecExpander] = None
+        if config.spec_use_llm:
+            try:
+                self.llm_expander = LLMSpecExpander(
+                    model=config.spec_llm_model,
+                    max_tokens=config.spec_llm_max_tokens,
+                )
+                logger.info(
+                    "LLM spec expansion enabled (model=%s)", config.spec_llm_model
+                )
+            except (ValueError, Exception) as e:
+                logger.warning(
+                    "LLM spec expansion unavailable, using Jinja2 fallback: %s", e
+                )
+
     def generate_spec(self, idea: dict, output_dir: Path) -> Path:
         """
         Generate app spec file from idea data.
+
+        Uses LLM expansion when available for idea-specific specs.
+        Falls back to Jinja2 template rendering on LLM failure or when disabled.
 
         Args:
             idea: Idea dictionary with required fields:
@@ -68,7 +93,7 @@ class SpecGenerator:
             Path to generated spec file
 
         Raises:
-            FileNotFoundError: If template file not found
+            FileNotFoundError: If template file not found (Jinja2 fallback only)
             ValueError: If required fields missing from idea
         """
         # Validate required fields
@@ -83,32 +108,72 @@ class SpecGenerator:
         # Create output directory if it doesn't exist
         output_dir.mkdir(parents=True, exist_ok=True)
 
-        # Load template
+        output_path = output_dir / f"app_spec_{idea['id']}.txt"
+
+        # Try LLM expansion first
+        if self.llm_expander is not None:
+            try:
+                rendered_spec = self.llm_expander.expand(idea)
+                output_path.write_text(rendered_spec, encoding="utf-8")
+                logger.info(
+                    "LLM spec generated for idea %s: %s (%d chars)",
+                    idea["id"], idea["title"], len(rendered_spec),
+                )
+                return output_path
+            except Exception as e:
+                logger.warning(
+                    "LLM expansion failed for idea %s, falling back to Jinja2: %s",
+                    idea["id"], e,
+                )
+
+        # Jinja2 fallback
+        rendered_spec = self._render_jinja2(idea)
+        output_path.write_text(rendered_spec, encoding="utf-8")
+        logger.info(
+            "Jinja2 spec generated for idea %s: %s (%d chars)",
+            idea["id"], idea["title"], len(rendered_spec),
+        )
+
+        return output_path
+
+    def _render_jinja2(self, idea: dict) -> str:
+        """Render spec using Jinja2 template (fallback path).
+
+        Selects template based on source:
+        - Academy promotions use tier1_agent_template.md
+        - All other sources use app_spec_template.md
+        """
+        # Select template based on source
+        is_academy = idea.get("_source") == "academy"
+        template_name = "tier1_agent_template.md" if is_academy else "app_spec_template.md"
+
         try:
-            template = self.env.get_template("app_spec_template.md")
+            template = self.env.get_template(template_name)
         except TemplateNotFound:
             raise FileNotFoundError(
-                f"Template not found: app_spec_template.md in {self.template_dir}"
+                f"Template not found: {template_name} in {self.template_dir}"
             )
 
-        # Prepare template variables
         template_vars = {
             "title": idea["title"],
             "description": idea["description"],
             "problem_statement": idea["problem_statement"],
             "target_audience": idea["target_audience"],
             "artifact_type": idea["artifact_type"],
-            "tech_stack": idea.get("tech_stack", None)  # Optional field
+            "tech_stack": idea.get("tech_stack", None),
         }
 
-        # Render template
-        rendered_spec = template.render(**template_vars)
+        # Add Academy-specific template variables for agent builds
+        if is_academy:
+            template_vars.update({
+                "persona_id": idea.get("_persona_id", "unknown"),
+                "model": idea.get("_model", "sonnet"),
+                "tool_groups": idea.get("_tool_groups", ["file_readonly"]),
+                "prompt_file": idea.get("_prompt_file", "agent_prompt.md"),
+                "promotion_reason": idea.get("_promotion_reason", "Graduation gates passed"),
+            })
 
-        # Write to output file
-        output_path = output_dir / f"app_spec_{idea['id']}.txt"
-        output_path.write_text(rendered_spec, encoding="utf-8")
-
-        return output_path
+        return template.render(**template_vars)
 
 
 class BuildOrchestrator:
@@ -143,7 +208,8 @@ class BuildOrchestrator:
         Returns:
             BuildJob if executed, None if dry_run
         """
-        job_id = f"metroplex-{idea['id']}"
+        source = idea.get("_source", "ideaforge")
+        job_id = f"metroplex-{source}-{idea['id']}"
         command = [
             str(self.yce_python),
             str(self.queue_runner_path),
@@ -152,8 +218,11 @@ class BuildOrchestrator:
             "--id",
             job_id,
             "--model",
-            self.config.build_model
+            self.config.build_model,
         ]
+        if self.config.build_parallel:
+            command.append("--parallel")
+            command.extend(["--max-workers", str(self.config.build_max_workers)])
 
         if dry_run:
             print(f"[DRY RUN] Would execute: {' '.join(command)}")
@@ -265,10 +334,13 @@ class BuildOrchestrator:
         Returns:
             True if started, False otherwise
         """
+        concurrency = self.config.max_concurrent_builds
         command = [
             str(self.yce_python),
             str(self.queue_runner_path),
-            "start"
+            "start",
+            "--concurrency",
+            str(concurrency),
         ]
 
         if dry_run:
@@ -280,7 +352,7 @@ class BuildOrchestrator:
             return True
 
         try:
-            log_path = Path("data/runner.log")
+            log_path = Path(__file__).parent.parent / "data" / "runner.log"
             log_path.parent.mkdir(parents=True, exist_ok=True)
             log_file = open(log_path, "a")
 
@@ -408,10 +480,24 @@ class BuildOrchestrator:
         """
         Poll queue_runner status and sync completed/failed jobs back to metroplex DB.
 
+        Writes terminal statuses (completed/failed) back to both build_jobs
+        and priority_queue tables so dispatched items don't stay stuck forever.
+
         Returns:
-            dict with keys: running (bool), completed (list), failed (list)
+            dict with keys:
+                running (list[str]): IDs of currently running jobs
+                running_count (int): number of running jobs
+                completed (list[str]): IDs of completed jobs
+                failed (list[str]): IDs of failed jobs
+                newly_synced (list[str]): IDs synced to DB this poll
         """
-        result = {"running": False, "completed": [], "failed": []}
+        result: dict = {
+            "running": [],
+            "running_count": 0,
+            "completed": [],
+            "failed": [],
+            "newly_synced": [],
+        }
 
         status = self.check_status()
         if not status or "jobs" not in status:
@@ -425,14 +511,34 @@ class BuildOrchestrator:
             job_id = job_data.get("id", "")
 
             if job_status == "running":
-                result["running"] = True
+                result["running"].append(job_id)
             elif job_status == "completed":
                 result["completed"].append(job_id)
+                try:
+                    if self.state_db.update_build_job_status(job_id, "completed"):
+                        result["newly_synced"].append(job_id)
+                except Exception as e:
+                    self.audit_logger.log_error(
+                        gate="build",
+                        error=f"Failed to sync completed status for {job_id}: {e}",
+                        details={"job_id": job_id}
+                    )
             elif job_status == "failed":
                 result["failed"].append(job_id)
+                try:
+                    if self.state_db.update_build_job_status(job_id, "failed"):
+                        result["newly_synced"].append(job_id)
+                except Exception as e:
+                    self.audit_logger.log_error(
+                        gate="build",
+                        error=f"Failed to sync failed status for {job_id}: {e}",
+                        details={"job_id": job_id}
+                    )
+
+        result["running_count"] = len(result["running"])
 
         # Clean up PID file if runner is no longer active
-        if not result["running"] and not self.is_runner_active():
+        if result["running_count"] == 0 and not self.is_runner_active():
             RUNNER_PID_FILE.unlink(missing_ok=True)
 
         return result
@@ -501,18 +607,31 @@ class BuildOrchestrator:
         Returns:
             List of BuildJob results
         """
-        # Check if runner is already active
-        if self.is_runner_active():
-            print("Queue runner still active from previous dispatch, polling status...")
-            sync = self.poll_and_sync_status()
-            if sync["running"]:
-                print("Build in progress, skipping new dispatch")
-                return []
+        # Check capacity: how many more builds can we dispatch?
+        max_concurrent = self.config.max_concurrent_builds
+        available_slots = max_concurrent
 
-        # Pull pending items from priority queue
+        if self.is_runner_active():
+            print("Queue runner active, checking capacity...")
+            sync = self.poll_and_sync_status()
+            running_count = sync.get("running_count", 0)
+            available_slots = max(0, max_concurrent - running_count)
+
+            if available_slots == 0:
+                print(f"At capacity ({running_count}/{max_concurrent} builds running), skipping dispatch")
+                return []
+            else:
+                print(f"Capacity available: {available_slots} slot(s) free ({running_count}/{max_concurrent} running)")
+
+        # Pull pending BUILDABLE items from sources that produce app specs.
+        # Sky-Lynx recommendations are internal tasks dispatched via the
+        # EA-Claude dispatcher, not through the YCE build pipeline.
+        # Academy promotions produce agent builds via tier1_agent_template.
+        buildable_sources = ("ideaforge", "linear", "academy")
+        dispatch_limit = min(available_slots, self.config.max_approve_per_cycle)
         approved_ideas = []
-        for _ in range(self.config.max_approve_per_cycle):
-            item = state_db.get_next_pending()
+        for _ in range(dispatch_limit):
+            item = state_db.get_next_pending(sources=buildable_sources)
             if item is None:
                 break
 
@@ -526,8 +645,10 @@ class BuildOrchestrator:
                     "description": item.description,
                     "problem_statement": item.description,
                     "target_audience": "General",
-                    "artifact_type": "tool"
+                    "artifact_type": "tool",
                 }
+            # Propagate source for job_id encoding
+            idea["_source"] = item.source
 
             approved_ideas.append(idea)
 

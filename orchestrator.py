@@ -1,25 +1,30 @@
 """
 Metroplex Cycle Orchestrator
-Sequences all three gates into cycles with safety systems integration.
+Sequences all four gates into cycles with safety systems integration.
 Includes notifications, schedule windows, and priority queue dispatch.
 """
+import json
 import time
 from datetime import datetime
 from typing import Optional, Protocol
 
 from config import Config
-from models import CycleResult
+from models import CycleResult, PriorityItem
 from db import StateDB
 from audit import AuditLogger
 from safety import CircuitBreaker, CycleCaps, ShutdownHandler
 from gates.triage import TriageGate
 from gates.build import BuildOrchestrator
 from gates.patcher import PatchGate
+from gates.publish import PublishGate
 from notifier import Notifier, LogNotifier
+from readers.academy_reader import AcademyReader
+from readers.skylynx_reader import SkyLynxReader
+from readers.linear_reader import LinearReader
 
 
 class CycleOrchestrator:
-    """Orchestrates full Metroplex cycles (triage -> build -> patch)."""
+    """Orchestrates full Metroplex cycles (triage -> build -> publish -> patch)."""
 
     def __init__(
         self,
@@ -33,7 +38,11 @@ class CycleOrchestrator:
         state_db: StateDB,
         audit_logger: AuditLogger,
         cycle_sleep_seconds: int = 60,
-        notifier: Notifier | None = None
+        notifier: Notifier | None = None,
+        skylynx_reader: SkyLynxReader | None = None,
+        linear_reader: LinearReader | None = None,
+        academy_reader: AcademyReader | None = None,
+        publish_gate: PublishGate | None = None,
     ):
         """
         Initialize Cycle Orchestrator.
@@ -50,11 +59,16 @@ class CycleOrchestrator:
             audit_logger: AuditLogger instance
             cycle_sleep_seconds: Sleep duration between cycles (default 60)
             notifier: Notification backend (defaults to LogNotifier)
+            skylynx_reader: SkyLynxReader instance (optional, enables Sky-Lynx intake)
+            linear_reader: LinearReader instance (optional, enables Linear intake)
+            academy_reader: AcademyReader instance (optional, enables Academy promotion intake)
+            publish_gate: PublishGate instance (optional, enables Gate 4)
         """
         self.config = config
         self.triage_gate = triage_gate
         self.build_orchestrator = build_orchestrator
         self.patch_gate = patch_gate
+        self.publish_gate = publish_gate
         self.circuit_breaker = circuit_breaker
         self.cycle_caps = cycle_caps
         self.shutdown_handler = shutdown_handler
@@ -62,6 +76,12 @@ class CycleOrchestrator:
         self.audit_logger = audit_logger
         self.cycle_sleep_seconds = cycle_sleep_seconds
         self.notifier = notifier or LogNotifier()
+        self.skylynx_reader = skylynx_reader
+        self.linear_reader = linear_reader
+        self.academy_reader = academy_reader
+        # Track which gates have already sent a halted notification.
+        # Prevents spamming Telegram every cycle while a breaker is tripped.
+        self._halted_notified: set[str] = set()
 
     def is_within_schedule(self) -> bool:
         """Check if current time is within the configured schedule window."""
@@ -93,12 +113,178 @@ class CycleOrchestrator:
             # Overnight range: e.g. 22-6
             return current_hour >= start or current_hour < end
 
+    def ingest_skylynx(self, dry_run: bool = False) -> int:
+        """
+        Ingest pending Sky-Lynx recommendations into the priority queue.
+
+        Sky-Lynx recommendations bypass triage (they are already analyzed)
+        and enqueue directly with skylynx_weight applied.
+
+        Args:
+            dry_run: If True, count items but don't write to DB
+
+        Returns:
+            Number of recommendations enqueued
+        """
+        if self.skylynx_reader is None:
+            return 0
+
+        try:
+            recs = self.skylynx_reader.get_pending_recommendations()
+        except Exception as e:
+            self.audit_logger.log_error("skylynx_intake", f"Failed to read recommendations: {e}")
+            return 0
+
+        if not recs:
+            return 0
+
+        count = 0
+        for rec in recs:
+            base_score = self.skylynx_reader.priority_to_score(rec.get("priority", "medium"))
+            priority_score = base_score * self.config.skylynx_weight
+            idea = self.skylynx_reader.recommendation_to_idea(rec)
+
+            item = PriorityItem(
+                source="skylynx",
+                source_id=rec["recommendation_id"],
+                title=rec["title"],
+                description=rec.get("raw_json", {}).get("description", rec["title"]),
+                priority_score=priority_score,
+                idea_data=json.dumps(idea, default=str),
+            )
+
+            if dry_run:
+                print(f"  [DRY RUN] Would enqueue Sky-Lynx: {rec['title']} (score={priority_score:.1f})")
+                count += 1
+            else:
+                row_id = self.state_db.enqueue_item(item)
+                if row_id > 0:
+                    # Mark as dispatched in ST Factory DB
+                    try:
+                        self.skylynx_reader.mark_dispatched(rec["recommendation_id"])
+                    except Exception as e:
+                        self.audit_logger.log_error(
+                            "skylynx_intake",
+                            f"Failed to mark {rec['recommendation_id']} dispatched: {e}"
+                        )
+                    count += 1
+
+        return count
+
+    def ingest_linear(self, dry_run: bool = False) -> int:
+        """
+        Ingest issues from Linear into the priority queue.
+
+        Linear issues bypass triage (they are already triaged in Linear)
+        and enqueue directly with linear_weight applied.
+
+        Args:
+            dry_run: If True, count items but don't write to DB
+
+        Returns:
+            Number of issues enqueued
+        """
+        if self.linear_reader is None:
+            return 0
+
+        try:
+            issues = self.linear_reader.get_issues()
+        except Exception as e:
+            self.audit_logger.log_error("linear_intake", f"Failed to read issues: {e}")
+            return 0
+
+        if not issues:
+            return 0
+
+        count = 0
+        for issue in issues:
+            base_score = self.linear_reader.priority_to_score(issue.get("priority", 0))
+            priority_score = base_score * self.config.linear_weight
+            idea = self.linear_reader.issue_to_idea(issue)
+
+            item = PriorityItem(
+                source="linear",
+                source_id=issue["identifier"],
+                title=issue["title"],
+                description=issue.get("description", issue["title"]) or issue["title"],
+                priority_score=priority_score,
+                idea_data=json.dumps(idea, default=str),
+            )
+
+            if dry_run:
+                print(f"  [DRY RUN] Would enqueue Linear: {issue['identifier']} {issue['title']} (score={priority_score:.1f})")
+                count += 1
+            else:
+                row_id = self.state_db.enqueue_item(item)
+                if row_id > 0:
+                    count += 1  # Linear has no write-back (no "mark dispatched")
+
+        return count
+
+    def ingest_academy(self, dry_run: bool = False) -> int:
+        """
+        Ingest pending Academy persona promotions into the priority queue.
+
+        Academy promotions bypass triage (they are pre-validated by graduation
+        gates) and enqueue directly with academy_weight applied.
+
+        Args:
+            dry_run: If True, count items but don't write to DB
+
+        Returns:
+            Number of promotions enqueued
+        """
+        if self.academy_reader is None:
+            return 0
+
+        try:
+            promotions = self.academy_reader.get_pending_promotions()
+        except Exception as e:
+            self.audit_logger.log_error("academy_intake", f"Failed to read promotions: {e}")
+            return 0
+
+        if not promotions:
+            return 0
+
+        count = 0
+        for promo in promotions:
+            base_score = self.academy_reader.priority_to_score(promo.get("priority", "high"))
+            priority_score = base_score * self.config.academy_weight
+            idea = self.academy_reader.promotion_to_idea(promo)
+
+            item = PriorityItem(
+                source="academy",
+                source_id=promo.get("promotion_id", f"promo-{promo.get('persona_id', 'unknown')}"),
+                title=f"{promo.get('persona_name', promo.get('persona_id', 'unknown'))} - Agent Build",
+                description=idea["description"],
+                priority_score=priority_score,
+                idea_data=json.dumps(idea, default=str),
+            )
+
+            if dry_run:
+                print(f"  [DRY RUN] Would enqueue Academy: {item.title} (score={priority_score:.1f})")
+                count += 1
+            else:
+                row_id = self.state_db.enqueue_item(item)
+                if row_id > 0:
+                    # Mark as dispatched in promotions JSONL
+                    try:
+                        self.academy_reader.mark_dispatched(promo.get("promotion_id", ""))
+                    except Exception as e:
+                        self.audit_logger.log_error(
+                            "academy_intake",
+                            f"Failed to mark {promo.get('promotion_id')} dispatched: {e}"
+                        )
+                    count += 1
+
+        return count
+
     def run_cycle(self, dry_run: bool = False) -> CycleResult:
         """
-        Run a single Metroplex cycle: triage -> build -> patch.
+        Run a single Metroplex cycle: intake -> triage -> build -> patch.
 
-        Build gate now pulls from the priority queue (populated by triage)
-        instead of receiving approved_ideas directly.
+        Intake: Sky-Lynx + Linear (bypass triage, direct to queue).
+        Build gate pulls from the priority queue (populated by triage + intake).
 
         Args:
             dry_run: If True, run gates in dry-run mode (no DB writes)
@@ -119,13 +305,34 @@ class CycleOrchestrator:
         patch_count = 0
         errors = []
 
+        # Sky-Lynx Intake (enqueue recommendations directly into priority queue)
+        skylynx_count = self.ingest_skylynx(dry_run=dry_run)
+        if skylynx_count > 0:
+            print(f"+ Sky-Lynx intake: {skylynx_count} recommendations enqueued")
+            self.notifier.notify(f"Sky-Lynx: {skylynx_count} recommendations enqueued")
+
+        # Linear Intake (enqueue issues directly into priority queue)
+        linear_count = self.ingest_linear(dry_run=dry_run)
+        if linear_count > 0:
+            print(f"+ Linear intake: {linear_count} issues enqueued")
+            self.notifier.notify(f"Linear: {linear_count} issues enqueued")
+
+        # Academy Intake (enqueue persona promotions directly into priority queue)
+        academy_count = self.ingest_academy(dry_run=dry_run)
+        if academy_count > 0:
+            print(f"+ Academy intake: {academy_count} promotions enqueued")
+            self.notifier.notify(f"Academy: {academy_count} persona promotions enqueued")
+
         # Gate 1: Triage (scores ideas, enqueues approved into priority_queue)
         if self.circuit_breaker.is_halted("triage"):
             error_msg = "Gate 1 (triage) halted by circuit breaker"
             errors.append(error_msg)
             print(f"! {error_msg}")
-            self.notifier.notify(f"ALERT: triage gate halted by circuit breaker", "warning")
+            if "triage" not in self._halted_notified:
+                self.notifier.notify(f"ALERT: triage gate halted by circuit breaker", "warning")
+                self._halted_notified.add("triage")
         else:
+            self._halted_notified.discard("triage")
             try:
                 print(f"Running Gate 1 (triage)...")
                 decisions = self.triage_gate.run(dry_run=dry_run)
@@ -153,8 +360,11 @@ class CycleOrchestrator:
             error_msg = "Gate 2 (build) halted by circuit breaker"
             errors.append(error_msg)
             print(f"! {error_msg}")
-            self.notifier.notify(f"ALERT: build gate halted by circuit breaker", "warning")
+            if "build" not in self._halted_notified:
+                self.notifier.notify(f"ALERT: build gate halted by circuit breaker", "warning")
+                self._halted_notified.add("build")
         else:
+            self._halted_notified.discard("build")
             try:
                 print(f"Running Gate 2 (build) from priority queue...")
                 jobs = self.build_orchestrator.run_from_queue(self.state_db, dry_run=dry_run)
@@ -176,12 +386,66 @@ class CycleOrchestrator:
                 self.audit_logger.log_error("build", error_msg)
                 self.notifier.notify(f"Gate 2 (build) FAILED: {str(e)}", "error")
 
+        # Build Status Sync (unconditional -- syncs completed/failed builds every cycle)
+        try:
+            sync_result = self.build_orchestrator.poll_and_sync_status()
+            newly_synced = sync_result.get("newly_synced", [])
+            if newly_synced:
+                completed = [jid for jid in newly_synced if jid in sync_result.get("completed", [])]
+                failed = [jid for jid in newly_synced if jid in sync_result.get("failed", [])]
+                if completed:
+                    self.notifier.notify(f"Build completed: {', '.join(completed)}")
+                if failed:
+                    self.notifier.notify(f"Build failed: {', '.join(failed)}", "error")
+        except Exception as e:
+            # Non-fatal -- log and continue to publish gate
+            self.audit_logger.log_error("build", f"Status poll failed: {e}")
+
+        # Gate 4: Publish (push completed builds to GitHub)
+        publish_count = 0
+        if self.publish_gate is not None:
+            if self.circuit_breaker.is_halted("publish"):
+                error_msg = "Gate 4 (publish) halted by circuit breaker"
+                errors.append(error_msg)
+                print(f"! {error_msg}")
+                if "publish" not in self._halted_notified:
+                    self.notifier.notify(f"ALERT: publish gate halted by circuit breaker", "warning")
+                    self._halted_notified.add("publish")
+            else:
+                self._halted_notified.discard("publish")
+                try:
+                    print(f"Running Gate 4 (publish)...")
+                    pub_jobs = self.publish_gate.run(dry_run=dry_run)
+                    publish_count = sum(1 for j in pub_jobs if j.status == "published")
+
+                    self.circuit_breaker.record_success("publish")
+                    print(f"+ Gate 4 completed: {len(pub_jobs)} processed, {publish_count} published")
+
+                    for job in pub_jobs:
+                        if job.status == "published":
+                            self.notifier.notify(
+                                f"Published: {self.config.github_org}/{job.repo_name} ({job.title})"
+                            )
+                        elif job.status == "failed":
+                            self.notifier.notify(f"Publish FAILED: {job.title} -- {job.error}", "error")
+                except Exception as e:
+                    error_msg = f"Gate 4 (publish) failed: {str(e)}"
+                    errors.append(error_msg)
+                    print(f"x {error_msg}")
+                    self.circuit_breaker.record_failure("publish", error_msg)
+                    self.audit_logger.log_error("publish", error_msg)
+                    self.notifier.notify(f"Gate 4 (publish) FAILED: {str(e)}", "error")
+
         # Gate 3: Patch
         if self.circuit_breaker.is_halted("patch"):
             error_msg = "Gate 3 (patch) halted by circuit breaker"
             errors.append(error_msg)
             print(f"! {error_msg}")
+            if "patch" not in self._halted_notified:
+                self.notifier.notify(f"ALERT: patch gate halted by circuit breaker", "warning")
+                self._halted_notified.add("patch")
         else:
+            self._halted_notified.discard("patch")
             try:
                 print(f"Running Gate 3 (patch)...")
                 patches = self.patch_gate.run(dry_run=dry_run)
@@ -200,17 +464,22 @@ class CycleOrchestrator:
         self.state_db.end_cycle(cycle_id, triage_count, build_count, patch_count, errors)
         self.audit_logger.log_cycle_end(cycle_id, triage_count, build_count, patch_count, errors)
 
-        # Only notify on cycles with actual activity or errors (suppress empty cycle noise)
-        if errors or build_count > 0:
+        # Only notify on cycles with actual activity or new errors.
+        # Suppress summary when the only "errors" are halted-gate messages (already notified once).
+        halted_only = all("halted by circuit breaker" in e for e in errors)
+        has_activity = triage_count > 0 or build_count > 0 or publish_count > 0 or patch_count > 0
+        if has_activity or (errors and not halted_only):
             error_text = f", {len(errors)} errors" if errors else ""
+            pub_text = f", {publish_count} published" if publish_count > 0 else ""
             self.notifier.notify(
-                f"Metroplex: {triage_count} triaged, {build_count} built, {patch_count} patched{error_text}"
+                f"Metroplex: {triage_count} triaged, {build_count} built{pub_text}, {patch_count} patched{error_text}"
             )
 
         # Update cycle result
         cycle_result.completed_at = datetime.now()
         cycle_result.triage_count = triage_count
         cycle_result.build_count = build_count
+        cycle_result.publish_count = publish_count
         cycle_result.patch_count = patch_count
         cycle_result.errors = errors
 
@@ -266,6 +535,7 @@ class CycleOrchestrator:
             print(f"\nCycle {cycle_count} completed")
             print(f"  Triage: {cycle_result.triage_count}")
             print(f"  Build: {cycle_result.build_count}")
+            print(f"  Publish: {cycle_result.publish_count}")
             print(f"  Patch: {cycle_result.patch_count}")
             print(f"  Errors: {len(cycle_result.errors)}")
 

@@ -40,6 +40,16 @@ class TestConfigDefaults:
         config = Config()
         assert config.build_model == "opus"
 
+    def test_default_build_parallel(self):
+        with patch.dict(os.environ, {"METROPLEX_BUILD_PARALLEL": ""}):
+            config = Config()
+            assert config.build_parallel is False
+
+    def test_default_build_max_workers(self):
+        with patch.dict(os.environ, {"METROPLEX_BUILD_MAX_WORKERS": ""}):
+            config = Config()
+            assert config.build_max_workers == 2
+
     def test_default_academy_repo(self):
         config = Config()
         assert config.academy_repo == "m2ai-portfolio/agent-persona-academy"
@@ -90,10 +100,54 @@ class TestConfigEnvOverrides:
             config = Config()
             assert config.cycle_sleep_seconds == 120
 
+    def test_override_build_parallel_true(self):
+        with patch.dict(os.environ, {"METROPLEX_BUILD_PARALLEL": "true"}):
+            config = Config()
+            assert config.build_parallel is True
+
+    def test_override_build_parallel_one(self):
+        with patch.dict(os.environ, {"METROPLEX_BUILD_PARALLEL": "1"}):
+            config = Config()
+            assert config.build_parallel is True
+
+    def test_override_build_parallel_false(self):
+        with patch.dict(os.environ, {"METROPLEX_BUILD_PARALLEL": "false"}):
+            config = Config()
+            assert config.build_parallel is False
+
+    def test_override_build_max_workers(self):
+        with patch.dict(os.environ, {"METROPLEX_BUILD_MAX_WORKERS": "3"}):
+            config = Config()
+            assert config.build_max_workers == 3
+
+    def test_invalid_max_workers_keeps_default(self):
+        with patch.dict(os.environ, {"METROPLEX_BUILD_MAX_WORKERS": "abc"}):
+            config = Config()
+            assert config.build_max_workers == 2  # default preserved
+
     def test_invalid_int_env_keeps_default(self):
         with patch.dict(os.environ, {"METROPLEX_APPROVE_THRESHOLD": "not_a_number"}):
             config = Config()
             assert config.approve_threshold == 70  # default preserved
+
+    def test_override_max_concurrent_builds(self):
+        with patch.dict(os.environ, {"METROPLEX_MAX_CONCURRENT_BUILDS": "4"}):
+            config = Config()
+            assert config.max_concurrent_builds == 4
+
+    def test_invalid_max_concurrent_builds_keeps_default(self):
+        with patch.dict(os.environ, {"METROPLEX_MAX_CONCURRENT_BUILDS": "nope"}):
+            config = Config()
+            assert config.max_concurrent_builds == 1  # default preserved
+
+
+class TestConfigConcurrencyDefaults:
+    """Test Level 2 concurrency config defaults (env-isolated)."""
+
+    def test_default_max_concurrent_builds(self):
+        with patch.dict(os.environ, {"METROPLEX_MAX_CONCURRENT_BUILDS": ""}):
+            config = Config()
+            assert config.max_concurrent_builds == 1
 
 
 class TestConfigValidation:

@@ -6,7 +6,7 @@ import pytest
 from datetime import datetime
 
 from db import StateDB
-from models import TriageDecision, BuildJob, PatchApplication, GateStatus
+from models import TriageDecision, BuildJob, PatchApplication, GateStatus, PriorityItem
 
 
 @pytest.fixture
@@ -282,3 +282,334 @@ class TestConnectionManagement:
         db.init_db()
         db.close()
         db.close()  # Should not raise
+
+
+class TestPriorityQueue:
+    """Test priority queue operations."""
+
+    def test_init_creates_priority_queue_table(self, db):
+        cursor = db.conn.cursor()
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='priority_queue'")
+        assert cursor.fetchone() is not None
+
+    def test_init_creates_priority_queue_indexes(self, db):
+        cursor = db.conn.cursor()
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='index' AND name LIKE 'idx_priority_queue_%'")
+        indexes = [row["name"] for row in cursor.fetchall()]
+        assert "idx_priority_queue_status" in indexes
+        assert "idx_priority_queue_score" in indexes
+        assert "idx_priority_queue_source" in indexes
+
+    def test_enqueue_item(self, db):
+        item = PriorityItem(
+            source="ideaforge",
+            source_id="42",
+            title="Test Idea",
+            description="A test idea",
+            priority_score=85.0,
+            idea_data='{"id": 42, "title": "Test Idea"}',
+        )
+        row_id = db.enqueue_item(item)
+        assert row_id > 0
+
+        # Verify stored
+        cursor = db.conn.cursor()
+        cursor.execute("SELECT * FROM priority_queue WHERE id = ?", (row_id,))
+        row = cursor.fetchone()
+        assert row["source"] == "ideaforge"
+        assert row["source_id"] == "42"
+        assert row["title"] == "Test Idea"
+        assert row["priority_score"] == 85.0
+        assert row["status"] == "pending"
+
+    def test_enqueue_duplicate_skips(self, db):
+        item = PriorityItem(
+            source="ideaforge",
+            source_id="42",
+            title="Test Idea",
+            description="Desc",
+            priority_score=85.0,
+        )
+        first_id = db.enqueue_item(item)
+        second_id = db.enqueue_item(item)
+
+        assert first_id > 0
+        assert second_id == 0  # Duplicate skipped
+
+        # Verify only one row
+        cursor = db.conn.cursor()
+        cursor.execute("SELECT COUNT(*) as cnt FROM priority_queue")
+        assert cursor.fetchone()["cnt"] == 1
+
+    def test_get_next_pending_returns_highest_score(self, db):
+        for score, sid in [(50.0, "1"), (90.0, "2"), (70.0, "3")]:
+            item = PriorityItem(
+                source="ideaforge",
+                source_id=sid,
+                title=f"Idea {sid}",
+                description="Desc",
+                priority_score=score,
+            )
+            db.enqueue_item(item)
+
+        result = db.get_next_pending()
+        assert result is not None
+        assert result.source_id == "2"
+        assert result.priority_score == 90.0
+
+    def test_get_next_pending_empty_queue(self, db):
+        result = db.get_next_pending()
+        assert result is None
+
+    def test_get_next_pending_skips_non_pending(self, db):
+        item = PriorityItem(
+            source="ideaforge",
+            source_id="1",
+            title="Dispatched Idea",
+            description="Desc",
+            priority_score=90.0,
+        )
+        row_id = db.enqueue_item(item)
+        db.update_item_status(row_id, "dispatched", "dispatched_at")
+
+        result = db.get_next_pending()
+        assert result is None
+
+    def test_update_item_status(self, db):
+        item = PriorityItem(
+            source="ideaforge",
+            source_id="1",
+            title="Test Idea",
+            description="Desc",
+            priority_score=85.0,
+        )
+        row_id = db.enqueue_item(item)
+
+        db.update_item_status(row_id, "dispatched", "dispatched_at")
+
+        cursor = db.conn.cursor()
+        cursor.execute("SELECT status, dispatched_at FROM priority_queue WHERE id = ?", (row_id,))
+        row = cursor.fetchone()
+        assert row["status"] == "dispatched"
+        assert row["dispatched_at"] is not None
+
+    def test_update_item_status_completed(self, db):
+        item = PriorityItem(
+            source="ideaforge",
+            source_id="1",
+            title="Test Idea",
+            description="Desc",
+            priority_score=85.0,
+        )
+        row_id = db.enqueue_item(item)
+
+        db.update_item_status(row_id, "completed", "completed_at")
+
+        cursor = db.conn.cursor()
+        cursor.execute("SELECT status, completed_at FROM priority_queue WHERE id = ?", (row_id,))
+        row = cursor.fetchone()
+        assert row["status"] == "completed"
+        assert row["completed_at"] is not None
+
+    def test_update_item_status_no_timestamp(self, db):
+        item = PriorityItem(
+            source="ideaforge",
+            source_id="1",
+            title="Test Idea",
+            description="Desc",
+            priority_score=85.0,
+        )
+        row_id = db.enqueue_item(item)
+
+        db.update_item_status(row_id, "failed")
+
+        cursor = db.conn.cursor()
+        cursor.execute("SELECT status FROM priority_queue WHERE id = ?", (row_id,))
+        assert cursor.fetchone()["status"] == "failed"
+
+    def test_get_queue_summary(self, db):
+        # Insert items with different statuses
+        for sid, score in [("1", 90.0), ("2", 80.0), ("3", 70.0)]:
+            item = PriorityItem(
+                source="ideaforge", source_id=sid, title=f"Idea {sid}",
+                description="Desc", priority_score=score,
+            )
+            db.enqueue_item(item)
+
+        # Mark one as dispatched and one as completed
+        db.update_item_status(2, "dispatched", "dispatched_at")
+        db.update_item_status(3, "completed", "completed_at")
+
+        summary = db.get_queue_summary()
+        assert summary["total"] == 3
+        assert summary.get("pending", 0) == 1
+        assert summary.get("dispatched", 0) == 1
+        assert summary.get("completed", 0) == 1
+
+    def test_get_queue_summary_empty(self, db):
+        summary = db.get_queue_summary()
+        assert summary["total"] == 0
+
+    def test_update_build_job_status_syncs_priority_queue(self, db):
+        """Completing a build job also updates the priority queue item."""
+        # Insert into priority_queue
+        item = PriorityItem(
+            source="ideaforge", source_id="5", title="Build Me",
+            description="Desc", priority_score=80.0,
+        )
+        db.enqueue_item(item)
+        db.update_item_status(1, "dispatched", "dispatched_at")
+
+        # Insert a matching build job
+        job = BuildJob(
+            idea_id=5, title="Build Me", spec_path="/tmp/spec.txt",
+            queue_job_id="metroplex-5", status="queued",
+            queued_at=datetime(2026, 2, 26, 12, 0, 0),
+        )
+        db.record_build_job(job)
+
+        # Mark build job as completed
+        db.update_build_job_status("metroplex-5", "completed")
+
+        # Verify build_jobs table updated
+        cursor = db.conn.cursor()
+        cursor.execute("SELECT status FROM build_jobs WHERE queue_job_id = 'metroplex-5'")
+        assert cursor.fetchone()["status"] == "completed"
+
+        # Verify priority_queue also updated
+        cursor.execute("SELECT status, completed_at FROM priority_queue WHERE source_id = '5'")
+        row = cursor.fetchone()
+        assert row["status"] == "completed"
+        assert row["completed_at"] is not None
+
+    def test_update_build_job_status_failed_syncs(self, db):
+        """Failing a build job marks priority queue item as failed."""
+        item = PriorityItem(
+            source="ideaforge", source_id="6", title="Will Fail",
+            description="Desc", priority_score=75.0,
+        )
+        db.enqueue_item(item)
+
+        job = BuildJob(
+            idea_id=6, title="Will Fail", spec_path="/tmp/spec.txt",
+            queue_job_id="metroplex-6", status="queued",
+            queued_at=datetime(2026, 2, 26, 12, 0, 0),
+        )
+        db.record_build_job(job)
+
+        db.update_build_job_status("metroplex-6", "failed")
+
+        cursor = db.conn.cursor()
+        cursor.execute("SELECT status FROM priority_queue WHERE source_id = '6'")
+        assert cursor.fetchone()["status"] == "failed"
+
+    def test_enqueue_different_sources(self, db):
+        """Items from different sources with same source_id are allowed."""
+        item1 = PriorityItem(
+            source="ideaforge", source_id="1", title="From IdeaForge",
+            description="Desc", priority_score=80.0,
+        )
+        item2 = PriorityItem(
+            source="skylynx", source_id="1", title="From SkyLynx",
+            description="Desc", priority_score=90.0,
+        )
+        id1 = db.enqueue_item(item1)
+        id2 = db.enqueue_item(item2)
+
+        assert id1 > 0
+        assert id2 > 0
+        assert id1 != id2
+
+    # --- Gap 1: Multi-source build status sync tests ---
+
+    def test_update_build_job_status_skylynx_source(self, db):
+        """New format job ID with skylynx source syncs priority_queue correctly."""
+        item = PriorityItem(
+            source="skylynx", source_id="sl-abc123", title="SkyLynx Rec",
+            description="Desc", priority_score=135.0,
+        )
+        row_id = db.enqueue_item(item)
+        db.update_item_status(row_id, "dispatched", "dispatched_at")
+
+        job = BuildJob(
+            idea_id=0, title="SkyLynx Rec", spec_path="/tmp/spec.txt",
+            queue_job_id="metroplex-skylynx-sl-abc123", status="queued",
+            queued_at=datetime(2026, 2, 27, 12, 0, 0),
+        )
+        db.record_build_job(job)
+
+        db.update_build_job_status("metroplex-skylynx-sl-abc123", "completed")
+
+        cursor = db.conn.cursor()
+        cursor.execute(
+            "SELECT status, completed_at FROM priority_queue WHERE source = 'skylynx' AND source_id = 'sl-abc123'"
+        )
+        row = cursor.fetchone()
+        assert row["status"] == "completed"
+        assert row["completed_at"] is not None
+
+    def test_update_build_job_status_linear_source(self, db):
+        """New format job ID with linear source (non-digit source_id) syncs correctly."""
+        item = PriorityItem(
+            source="linear", source_id="TOO-42", title="Linear Issue",
+            description="Desc", priority_score=160.0,
+        )
+        row_id = db.enqueue_item(item)
+        db.update_item_status(row_id, "dispatched", "dispatched_at")
+
+        job = BuildJob(
+            idea_id=0, title="Linear Issue", spec_path="/tmp/spec.txt",
+            queue_job_id="metroplex-linear-TOO-42", status="queued",
+            queued_at=datetime(2026, 2, 27, 12, 0, 0),
+        )
+        db.record_build_job(job)
+
+        db.update_build_job_status("metroplex-linear-TOO-42", "failed")
+
+        cursor = db.conn.cursor()
+        cursor.execute(
+            "SELECT status FROM priority_queue WHERE source = 'linear' AND source_id = 'TOO-42'"
+        )
+        assert cursor.fetchone()["status"] == "failed"
+
+    def test_update_build_job_status_ideaforge_new_format(self, db):
+        """New format with ideaforge source (backward compat with numeric IDs)."""
+        item = PriorityItem(
+            source="ideaforge", source_id="5", title="IdeaForge Idea",
+            description="Desc", priority_score=80.0,
+        )
+        row_id = db.enqueue_item(item)
+        db.update_item_status(row_id, "dispatched", "dispatched_at")
+
+        job = BuildJob(
+            idea_id=5, title="IdeaForge Idea", spec_path="/tmp/spec.txt",
+            queue_job_id="metroplex-ideaforge-5", status="queued",
+            queued_at=datetime(2026, 2, 27, 12, 0, 0),
+        )
+        db.record_build_job(job)
+
+        db.update_build_job_status("metroplex-ideaforge-5", "completed")
+
+        cursor = db.conn.cursor()
+        cursor.execute(
+            "SELECT status FROM priority_queue WHERE source = 'ideaforge' AND source_id = '5'"
+        )
+        assert cursor.fetchone()["status"] == "completed"
+
+    def test_update_build_job_status_malformed_job_id_noop(self, db):
+        """Malformed job IDs don't crash and don't modify priority_queue."""
+        item = PriorityItem(
+            source="ideaforge", source_id="10", title="Safe Item",
+            description="Desc", priority_score=70.0,
+        )
+        row_id = db.enqueue_item(item)
+        db.update_item_status(row_id, "dispatched", "dispatched_at")
+
+        # These should all be no-ops (no crash, no queue update)
+        db.update_build_job_status("invalid-format", "completed")
+        db.update_build_job_status("", "completed")
+        db.update_build_job_status("metroplex-unknown-123", "completed")
+
+        cursor = db.conn.cursor()
+        cursor.execute("SELECT status FROM priority_queue WHERE source_id = '10'")
+        assert cursor.fetchone()["status"] == "dispatched"  # Unchanged

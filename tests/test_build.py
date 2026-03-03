@@ -394,7 +394,7 @@ class TestBuildOrchestrator:
             assert "add" in command
             assert str(spec_path) in command
             assert "--id" in command
-            assert "metroplex-1" in command  # job_id format
+            assert "metroplex-ideaforge-1" in command  # job_id format: metroplex-{source}-{id}
             assert "--model" in command
             assert orchestrator.config.build_model in command
 
@@ -408,7 +408,7 @@ class TestBuildOrchestrator:
             assert job.idea_id == tool_idea["id"]
             assert job.title == tool_idea["title"]
             assert job.spec_path == str(spec_path)
-            assert job.queue_job_id == "metroplex-1"
+            assert job.queue_job_id == "metroplex-ideaforge-1"
             assert job.status == "queued"
 
             # Verify state_db was called
@@ -434,7 +434,7 @@ class TestBuildOrchestrator:
             # Verify BuildJob was created with failed status
             assert job is not None
             assert job.status == "failed"
-            assert job.queue_job_id == "metroplex-1"
+            assert job.queue_job_id == "metroplex-ideaforge-1"
 
             # Verify state_db was called with failed job
             assert mock_state_db.record_build_job.called
@@ -460,7 +460,7 @@ class TestBuildOrchestrator:
             # Verify command was printed
             captured = capsys.readouterr()
             assert "[DRY RUN]" in captured.out
-            assert "metroplex-1" in captured.out
+            assert "metroplex-ideaforge-1" in captured.out
 
     def test_check_status(self, orchestrator, mock_audit_logger):
         """Test 4: Call check_status() with mocked subprocess returning JSON → verify parsed correctly."""
@@ -512,12 +512,12 @@ class TestBuildOrchestrator:
             job = orchestrator.queue_build(idea, spec_path, dry_run=False)
 
             # Verify job_id format
-            assert job.queue_job_id == "metroplex-42"
+            assert job.queue_job_id == "metroplex-ideaforge-42"
 
             # Verify it was used in the command
             call_args = mock_run.call_args
             command = call_args[0][0]
-            assert "metroplex-42" in command
+            assert "metroplex-ideaforge-42" in command
 
     def test_start_queue_success(self, orchestrator, mock_audit_logger):
         """Test start_queue with successful execution."""
@@ -609,6 +609,57 @@ class TestBuildOrchestrator:
             # Verify no jobs were returned (dry_run returns None from queue_build)
             assert len(jobs) == 0
 
+    def test_queue_build_parallel_flags(self, mock_state_db, mock_spec_generator, mock_audit_logger, tool_idea):
+        """Test queue_build passes --parallel and --max-workers when config.build_parallel is True."""
+        config = Config()
+        config.build_parallel = True
+        config.build_max_workers = 3
+
+        orch = BuildOrchestrator(
+            config=config,
+            state_db=mock_state_db,
+            spec_generator=mock_spec_generator,
+            audit_logger=mock_audit_logger,
+        )
+        spec_path = Path("/tmp/app_spec_1.txt")
+
+        with patch('subprocess.run') as mock_run:
+            mock_result = Mock()
+            mock_result.returncode = 0
+            mock_result.stdout = ""
+            mock_result.stderr = ""
+            mock_run.return_value = mock_result
+
+            orch.queue_build(tool_idea, spec_path, dry_run=False)
+
+            call_args = mock_run.call_args
+            command = call_args[0][0]
+
+            assert "--parallel" in command
+            assert "--max-workers" in command
+            idx = command.index("--max-workers")
+            assert command[idx + 1] == "3"
+
+    def test_queue_build_no_parallel_flags_when_disabled(self, orchestrator, mock_state_db, mock_audit_logger, tool_idea):
+        """Test queue_build does NOT pass --parallel when config.build_parallel is False."""
+        orchestrator.config.build_parallel = False  # Ensure disabled regardless of .env
+        spec_path = Path("/tmp/app_spec_1.txt")
+
+        with patch('subprocess.run') as mock_run:
+            mock_result = Mock()
+            mock_result.returncode = 0
+            mock_result.stdout = ""
+            mock_result.stderr = ""
+            mock_run.return_value = mock_result
+
+            orchestrator.queue_build(tool_idea, spec_path, dry_run=False)
+
+            call_args = mock_run.call_args
+            command = call_args[0][0]
+
+            assert "--parallel" not in command
+            assert "--max-workers" not in command
+
     def test_queue_build_timeout(self, orchestrator, mock_state_db, mock_audit_logger, tool_idea):
         """Test queue_build handles timeout gracefully."""
         spec_path = Path("/tmp/app_spec_1.txt")
@@ -628,3 +679,270 @@ class TestBuildOrchestrator:
             assert mock_audit_logger.log_error.called
             error_call_args = mock_audit_logger.log_error.call_args
             assert "timed out" in error_call_args[1]["error"]
+
+    # --- Level 2: Concurrency tests ---
+
+    def test_start_queue_background_passes_concurrency(self, mock_state_db, mock_spec_generator, mock_audit_logger):
+        """Test start_queue_background includes --concurrency flag from config."""
+        config = Config()
+        config.max_concurrent_builds = 3
+
+        orch = BuildOrchestrator(
+            config=config,
+            state_db=mock_state_db,
+            spec_generator=mock_spec_generator,
+            audit_logger=mock_audit_logger,
+        )
+
+        with patch('subprocess.Popen') as mock_popen, \
+             patch.object(orch, 'is_runner_active', return_value=False), \
+             patch('builtins.open', MagicMock()):
+            mock_proc = MagicMock()
+            mock_proc.pid = 12345
+            mock_popen.return_value = mock_proc
+
+            result = orch.start_queue_background(dry_run=False)
+
+            assert result is True
+            call_args = mock_popen.call_args
+            command = call_args[0][0]
+            assert "--concurrency" in command
+            idx = command.index("--concurrency")
+            assert command[idx + 1] == "3"
+
+    def test_start_queue_background_dry_run_shows_concurrency(self, orchestrator, capsys):
+        """Test dry-run prints the --concurrency flag."""
+        orchestrator.config.max_concurrent_builds = 2
+        result = orchestrator.start_queue_background(dry_run=True)
+        assert result is True
+
+        captured = capsys.readouterr()
+        assert "[DRY RUN]" in captured.out
+        assert "--concurrency" in captured.out
+        assert "2" in captured.out
+
+    def test_start_queue_background_skips_if_active(self, orchestrator, mock_audit_logger, capsys):
+        """Test start_queue_background skips if runner already active."""
+        with patch.object(orchestrator, 'is_runner_active', return_value=True):
+            result = orchestrator.start_queue_background(dry_run=False)
+            assert result is True
+
+            captured = capsys.readouterr()
+            assert "already active" in captured.out
+
+    def test_poll_and_sync_returns_list_format(self, orchestrator, mock_state_db, mock_audit_logger):
+        """Test poll_and_sync_status returns running as list[str] with running_count."""
+        status_dict = {
+            "jobs": [
+                {"id": "metroplex-1", "status": "running"},
+                {"id": "metroplex-2", "status": "running"},
+                {"id": "metroplex-3", "status": "completed"},
+                {"id": "metroplex-4", "status": "failed"},
+            ]
+        }
+
+        with patch.object(orchestrator, 'check_status', return_value=status_dict), \
+             patch.object(orchestrator, 'is_runner_active', return_value=True):
+            # Mock state_db.update_build_job_status
+            mock_state_db.update_build_job_status = Mock()
+
+            result = orchestrator.poll_and_sync_status()
+
+            assert isinstance(result["running"], list)
+            assert result["running"] == ["metroplex-1", "metroplex-2"]
+            assert result["running_count"] == 2
+            assert result["completed"] == ["metroplex-3"]
+            assert result["failed"] == ["metroplex-4"]
+            assert "metroplex-3" in result["newly_synced"]
+            assert "metroplex-4" in result["newly_synced"]
+
+    def test_poll_and_sync_empty_status(self, orchestrator, mock_audit_logger):
+        """Test poll_and_sync_status with empty status returns zero-filled dict."""
+        with patch.object(orchestrator, 'check_status', return_value={}), \
+             patch.object(orchestrator, 'is_runner_active', return_value=False):
+            result = orchestrator.poll_and_sync_status()
+
+            assert result["running"] == []
+            assert result["running_count"] == 0
+            assert result["completed"] == []
+            assert result["failed"] == []
+            assert result["newly_synced"] == []
+
+    # --- Gap 1: Multi-source poll_and_sync tests ---
+
+    def test_poll_and_sync_multi_source_jobs(self, orchestrator, mock_state_db, mock_audit_logger):
+        """poll_and_sync handles jobs from multiple sources."""
+        status_dict = {
+            "jobs": [
+                {"id": "metroplex-ideaforge-5", "status": "completed"},
+                {"id": "metroplex-skylynx-sl-abc", "status": "completed"},
+                {"id": "metroplex-linear-TOO-42", "status": "running"},
+            ]
+        }
+        with patch.object(orchestrator, 'check_status', return_value=status_dict), \
+             patch.object(orchestrator, 'is_runner_active', return_value=True):
+            mock_state_db.update_build_job_status = Mock()
+            result = orchestrator.poll_and_sync_status()
+            assert result["running"] == ["metroplex-linear-TOO-42"]
+            assert result["running_count"] == 1
+            assert "metroplex-ideaforge-5" in result["newly_synced"]
+            assert "metroplex-skylynx-sl-abc" in result["newly_synced"]
+            assert mock_state_db.update_build_job_status.call_count == 2
+
+    def test_poll_and_sync_unexpected_status_ignored(self, orchestrator, mock_state_db, mock_audit_logger):
+        """Jobs with unexpected status are not categorized."""
+        status_dict = {
+            "jobs": [
+                {"id": "metroplex-ideaforge-1", "status": "queued"},
+                {"id": "metroplex-ideaforge-2", "status": "completed"},
+            ]
+        }
+        with patch.object(orchestrator, 'check_status', return_value=status_dict), \
+             patch.object(orchestrator, 'is_runner_active', return_value=True):
+            mock_state_db.update_build_job_status = Mock()
+            result = orchestrator.poll_and_sync_status()
+            assert "metroplex-ideaforge-1" not in result["running"]
+            assert "metroplex-ideaforge-1" not in result["completed"]
+            assert "metroplex-ideaforge-2" in result["newly_synced"]
+
+    def test_poll_and_sync_all_running_no_sync(self, orchestrator, mock_state_db, mock_audit_logger):
+        """When all jobs are running, no DB sync calls are made."""
+        status_dict = {
+            "jobs": [
+                {"id": "metroplex-ideaforge-1", "status": "running"},
+                {"id": "metroplex-skylynx-sl-x", "status": "running"},
+            ]
+        }
+        with patch.object(orchestrator, 'check_status', return_value=status_dict), \
+             patch.object(orchestrator, 'is_runner_active', return_value=True):
+            mock_state_db.update_build_job_status = Mock()
+            result = orchestrator.poll_and_sync_status()
+            assert result["running_count"] == 2
+            assert result["newly_synced"] == []
+            mock_state_db.update_build_job_status.assert_not_called()
+
+    def test_poll_and_sync_db_error_continues(self, orchestrator, mock_state_db, mock_audit_logger):
+        """A DB error syncing one job does not prevent syncing others."""
+        status_dict = {
+            "jobs": [
+                {"id": "metroplex-ideaforge-1", "status": "completed"},
+                {"id": "metroplex-ideaforge-2", "status": "completed"},
+            ]
+        }
+        call_count = {"n": 0}
+        def side_effect(*args):
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                raise Exception("DB locked")
+        with patch.object(orchestrator, 'check_status', return_value=status_dict), \
+             patch.object(orchestrator, 'is_runner_active', return_value=True):
+            mock_state_db.update_build_job_status = Mock(side_effect=side_effect)
+            result = orchestrator.poll_and_sync_status()
+            assert mock_state_db.update_build_job_status.call_count == 2
+            # Second job should have synced even though first failed
+            assert len(result["newly_synced"]) >= 1
+
+    def test_poll_and_sync_runner_not_active(self, orchestrator, mock_audit_logger):
+        """When runner is not active and no status, returns empty result."""
+        with patch.object(orchestrator, 'is_runner_active', return_value=False), \
+             patch.object(orchestrator, 'check_status', return_value={}):
+            result = orchestrator.poll_and_sync_status()
+            assert result["running"] == []
+            assert result["running_count"] == 0
+            assert result["newly_synced"] == []
+
+    def test_run_from_queue_capacity_dispatch(self, mock_state_db, mock_spec_generator, mock_audit_logger):
+        """Test run_from_queue dispatches up to available_slots."""
+        config = Config()
+        config.max_concurrent_builds = 3
+        config.max_approve_per_cycle = 5
+
+        orch = BuildOrchestrator(
+            config=config,
+            state_db=mock_state_db,
+            spec_generator=mock_spec_generator,
+            audit_logger=mock_audit_logger,
+        )
+
+        # Simulate 1 running job, so 2 slots available
+        mock_sync = {
+            "running": ["metroplex-old"],
+            "running_count": 1,
+            "completed": [],
+            "failed": [],
+            "newly_synced": [],
+        }
+
+        # Create mock priority items
+        mock_items = [
+            Mock(id=10, source_id=10, title="Idea A", description="Desc A",
+                 idea_data=json.dumps({"id": 10, "title": "Idea A", "description": "Desc A",
+                                       "problem_statement": "P", "target_audience": "T",
+                                       "artifact_type": "tool"})),
+            Mock(id=11, source_id=11, title="Idea B", description="Desc B",
+                 idea_data=json.dumps({"id": 11, "title": "Idea B", "description": "Desc B",
+                                       "problem_statement": "P", "target_audience": "T",
+                                       "artifact_type": "tool"})),
+            None,  # Third call returns None (queue empty)
+        ]
+        mock_state_db.get_next_pending = Mock(side_effect=mock_items)
+        mock_state_db.update_item_status = Mock()
+
+        with patch.object(orch, 'is_runner_active', return_value=True), \
+             patch.object(orch, 'poll_and_sync_status', return_value=mock_sync), \
+             patch.object(orch, 'run', return_value=[]) as mock_run:
+            orch.run_from_queue(mock_state_db, dry_run=False)
+
+            # Should have pulled 2 items (min(2 available, 5 per-cycle))
+            assert mock_run.called
+            ideas_arg = mock_run.call_args[0][0]
+            assert len(ideas_arg) == 2
+            assert ideas_arg[0]["id"] == 10
+            assert ideas_arg[1]["id"] == 11
+
+    def test_run_from_queue_at_capacity_skips(self, mock_state_db, mock_spec_generator, mock_audit_logger, capsys):
+        """Test run_from_queue skips dispatch when at capacity."""
+        config = Config()
+        config.max_concurrent_builds = 2
+
+        orch = BuildOrchestrator(
+            config=config,
+            state_db=mock_state_db,
+            spec_generator=mock_spec_generator,
+            audit_logger=mock_audit_logger,
+        )
+
+        mock_sync = {
+            "running": ["metroplex-1", "metroplex-2"],
+            "running_count": 2,
+            "completed": [],
+            "failed": [],
+            "newly_synced": [],
+        }
+
+        with patch.object(orch, 'is_runner_active', return_value=True), \
+             patch.object(orch, 'poll_and_sync_status', return_value=mock_sync):
+            jobs = orch.run_from_queue(mock_state_db, dry_run=False)
+
+            assert jobs == []
+            captured = capsys.readouterr()
+            assert "At capacity" in captured.out
+
+    def test_is_runner_active_no_pid_file(self, orchestrator):
+        """Test is_runner_active returns False when PID file doesn't exist."""
+        with patch('gates.build.RUNNER_PID_FILE') as mock_pid:
+            mock_pid.exists.return_value = False
+            assert orchestrator.is_runner_active() is False
+
+    def test_is_runner_active_stale_pid(self, orchestrator, tmp_path):
+        """Test is_runner_active cleans up stale PID file."""
+        pid_file = tmp_path / "runner.pid"
+        pid_file.write_text("99999999")  # Non-existent PID
+
+        with patch('gates.build.RUNNER_PID_FILE', pid_file):
+            result = orchestrator.is_runner_active()
+            assert result is False
+            # Stale PID file should be cleaned up
+            assert not pid_file.exists()
+
+

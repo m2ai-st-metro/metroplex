@@ -571,3 +571,139 @@ def test_triage_gate_boundary_conditions(
 
     finally:
         Path(db_path).unlink(missing_ok=True)
+
+
+def test_triage_gate_enqueues_approved_into_priority_queue(
+    triage_config, in_memory_state_db, temp_audit_log, create_ideaforge_db
+):
+    """
+    Test: Approved ideas are inserted into the priority queue.
+    Rejected/deferred ideas are NOT inserted.
+    """
+    ideas_data = [
+        (1, "High Score Idea", 9.0, "classified"),     # 90 -> approve
+        (2, "Medium Score Idea", 5.0, "classified"),   # 50 -> defer
+        (3, "Low Score Idea", 2.0, "classified"),      # 20 -> reject
+    ]
+    db_path = create_ideaforge_db(ideas_data)
+
+    try:
+        ideaforge_reader = IdeaForgeReader(db_path)
+        audit_logger = AuditLogger(temp_audit_log)
+
+        triage_gate = TriageGate(
+            config=triage_config,
+            state_db=in_memory_state_db,
+            ideaforge_reader=ideaforge_reader,
+            audit_logger=audit_logger
+        )
+
+        decisions = triage_gate.run(dry_run=False)
+
+        # Verify 3 decisions made
+        assert len(decisions) == 3
+        assert decisions[0].decision == "approve"
+        assert decisions[1].decision == "defer"
+        assert decisions[2].decision == "reject"
+
+        # Verify ONLY the approved idea was enqueued
+        in_memory_state_db.connect()
+        cursor = in_memory_state_db.conn.cursor()
+        cursor.execute("SELECT * FROM priority_queue")
+        rows = cursor.fetchall()
+
+        assert len(rows) == 1, f"Expected 1 queued item but found {len(rows)}"
+        assert rows[0]["source"] == "ideaforge"
+        assert rows[0]["source_id"] == "1"  # The approved idea
+        assert rows[0]["title"] == "High Score Idea"
+        assert rows[0]["status"] == "pending"
+        assert rows[0]["priority_score"] == 90.0 * triage_config.ideaforge_weight
+
+        # Verify idea_data is valid JSON with the full idea
+        idea_data = json.loads(rows[0]["idea_data"])
+        assert idea_data["id"] == 1
+        assert idea_data["title"] == "High Score Idea"
+
+        ideaforge_reader.close()
+
+    finally:
+        Path(db_path).unlink(missing_ok=True)
+
+
+def test_triage_gate_priority_score_uses_weight(
+    in_memory_state_db, temp_audit_log, create_ideaforge_db
+):
+    """
+    Test: Priority score = scaled_score * ideaforge_weight.
+    """
+    config = Config()
+    config.ideaforge_weight = 1.5
+
+    ideas_data = [
+        (1, "Test Idea", 8.0, "classified"),  # scaled=80, priority=80*1.5=120
+    ]
+    db_path = create_ideaforge_db(ideas_data)
+
+    try:
+        ideaforge_reader = IdeaForgeReader(db_path)
+        audit_logger = AuditLogger(temp_audit_log)
+
+        triage_gate = TriageGate(
+            config=config,
+            state_db=in_memory_state_db,
+            ideaforge_reader=ideaforge_reader,
+            audit_logger=audit_logger
+        )
+
+        triage_gate.run(dry_run=False)
+
+        in_memory_state_db.connect()
+        cursor = in_memory_state_db.conn.cursor()
+        cursor.execute("SELECT priority_score FROM priority_queue")
+        row = cursor.fetchone()
+
+        assert row is not None
+        assert row["priority_score"] == pytest.approx(120.0)
+
+        ideaforge_reader.close()
+
+    finally:
+        Path(db_path).unlink(missing_ok=True)
+
+
+def test_triage_gate_dry_run_does_not_enqueue(
+    triage_config, in_memory_state_db, temp_audit_log, create_ideaforge_db
+):
+    """
+    Test: dry_run=True does NOT insert into priority queue.
+    """
+    ideas_data = [
+        (1, "Test Idea", 9.0, "classified"),  # Would normally be approved
+    ]
+    db_path = create_ideaforge_db(ideas_data)
+
+    try:
+        ideaforge_reader = IdeaForgeReader(db_path)
+        audit_logger = AuditLogger(temp_audit_log)
+
+        triage_gate = TriageGate(
+            config=triage_config,
+            state_db=in_memory_state_db,
+            ideaforge_reader=ideaforge_reader,
+            audit_logger=audit_logger
+        )
+
+        decisions = triage_gate.run(dry_run=True)
+        assert len(decisions) == 1
+        assert decisions[0].decision == "approve"
+
+        # Verify priority queue is empty
+        in_memory_state_db.connect()
+        cursor = in_memory_state_db.conn.cursor()
+        cursor.execute("SELECT COUNT(*) FROM priority_queue")
+        assert cursor.fetchone()[0] == 0, "dry_run should NOT enqueue"
+
+        ideaforge_reader.close()
+
+    finally:
+        Path(db_path).unlink(missing_ok=True)

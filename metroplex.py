@@ -15,10 +15,15 @@ from safety import CircuitBreaker, CycleCaps, ShutdownHandler
 from gates.triage import TriageGate
 from gates.build import SpecGenerator, BuildOrchestrator
 from gates.patcher import PatchGate
+from gates.publish import PublishGate
 from orchestrator import CycleOrchestrator
 from notifier import create_notifier
 from readers.ideaforge_reader import IdeaForgeReader
+from readers.linear_reader import LinearReader
+from readers.academy_reader import AcademyReader
+from readers.skylynx_reader import SkyLynxReader
 from readers.stfactory_reader import STFactoryReader
+from dispatcher import create_dispatcher, route_to_worker, build_dispatch_prompt
 
 
 def setup_logging(verbose: bool):
@@ -74,6 +79,40 @@ def initialize_components(config: Config):
         print(f"Warning: ST Factory DB not found at {config.stfactory_db}")
         stfactory_reader = None
 
+    try:
+        skylynx_reader = SkyLynxReader(config.stfactory_db)
+    except FileNotFoundError:
+        print(f"Warning: ST Factory DB not found at {config.stfactory_db} (Sky-Lynx reader)")
+        skylynx_reader = None
+
+    # Initialize Linear reader (requires ARCADE_API_KEY)
+    import os
+    arcade_key = os.environ.get("ARCADE_API_KEY", "")
+    if arcade_key and config.linear_team:
+        try:
+            linear_reader = LinearReader(
+                arcade_api_key=arcade_key,
+                arcade_user_id=os.environ.get("ARCADE_USER_ID", "agent@local"),
+                team=config.linear_team,
+                label_filter=config.linear_label_filter,
+                poll_states=config.linear_poll_states,
+            )
+        except (ValueError, Exception) as e:
+            print(f"Warning: Linear reader init failed: {e}")
+            linear_reader = None
+    else:
+        linear_reader = None
+        if not arcade_key:
+            pass  # Silent -- Arcade key not configured
+        elif not config.linear_team:
+            pass  # Silent -- no team configured
+
+    # Initialize Academy reader (reads from promotions JSONL file)
+    academy_reader = AcademyReader(
+        promotions_path=config.academy_promotions_path,
+        academy_dir=config.academy_dir,
+    )
+
     # Initialize gates
     triage_gate = TriageGate(
         config=config,
@@ -104,6 +143,12 @@ def initialize_components(config: Config):
         audit_logger=audit_logger
     )
 
+    publish_gate = PublishGate(
+        config=config,
+        state_db=state_db,
+        audit_logger=audit_logger,
+    )
+
     # Initialize notifier
     notifier = create_notifier(config.telegram_bot_token, config.telegram_chat_id)
 
@@ -119,7 +164,11 @@ def initialize_components(config: Config):
         state_db=state_db,
         audit_logger=audit_logger,
         cycle_sleep_seconds=config.cycle_sleep_seconds,
-        notifier=notifier
+        notifier=notifier,
+        skylynx_reader=skylynx_reader,
+        linear_reader=linear_reader,
+        academy_reader=academy_reader,
+        publish_gate=publish_gate,
     )
 
     return orchestrator, state_db, circuit_breaker
@@ -284,9 +333,62 @@ def cmd_patch(args, config: Config):
         state_db.close()
 
 
+def cmd_publish(args, config: Config):
+    """
+    Run Gate 4 (publish) only -- push completed builds to GitHub.
+
+    Args:
+        args: Parsed command-line arguments
+        config: Metroplex configuration
+
+    Returns:
+        Exit code (0=success, 1=error, 2=halted)
+    """
+    orchestrator, state_db, circuit_breaker = initialize_components(config)
+
+    # Check if gate is halted
+    if circuit_breaker.is_halted("publish"):
+        print("ERROR: Publish gate is halted by circuit breaker")
+        print("Run 'metroplex.py reset --gate publish' to reset")
+        return 2
+
+    try:
+        print("Running Gate 4 (Publish)...")
+        jobs = orchestrator.publish_gate.run(dry_run=args.dry_run)
+
+        if not jobs:
+            print("\nNo unpublished builds found.")
+            return 0
+
+        published = sum(1 for j in jobs if j.status == "published")
+        failed = sum(1 for j in jobs if j.status == "failed")
+        pending = sum(1 for j in jobs if j.status == "pending")
+
+        print(f"\nCompleted: {len(jobs)} processed")
+        if published:
+            print(f"  Published: {published}")
+        if failed:
+            print(f"  Failed: {failed}")
+        if pending:
+            print(f"  Pending (dry-run): {pending}")
+
+        for job in jobs:
+            if job.status == "published":
+                print(f"  + {config.github_org}/{job.repo_name} -> {job.repo_url}")
+            elif job.status == "failed":
+                print(f"  x {job.build_job_id}: {job.error}")
+
+        return 0
+    except Exception as e:
+        print(f"ERROR: {e}")
+        return 1
+    finally:
+        state_db.close()
+
+
 def cmd_run_all(args, config: Config):
     """
-    Run full cycle (triage → build → patch).
+    Run full cycle (triage → build → publish → patch).
 
     Args:
         args: Parsed command-line arguments
@@ -313,6 +415,7 @@ def cmd_run_all(args, config: Config):
         print(f"Total cycles: {len(results)}")
         print(f"Total triage decisions: {sum(r.triage_count for r in results)}")
         print(f"Total build jobs: {sum(r.build_count for r in results)}")
+        print(f"Total published: {sum(r.publish_count for r in results)}")
         print(f"Total patches: {sum(r.patch_count for r in results)}")
         print(f"Total errors: {sum(len(r.errors) for r in results)}")
 
@@ -456,7 +559,7 @@ def cmd_reset(args, config: Config):
 
     try:
         if args.gate == "all":
-            gates = ["triage", "build", "patch"]
+            gates = ["triage", "build", "publish", "patch"]
         else:
             gates = [args.gate]
 
@@ -464,6 +567,90 @@ def cmd_reset(args, config: Config):
             circuit_breaker.reset(gate)
             print(f"Reset circuit breaker for {gate} gate")
 
+        return 0
+    except Exception as e:
+        print(f"ERROR: {e}")
+        return 1
+    finally:
+        state_db.close()
+
+
+def cmd_dispatch(args, config: Config):
+    """
+    Dispatch pending queue items to EA-Claude workers.
+
+    Args:
+        args: Parsed command-line arguments
+        config: Metroplex configuration
+
+    Returns:
+        Exit code (0=success, 1=error)
+    """
+    state_db = StateDB()
+    state_db.init_db()
+
+    dispatcher = create_dispatcher(config.dispatch_db, config.dispatch_chat_id)
+
+    try:
+        state_db.connect()
+        cursor = state_db.conn.cursor()
+
+        if args.item_id:
+            # Dispatch specific item
+            cursor.execute(
+                "SELECT * FROM priority_queue WHERE id = ? AND status = 'pending'",
+                (args.item_id,)
+            )
+        else:
+            # Dispatch next N pending items by priority
+            cursor.execute("""
+                SELECT * FROM priority_queue
+                WHERE status = 'pending'
+                ORDER BY priority_score DESC
+                LIMIT ?
+            """, (args.count,))
+
+        rows = cursor.fetchall()
+
+        if not rows:
+            print("No pending items to dispatch")
+            return 0
+
+        dispatched = 0
+        for row in rows:
+            item = dict(row)
+            idea_data = {}
+            if item.get("idea_data"):
+                try:
+                    idea_data = json.loads(item["idea_data"])
+                except (json.JSONDecodeError, TypeError):
+                    pass
+
+            worker = args.worker or route_to_worker(
+                item["source"],
+                idea_data.get("_recommendation_type", "")
+            )
+            prompt = build_dispatch_prompt(item)
+
+            if args.dry_run:
+                print(f"  [DRY RUN] #{item['id']} [{item['source']}:{item['source_id']}] -> {worker}")
+                print(f"    {item['title']}")
+                dispatched += 1
+            else:
+                try:
+                    task_id = dispatcher.dispatch(prompt, worker)
+                    # Mark as dispatched in priority queue
+                    cursor.execute(
+                        "UPDATE priority_queue SET status = 'dispatched', dispatched_at = ? WHERE id = ?",
+                        (json.dumps(None), item["id"])  # dispatched_at handled by the DB
+                    )
+                    state_db.conn.commit()
+                    print(f"  #{item['id']} [{item['source']}:{item['source_id']}] -> {worker} (task={task_id[:8]}...)")
+                    dispatched += 1
+                except Exception as e:
+                    print(f"  ERROR dispatching #{item['id']}: {e}")
+
+        print(f"\nDispatched: {dispatched}/{len(rows)}")
         return 0
     except Exception as e:
         print(f"ERROR: {e}")
@@ -494,12 +681,16 @@ def main():
     build_parser.add_argument("--dry-run", action="store_true", help="Print commands without executing")
     build_parser.add_argument("--idea-id", type=int, help="Build specific idea ID")
 
+    # publish command
+    publish_parser = subparsers.add_parser("publish", help="Run Gate 4 (publish) -- push builds to GitHub")
+    publish_parser.add_argument("--dry-run", action="store_true", help="Show what would be published without creating repos")
+
     # patch command
     patch_parser = subparsers.add_parser("patch", help="Run Gate 3 (patch) only")
     patch_parser.add_argument("--dry-run", action="store_true", help="Print patches without applying")
 
     # run-all command
-    run_all_parser = subparsers.add_parser("run-all", help="Run full cycle (triage → build → patch)")
+    run_all_parser = subparsers.add_parser("run-all", help="Run full cycle (triage → build → publish → patch)")
     run_all_parser.add_argument("--dry-run", action="store_true", help="Run in dry-run mode")
     run_all_parser.add_argument("--cycles", type=int, default=1, help="Number of cycles (0=infinite)")
 
@@ -509,9 +700,17 @@ def main():
     # status command
     status_parser = subparsers.add_parser("status", help="Show current system status")
 
+    # dispatch command
+    dispatch_parser = subparsers.add_parser("dispatch", help="Dispatch queue items to EA-Claude workers")
+    dispatch_parser.add_argument("--dry-run", action="store_true", help="Show what would be dispatched")
+    dispatch_parser.add_argument("--item-id", type=int, help="Dispatch specific queue item by ID")
+    dispatch_parser.add_argument("--count", type=int, default=1, help="Number of items to dispatch (default: 1)")
+    dispatch_parser.add_argument("--worker", choices=["starscream", "ravage", "soundwave", "astrotrain", "default"],
+                                help="Override auto-routed worker type")
+
     # reset command
     reset_parser = subparsers.add_parser("reset", help="Reset circuit breaker")
-    reset_parser.add_argument("--gate", required=True, choices=["triage", "build", "patch", "all"], help="Gate to reset")
+    reset_parser.add_argument("--gate", required=True, choices=["triage", "build", "publish", "patch", "all"], help="Gate to reset")
 
     # Parse arguments
     args = parser.parse_args()
@@ -533,6 +732,8 @@ def main():
         sys.exit(cmd_triage(args, config))
     elif args.command == "build":
         sys.exit(cmd_build(args, config))
+    elif args.command == "publish":
+        sys.exit(cmd_publish(args, config))
     elif args.command == "patch":
         sys.exit(cmd_patch(args, config))
     elif args.command == "run-all":
@@ -541,6 +742,8 @@ def main():
         sys.exit(cmd_queue(args, config))
     elif args.command == "status":
         sys.exit(cmd_status(args, config))
+    elif args.command == "dispatch":
+        sys.exit(cmd_dispatch(args, config))
     elif args.command == "reset":
         sys.exit(cmd_reset(args, config))
     else:

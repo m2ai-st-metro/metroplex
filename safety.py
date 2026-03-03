@@ -25,7 +25,7 @@ class CircuitBreaker:
         self.threshold = threshold
         self.state_db = state_db
 
-    def record_success(self, gate: Literal["triage", "build", "patch"]) -> None:
+    def record_success(self, gate: Literal["triage", "build", "publish", "patch"]) -> None:
         """
         Record successful gate execution.
         Resets consecutive failures to 0.
@@ -41,7 +41,7 @@ class CircuitBreaker:
         status.last_error = None
         self.state_db.update_gate_status(status)
 
-    def record_failure(self, gate: Literal["triage", "build", "patch"], error: str) -> None:
+    def record_failure(self, gate: Literal["triage", "build", "publish", "patch"], error: str) -> None:
         """
         Record failed gate execution.
         Increments consecutive failures. If >= threshold, halts the gate.
@@ -63,7 +63,7 @@ class CircuitBreaker:
 
         self.state_db.update_gate_status(status)
 
-    def is_halted(self, gate: Literal["triage", "build", "patch"]) -> bool:
+    def is_halted(self, gate: Literal["triage", "build", "publish", "patch"]) -> bool:
         """
         Check if a gate is halted.
 
@@ -79,7 +79,7 @@ class CircuitBreaker:
         status = self.state_db.get_gate_status(gate)
         return status.halted
 
-    def reset(self, gate: Literal["triage", "build", "patch"]) -> None:
+    def reset(self, gate: Literal["triage", "build", "publish", "patch"]) -> None:
         """
         Manually reset a gate (for CLI reset command).
         Clears consecutive failures, unhalt, and clear error.
@@ -109,6 +109,7 @@ class CircuitBreaker:
         return [
             self.state_db.get_gate_status("triage"),
             self.state_db.get_gate_status("build"),
+            self.state_db.get_gate_status("publish"),
             self.state_db.get_gate_status("patch"),
         ]
 

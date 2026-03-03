@@ -35,8 +35,13 @@ class Config:
     # Model settings
     build_model: str = field(default="opus")
 
+    # Parallel build settings
+    build_parallel: bool = field(default=False)
+    build_max_workers: int = field(default=2)
+    max_concurrent_builds: int = field(default=1)
+
     # Scoring thresholds
-    approve_threshold: int = field(default=70)
+    approve_threshold: int = field(default=68)
     reject_threshold: int = field(default=40)
 
     # Cycle limits
@@ -53,10 +58,34 @@ class Config:
     ideaforge_weight: float = field(default=1.0)
     skylynx_weight: float = field(default=1.5)
     linear_weight: float = field(default=2.0)
+    academy_weight: float = field(default=2.0)
+
+    # Academy integration (persona -> agent promotions)
+    academy_dir: str = field(default="/home/apexaipc/projects/agent-persona-academy")
+    academy_promotions_path: str = field(default="/home/apexaipc/projects/agent-persona-academy/data/promotions.jsonl")
 
     # Telegram notifications (optional)
     telegram_bot_token: str = field(default="")
     telegram_chat_id: str = field(default="")
+
+    # Linear integration (via Arcade SDK)
+    linear_team: str = field(default="")
+    linear_label_filter: str = field(default="metroplex")
+    linear_poll_states: str = field(default="Backlog,Todo")
+
+    # Spec generation (LLM expansion)
+    spec_use_llm: bool = field(default=True)
+    spec_llm_model: str = field(default="claude-sonnet-4-20250514")
+    spec_llm_max_tokens: int = field(default=8192)
+
+    # Dispatch (EA-Claude worker queue)
+    dispatch_db: str = field(default="/home/apexaipc/projects/claudeclaw/store/claudeclaw.db")
+    dispatch_chat_id: str = field(default="")
+
+    # Publish gate (Gate 4)
+    github_org: str = field(default="m2ai-portfolio")
+    publish_visibility: str = field(default="private")
+    max_publish_per_cycle: int = field(default=3)
 
     # Schedule windows (24h clock, 0-23)
     schedule_start: int = field(default=0)    # midnight
@@ -71,6 +100,17 @@ class Config:
         self.yce_dir = os.environ.get("METROPLEX_YCE_DIR", self.yce_dir)
         self.academy_repo = os.environ.get("METROPLEX_ACADEMY_REPO", self.academy_repo)
         self.build_model = os.environ.get("METROPLEX_BUILD_MODEL", self.build_model)
+
+        # Parallel build settings
+        self.build_parallel = os.environ.get("METROPLEX_BUILD_PARALLEL", "").lower() in ("1", "true", "yes")
+        try:
+            self.build_max_workers = int(os.environ.get("METROPLEX_BUILD_MAX_WORKERS", self.build_max_workers))
+        except ValueError:
+            pass
+        try:
+            self.max_concurrent_builds = int(os.environ.get("METROPLEX_MAX_CONCURRENT_BUILDS", self.max_concurrent_builds))
+        except ValueError:
+            pass
 
         # Integer conversions with fallback to defaults
         try:
@@ -116,10 +156,43 @@ class Config:
             self.linear_weight = float(os.environ.get("METROPLEX_LINEAR_WEIGHT", self.linear_weight))
         except ValueError:
             pass
+        try:
+            self.academy_weight = float(os.environ.get("METROPLEX_ACADEMY_WEIGHT", self.academy_weight))
+        except ValueError:
+            pass
+
+        # Academy
+        self.academy_dir = os.environ.get("METROPLEX_ACADEMY_DIR", self.academy_dir)
+        self.academy_promotions_path = os.environ.get("METROPLEX_ACADEMY_PROMOTIONS_PATH", self.academy_promotions_path)
+
+        # Linear
+        self.linear_team = os.environ.get("METROPLEX_LINEAR_TEAM", self.linear_team)
+        self.linear_label_filter = os.environ.get("METROPLEX_LINEAR_LABEL_FILTER", self.linear_label_filter)
+        self.linear_poll_states = os.environ.get("METROPLEX_LINEAR_POLL_STATES", self.linear_poll_states)
+
+        # Spec generation (LLM expansion)
+        self.spec_use_llm = os.environ.get("METROPLEX_SPEC_USE_LLM", "").lower() not in ("0", "false", "no")
+        self.spec_llm_model = os.environ.get("METROPLEX_SPEC_LLM_MODEL", self.spec_llm_model)
+        try:
+            self.spec_llm_max_tokens = int(os.environ.get("METROPLEX_SPEC_LLM_MAX_TOKENS", self.spec_llm_max_tokens))
+        except ValueError:
+            pass
+
+        # Dispatch
+        self.dispatch_db = os.environ.get("METROPLEX_DISPATCH_DB", self.dispatch_db)
+        self.dispatch_chat_id = os.environ.get("METROPLEX_DISPATCH_CHAT_ID", self.dispatch_chat_id)
 
         # Telegram
         self.telegram_bot_token = os.environ.get("METROPLEX_TELEGRAM_BOT_TOKEN", self.telegram_bot_token)
         self.telegram_chat_id = os.environ.get("METROPLEX_TELEGRAM_CHAT_ID", self.telegram_chat_id)
+
+        # Publish gate
+        self.github_org = os.environ.get("METROPLEX_GITHUB_ORG", self.github_org)
+        self.publish_visibility = os.environ.get("METROPLEX_PUBLISH_VISIBILITY", self.publish_visibility)
+        try:
+            self.max_publish_per_cycle = int(os.environ.get("METROPLEX_MAX_PUBLISH_PER_CYCLE", self.max_publish_per_cycle))
+        except ValueError:
+            pass
 
         # Schedule
         try:

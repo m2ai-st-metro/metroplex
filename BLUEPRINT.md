@@ -48,6 +48,44 @@ L5 autonomy layer for the ST Metro ecosystem. Closes all three human gates in th
 - [x] Sky-Lynx data contract (`DATA_CONTRACT.md`) — stable read interface for `metroplex.db` and `decisions.log`
 - [x] 12 new tests in `tests/test_continuous.py` + 3 in `tests/test_config.py`
 
+## Phase 6: IdeaForge Integration
+
+- [x] Fix IdeaForge reader to query `classified` ideas (not `scored`)
+- [x] Stop triage re-processing ideas that already have decisions
+- [x] Absolute spec paths threaded through build gate
+
+## Phase 7: Triage Gate Proven
+
+- [x] End-to-end triage: IdeaForge scored idea → Metroplex triage → approve/reject/defer
+- [x] IdeaForge reader verified against live `ideaforge.db`
+
+## Phase 8: Pipeline Parallelization
+
+- [x] Level 1: `--parallel --max-workers N` flags passed to `queue_runner.py`
+- [x] Level 2: `METROPLEX_MAX_CONCURRENT_BUILDS` capacity-based dispatch
+- [x] `start_queue_background()` — Popen-based non-blocking dispatch with PID tracking
+- [x] `poll_and_sync_status()` — sync build_jobs + priority_queue from runner status
+- [x] `run_from_queue()` — capacity-aware dispatch from priority queue
+- [x] `is_runner_active()` — PID file existence + liveness check
+- [x] 170 tests passing (12 new Level 2 tests)
+
+## Phase 9: Priority Queue + Notifications + Schedule
+
+- [x] `PriorityItem` model (models.py) — ranked task items from any input source
+- [x] `priority_queue` table (db.py) — with indexes on status, score, and unique source constraint
+- [x] DB methods: `enqueue_item()`, `get_next_pending()`, `update_item_status()`, `get_queue_summary()`, `update_build_job_status()`
+- [x] Triage enqueues approved ideas into priority queue with source weight
+- [x] Config: `METROPLEX_IDEAFORGE_WEIGHT`, `METROPLEX_SKYLYNX_WEIGHT`, `METROPLEX_LINEAR_WEIGHT`
+- [x] `notifier.py` — `Notifier` protocol + `TelegramNotifier` (urllib, zero deps) + `LogNotifier` fallback
+- [x] `create_notifier()` factory wired into `metroplex.py` initialization
+- [x] Orchestrator sends notifications: triage approvals, build queued/failed, cycle summary, gate halt alerts
+- [x] Empty cycle notifications suppressed (no noise)
+- [x] Schedule windows: `METROPLEX_SCHEDULE_START`, `METROPLEX_SCHEDULE_END`, `METROPLEX_ACTIVE_DAYS`
+- [x] `is_within_schedule()` — supports normal ranges, overnight wraps, day-of-week filtering
+- [x] `queue` CLI subcommand — shows priority queue contents by score
+- [x] Fix: CWD bug in 7 CLI/SIGTERM subprocess tests
+- [x] **221 tests passing** (51 new Phase 9 tests: 15 queue DB, 16 notifier, 8 schedule, 5 notification integration, 3 status, 1 CLI queue, 3 triage-queue integration)
+
 ## Architecture
 
 ```
@@ -90,6 +128,7 @@ ST Factory (persona_patches) ──→ Gate 3: Patcher ──→ git clone/commi
 | `gates/triage.py` | Gate 1: score + threshold decisions |
 | `gates/build.py` | Gate 2: spec gen + queue_runner subprocess |
 | `gates/patcher.py` | Gate 3: YAML patches via git |
+| `notifier.py` | Telegram + log notification backends |
 | `readers/ideaforge_reader.py` | IdeaForge SQLite (read-only) |
 | `readers/stfactory_reader.py` | ST Factory SQLite (read + patch status write) |
 | `readers/um_reader.py` | Ultra-Magnus SQLite (read-only) |
