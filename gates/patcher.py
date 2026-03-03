@@ -141,8 +141,9 @@ class PatchGate:
                 continue
 
             # Parse operations from raw_json
+            # ST Factory patches use "patches" key with "operation" field per entry
             raw_json = patch.get("raw_json", {})
-            operations = raw_json.get("operations", [])
+            operations = raw_json.get("patches", []) or raw_json.get("operations", [])
 
             if not operations:
                 # No operations to apply
@@ -168,10 +169,19 @@ class PatchGate:
                             "reason": "no operations in patch"
                         }
                     )
+                    # Sync status back to ST Factory so it stops re-proposing
+                    try:
+                        self.stfactory_reader.update_patch_status(patch_id, "skipped")
+                    except Exception as e:
+                        self.audit_logger.log_error(
+                            gate="patch",
+                            error=f"Failed to update skipped patch status in ST Factory: {str(e)}",
+                            details={"patch_id": patch_id}
+                        )
                 continue
 
             # Determine target file path
-            target_file = f"personas/{persona_id}.yaml"
+            target_file = f"personas/{persona_id}/persona.yaml"
 
             if dry_run:
                 # Dry run: print what would change
@@ -179,7 +189,8 @@ class PatchGate:
                 print(f"  Target file: {target_file}")
                 print(f"  Operations: {len(operations)}")
                 for op in operations:
-                    print(f"    - {op.get('op')} {op.get('path')}: {op.get('value', 'N/A')}")
+                    op_name = op.get('operation') or op.get('op')
+                    print(f"    - {op_name} {op.get('path')}: {op.get('value', 'N/A')}")
 
                 patch_app = PatchApplication(
                     patch_id=patch_id,
@@ -333,7 +344,8 @@ class PatchGate:
         result = copy.deepcopy(yaml_data)
 
         for operation in operations:
-            op = operation.get("op")
+            # Support both ST Factory format ("operation") and JSON Patch format ("op")
+            op = operation.get("operation") or operation.get("op")
             path = operation.get("path", "")
             value = operation.get("value")
 
