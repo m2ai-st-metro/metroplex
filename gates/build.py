@@ -33,13 +33,14 @@ RUNNER_PID_FILE = Path(__file__).parent.parent / "data" / "runner.pid"
 class SpecGenerator:
     """Gate 2: Spec Generation - LLM expansion with Jinja2 fallback."""
 
-    def __init__(self, config: Config, template_dir: Path):
+    def __init__(self, config: Config, template_dir: Path, state_db: Optional[StateDB] = None):
         """
         Initialize Spec Generator.
 
         Args:
             config: Metroplex configuration
             template_dir: Path to spec_templates/ directory
+            state_db: Optional StateDB for cost recording
 
         Raises:
             FileNotFoundError: If template_dir does not exist
@@ -65,6 +66,7 @@ class SpecGenerator:
                 self.llm_expander = LLMSpecExpander(
                     model=config.spec_llm_model,
                     max_tokens=config.spec_llm_max_tokens,
+                    state_db=state_db,
                 )
                 logger.info(
                     "LLM spec expansion enabled (model=%s)", config.spec_llm_model

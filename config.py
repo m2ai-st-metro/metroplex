@@ -68,6 +68,7 @@ class Config:
     # Telegram notifications (optional)
     telegram_bot_token: str = field(default="")
     telegram_chat_id: str = field(default="")
+    notify_mode: str = field(default="all")
 
     # Linear integration (via Arcade SDK)
     linear_team: str = field(default="")
@@ -87,6 +88,13 @@ class Config:
     github_org: str = field(default="m2ai-portfolio")
     publish_visibility: str = field(default="private")
     max_publish_per_cycle: int = field(default=3)
+    require_review: bool = field(default=True)
+
+    # Budget controls
+    daily_cost_limit: float = field(default=50.0)
+    monthly_cost_limit: float = field(default=500.0)
+    cost_alert_threshold: float = field(default=0.8)
+    build_cost_estimate: float = field(default=3.0)
 
     # Schedule windows (24h clock, 0-23)
     schedule_start: int = field(default=0)    # midnight
@@ -191,12 +199,32 @@ class Config:
         # Telegram
         self.telegram_bot_token = os.environ.get("METROPLEX_TELEGRAM_BOT_TOKEN", self.telegram_bot_token)
         self.telegram_chat_id = os.environ.get("METROPLEX_TELEGRAM_CHAT_ID", self.telegram_chat_id)
+        self.notify_mode = os.environ.get("METROPLEX_NOTIFY_MODE", self.notify_mode)
 
         # Publish gate
         self.github_org = os.environ.get("METROPLEX_GITHUB_ORG", self.github_org)
         self.publish_visibility = os.environ.get("METROPLEX_PUBLISH_VISIBILITY", self.publish_visibility)
+        self.require_review = os.environ.get("METROPLEX_REQUIRE_REVIEW", "").lower() not in ("0", "false", "no")
         try:
             self.max_publish_per_cycle = int(os.environ.get("METROPLEX_MAX_PUBLISH_PER_CYCLE", self.max_publish_per_cycle))
+        except ValueError:
+            pass
+
+        # Budget controls
+        try:
+            self.daily_cost_limit = float(os.environ.get("METROPLEX_DAILY_COST_LIMIT", self.daily_cost_limit))
+        except ValueError:
+            pass
+        try:
+            self.monthly_cost_limit = float(os.environ.get("METROPLEX_MONTHLY_COST_LIMIT", self.monthly_cost_limit))
+        except ValueError:
+            pass
+        try:
+            self.cost_alert_threshold = float(os.environ.get("METROPLEX_COST_ALERT_THRESHOLD", self.cost_alert_threshold))
+        except ValueError:
+            pass
+        try:
+            self.build_cost_estimate = float(os.environ.get("METROPLEX_BUILD_COST_ESTIMATE", self.build_cost_estimate))
         except ValueError:
             pass
 
@@ -245,5 +273,8 @@ class Config:
 
         if self.cycle_sleep_seconds < 10:
             warnings.append(f"cycle_sleep_seconds ({self.cycle_sleep_seconds}) is below 10 — may cause excessive resource usage")
+
+        if self.notify_mode not in ("all", "anomaly", "summary"):
+            warnings.append(f"notify_mode '{self.notify_mode}' invalid — must be all/anomaly/summary")
 
         return warnings

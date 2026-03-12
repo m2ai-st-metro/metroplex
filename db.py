@@ -187,6 +187,27 @@ class StateDB:
             )
         """)
 
+        # Migrate: add estimated_cost to build_jobs
+        cursor.execute("PRAGMA table_info(build_jobs)")
+        bj_columns_refresh = {row[1] for row in cursor.fetchall()}
+        if "estimated_cost" not in bj_columns_refresh:
+            cursor.execute("ALTER TABLE build_jobs ADD COLUMN estimated_cost REAL DEFAULT NULL")
+
+        # Cost ledger table
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS cost_ledger (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT NOT NULL,
+                source TEXT NOT NULL,
+                model TEXT NOT NULL,
+                input_tokens INTEGER NOT NULL DEFAULT 0,
+                output_tokens INTEGER NOT NULL DEFAULT 0,
+                estimated_cost REAL NOT NULL DEFAULT 0.0,
+                queue_job_id TEXT,
+                details TEXT DEFAULT '{}'
+            )
+        """)
+
         # Create indexes
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_triage_decisions_idea ON triage_decisions(idea_id)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_triage_decisions_decision ON triage_decisions(decision)")
@@ -196,6 +217,7 @@ class StateDB:
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_priority_queue_score ON priority_queue(priority_score DESC)")
         cursor.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_priority_queue_source ON priority_queue(source, source_id)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_publish_jobs_status ON publish_jobs(status)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_cost_ledger_timestamp ON cost_ledger(timestamp)")
 
         # Initialize gate status for all gates
         for gate in ["triage", "build", "patch", "publish"]:
@@ -773,25 +795,40 @@ class StateDB:
 
     # --- Publish Jobs ---
 
-    def get_unpublished_builds(self) -> list[dict]:
-        """Get reviewed builds that haven't been published yet.
+    def get_unpublished_builds(self, require_review: bool = True) -> list[dict]:
+        """Get builds that haven't been published yet.
 
-        Returns distinct queue_job_ids with status='completed' and
-        review_status='reviewed' that have no 'published' entry in publish_jobs.
-        Falls back to unreviewed completed builds for backward compatibility.
+        Args:
+            require_review: If True (default, L5 strict mode), only return builds
+                with review_status='reviewed'. If False, also include builds with
+                NULL review_status for backward compatibility.
+
+        Returns distinct queue_job_ids with status='completed' that have no
+        'published' entry in publish_jobs.
         """
         self.connect()
         cursor = self.conn.cursor()
 
-        cursor.execute("""
-            SELECT DISTINCT b.queue_job_id, b.title, b.project_dir
-            FROM build_jobs b
-            WHERE b.status = 'completed'
-            AND (b.review_status = 'reviewed' OR b.review_status IS NULL)
-            AND b.queue_job_id NOT IN (
-                SELECT build_job_id FROM publish_jobs WHERE status = 'published'
-            )
-        """)
+        if require_review:
+            cursor.execute("""
+                SELECT DISTINCT b.queue_job_id, b.title, b.project_dir
+                FROM build_jobs b
+                WHERE b.status = 'completed'
+                AND b.review_status = 'reviewed'
+                AND b.queue_job_id NOT IN (
+                    SELECT build_job_id FROM publish_jobs WHERE status = 'published'
+                )
+            """)
+        else:
+            cursor.execute("""
+                SELECT DISTINCT b.queue_job_id, b.title, b.project_dir
+                FROM build_jobs b
+                WHERE b.status = 'completed'
+                AND (b.review_status = 'reviewed' OR b.review_status IS NULL)
+                AND b.queue_job_id NOT IN (
+                    SELECT build_job_id FROM publish_jobs WHERE status = 'published'
+                )
+            """)
         return [{"queue_job_id": row["queue_job_id"], "title": row["title"], "project_dir": row["project_dir"]} for row in cursor.fetchall()]
 
     def record_publish_job(self, job: PublishJob):
@@ -841,3 +878,102 @@ class StateDB:
             ORDER BY created_at DESC
         """)
         return [dict(row) for row in cursor.fetchall()]
+
+    # --- Cost Ledger (Phase 13e) ---
+
+    def record_cost(
+        self,
+        source: str,
+        model: str,
+        input_tokens: int,
+        output_tokens: int,
+        estimated_cost: float,
+        queue_job_id: str | None = None,
+        details: str = "{}",
+    ) -> int:
+        """Record a cost entry in the ledger.
+
+        Args:
+            source: Component that incurred the cost (e.g. 'spec_expander', 'um_bridge')
+            model: Model name used
+            input_tokens: Input token count
+            output_tokens: Output token count
+            estimated_cost: Estimated cost in USD
+            queue_job_id: Optional build job ID for correlation
+            details: JSON string with additional context
+
+        Returns:
+            Row ID of the inserted record.
+        """
+        self.connect()
+        cursor = self.conn.cursor()
+        cursor.execute("""
+            INSERT INTO cost_ledger (timestamp, source, model, input_tokens, output_tokens, estimated_cost, queue_job_id, details)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            datetime.now().isoformat(),
+            source,
+            model,
+            input_tokens,
+            output_tokens,
+            estimated_cost,
+            queue_job_id,
+            details,
+        ))
+        self.conn.commit()
+        return cursor.lastrowid
+
+    def get_daily_spend(self, date: str | None = None) -> float:
+        """Get total spend for a given date (YYYY-MM-DD). Defaults to today."""
+        self.connect()
+        cursor = self.conn.cursor()
+        if date is None:
+            date = datetime.now().strftime("%Y-%m-%d")
+        cursor.execute(
+            "SELECT COALESCE(SUM(estimated_cost), 0.0) FROM cost_ledger WHERE timestamp LIKE ?",
+            (f"{date}%",),
+        )
+        return cursor.fetchone()[0]
+
+    def get_monthly_spend(self, month: str | None = None) -> float:
+        """Get total spend for a given month (YYYY-MM). Defaults to current month."""
+        self.connect()
+        cursor = self.conn.cursor()
+        if month is None:
+            month = datetime.now().strftime("%Y-%m")
+        cursor.execute(
+            "SELECT COALESCE(SUM(estimated_cost), 0.0) FROM cost_ledger WHERE timestamp LIKE ?",
+            (f"{month}%",),
+        )
+        return cursor.fetchone()[0]
+
+    def get_cost_breakdown(self, days: int = 7) -> list[dict]:
+        """Get daily cost breakdown for the last N days.
+
+        Returns list of dicts with keys: date, total_cost, entry_count.
+        """
+        self.connect()
+        cursor = self.conn.cursor()
+        start_date = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
+        cursor.execute("""
+            SELECT
+                SUBSTR(timestamp, 1, 10) as date,
+                SUM(estimated_cost) as total_cost,
+                COUNT(*) as entry_count
+            FROM cost_ledger
+            WHERE timestamp >= ?
+            GROUP BY SUBSTR(timestamp, 1, 10)
+            ORDER BY date DESC
+        """, (start_date,))
+        return [dict(row) for row in cursor.fetchall()]
+
+    def update_build_estimated_cost(self, queue_job_id: str, estimated_cost: float) -> bool:
+        """Set estimated_cost on a build job."""
+        self.connect()
+        cursor = self.conn.cursor()
+        cursor.execute(
+            "UPDATE build_jobs SET estimated_cost = ? WHERE queue_job_id = ?",
+            (estimated_cost, queue_job_id),
+        )
+        self.conn.commit()
+        return cursor.rowcount > 0

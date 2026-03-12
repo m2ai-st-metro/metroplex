@@ -102,6 +102,7 @@ class LLMSpecExpander:
         model: str = "claude-sonnet-4-20250514",
         max_tokens: int = 8192,
         api_key: Optional[str] = None,
+        state_db=None,
     ):
         """
         Initialize LLM Spec Expander.
@@ -113,6 +114,7 @@ class LLMSpecExpander:
         """
         self.model = model
         self.max_tokens = max_tokens
+        self.state_db = state_db
 
         # Resolve API key
         resolved_key = api_key or os.environ.get("ANTHROPIC_API_KEY")
@@ -167,11 +169,29 @@ class LLMSpecExpander:
             if block.type == "text":
                 spec_text += block.text
 
+        input_tokens = message.usage.input_tokens
+        output_tokens = message.usage.output_tokens
+
         logger.info(
             "Spec expansion complete: %d chars, %d input tokens, %d output tokens",
             len(spec_text),
-            message.usage.input_tokens,
-            message.usage.output_tokens,
+            input_tokens,
+            output_tokens,
         )
+
+        # Record cost if state_db is available
+        if self.state_db is not None:
+            try:
+                from cost_rates import estimate_cost
+                cost = estimate_cost(self.model, input_tokens, output_tokens)
+                self.state_db.record_cost(
+                    source="spec_expander",
+                    model=self.model,
+                    input_tokens=input_tokens,
+                    output_tokens=output_tokens,
+                    estimated_cost=cost,
+                )
+            except Exception as e:
+                logger.warning("Failed to record spec expansion cost: %s", e)
 
         return spec_text

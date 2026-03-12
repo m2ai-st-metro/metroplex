@@ -56,7 +56,9 @@ class PublishGate:
         Returns:
             List of PublishJob objects
         """
-        unpublished = self.state_db.get_unpublished_builds()
+        unpublished = self.state_db.get_unpublished_builds(
+            require_review=self.config.require_review
+        )
 
         if not unpublished:
             return []

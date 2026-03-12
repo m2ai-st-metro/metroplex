@@ -217,8 +217,8 @@ class TestReviewableBuildsIntegration:
         unpublished = in_memory_db.get_unpublished_builds()
         assert len(unpublished) == 0
 
-    def test_unreviewed_builds_still_publishable(self, in_memory_db):
-        """Backward compat: completed builds with NULL review_status are still publishable."""
+    def test_unreviewed_builds_blocked_in_strict_mode(self, in_memory_db):
+        """L5 strict mode: completed builds with NULL review_status are NOT publishable."""
         job = BuildJob(
             idea_id=1,
             title="Old Build",
@@ -228,7 +228,53 @@ class TestReviewableBuildsIntegration:
             queued_at=datetime.now(),
         )
         in_memory_db.record_build_job(job)
-        # Don't set review_status — should still be publishable
 
-        unpublished = in_memory_db.get_unpublished_builds()
+        unpublished = in_memory_db.get_unpublished_builds(require_review=True)
+        assert len(unpublished) == 0
+
+    def test_unreviewed_builds_allowed_in_lenient_mode(self, in_memory_db):
+        """Lenient mode: completed builds with NULL review_status are publishable."""
+        job = BuildJob(
+            idea_id=1,
+            title="Old Build",
+            spec_path="/tmp/spec.txt",
+            queue_job_id="metroplex-ideaforge-1",
+            status="completed",
+            queued_at=datetime.now(),
+        )
+        in_memory_db.record_build_job(job)
+
+        unpublished = in_memory_db.get_unpublished_builds(require_review=False)
         assert len(unpublished) == 1
+
+    def test_reviewed_builds_in_strict_mode(self, in_memory_db):
+        """Strict mode: reviewed builds are publishable."""
+        job = BuildJob(
+            idea_id=1,
+            title="Reviewed Build",
+            spec_path="/tmp/spec.txt",
+            queue_job_id="metroplex-ideaforge-1",
+            status="completed",
+            queued_at=datetime.now(),
+        )
+        in_memory_db.record_build_job(job)
+        in_memory_db.update_build_review_status("metroplex-ideaforge-1", "reviewed")
+
+        unpublished = in_memory_db.get_unpublished_builds(require_review=True)
+        assert len(unpublished) == 1
+
+    def test_require_review_default_is_strict(self, in_memory_db):
+        """Default require_review=True blocks unreviewed builds."""
+        job = BuildJob(
+            idea_id=1,
+            title="Unreviewed",
+            spec_path="/tmp/spec.txt",
+            queue_job_id="metroplex-ideaforge-1",
+            status="completed",
+            queued_at=datetime.now(),
+        )
+        in_memory_db.record_build_job(job)
+
+        # Default (no arg) = strict
+        unpublished = in_memory_db.get_unpublished_builds()
+        assert len(unpublished) == 0

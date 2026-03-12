@@ -6,7 +6,7 @@ import pytest
 from unittest.mock import patch, MagicMock
 import urllib.error
 
-from notifier import LogNotifier, TelegramNotifier, create_notifier, Notifier
+from notifier import LogNotifier, TelegramNotifier, create_notifier, FilteredNotifier, Notifier
 
 
 class TestLogNotifier:
@@ -158,3 +158,110 @@ class TestCreateNotifier:
     def test_returns_log_when_both_none(self):
         notifier = create_notifier(None, None)
         assert isinstance(notifier, LogNotifier)
+
+
+# --- Phase 13d: FilteredNotifier ---
+
+
+class RecordingNotifier:
+    """Test double that records all notifications."""
+
+    def __init__(self):
+        self.messages: list[tuple[str, str]] = []
+
+    def notify(self, message: str, level: str = "info") -> bool:
+        self.messages.append((message, level))
+        return True
+
+
+@pytest.fixture
+def recorder():
+    return RecordingNotifier()
+
+
+class TestFilteredNotifierAllMode:
+    """In 'all' mode, everything passes through."""
+
+    def test_info_forwarded(self, recorder):
+        fn = FilteredNotifier(recorder, "all")
+        fn.notify("hello", "info")
+        assert len(recorder.messages) == 1
+
+    def test_warning_forwarded(self, recorder):
+        fn = FilteredNotifier(recorder, "all")
+        fn.notify("alert", "warning")
+        assert len(recorder.messages) == 1
+
+    def test_error_forwarded(self, recorder):
+        fn = FilteredNotifier(recorder, "all")
+        fn.notify("boom", "error")
+        assert len(recorder.messages) == 1
+
+
+class TestFilteredNotifierAnomalyMode:
+    """In 'anomaly' mode, only warning/error pass through."""
+
+    def test_info_suppressed(self, recorder):
+        fn = FilteredNotifier(recorder, "anomaly")
+        result = fn.notify("all good", "info")
+        assert result is True
+        assert len(recorder.messages) == 0
+
+    def test_warning_forwarded(self, recorder):
+        fn = FilteredNotifier(recorder, "anomaly")
+        fn.notify("heads up", "warning")
+        assert len(recorder.messages) == 1
+        assert recorder.messages[0] == ("heads up", "warning")
+
+    def test_error_forwarded(self, recorder):
+        fn = FilteredNotifier(recorder, "anomaly")
+        fn.notify("crash", "error")
+        assert len(recorder.messages) == 1
+
+    def test_info_with_error_keyword_still_suppressed(self, recorder):
+        """In anomaly mode, info messages are suppressed even if they mention 'error'."""
+        fn = FilteredNotifier(recorder, "anomaly")
+        fn.notify("Metroplex: 0 triaged, 1 built, 1 errors", "info")
+        assert len(recorder.messages) == 0
+
+
+class TestFilteredNotifierSummaryMode:
+    """In 'summary' mode, warning/error pass through, plus info with 'error' keyword."""
+
+    def test_info_suppressed(self, recorder):
+        fn = FilteredNotifier(recorder, "summary")
+        fn.notify("all good", "info")
+        assert len(recorder.messages) == 0
+
+    def test_warning_forwarded(self, recorder):
+        fn = FilteredNotifier(recorder, "summary")
+        fn.notify("heads up", "warning")
+        assert len(recorder.messages) == 1
+
+    def test_error_forwarded(self, recorder):
+        fn = FilteredNotifier(recorder, "summary")
+        fn.notify("crash", "error")
+        assert len(recorder.messages) == 1
+
+    def test_info_with_error_keyword_forwarded(self, recorder):
+        """Summary mode lets cycle summaries through when they mention errors."""
+        fn = FilteredNotifier(recorder, "summary")
+        fn.notify("Metroplex: 0 triaged, 1 built, 1 errors", "info")
+        assert len(recorder.messages) == 1
+
+    def test_info_without_error_keyword_suppressed(self, recorder):
+        fn = FilteredNotifier(recorder, "summary")
+        fn.notify("Metroplex: 2 triaged, 1 built, 0 patched", "info")
+        assert len(recorder.messages) == 0
+
+
+class TestFilteredNotifierWrapsLogNotifier:
+    """Integration: FilteredNotifier wraps a real LogNotifier."""
+
+    def test_anomaly_wrapping_log_notifier(self):
+        log = LogNotifier()
+        fn = FilteredNotifier(log, "anomaly")
+        result = fn.notify("info message", "info")
+        assert result is True
+        result = fn.notify("error message", "error")
+        assert result is True

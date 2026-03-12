@@ -91,6 +91,40 @@ class CycleOrchestrator:
         # Prevents spamming Telegram every cycle while a breaker is tripped.
         self._halted_notified: set[str] = set()
 
+    def check_budget(self) -> tuple[bool, str]:
+        """Check if spending is within daily and monthly budget limits.
+
+        Returns:
+            Tuple of (can_proceed, message).
+            can_proceed is False if either limit is exceeded.
+        """
+        daily = self.state_db.get_daily_spend()
+        monthly = self.state_db.get_monthly_spend()
+
+        daily_limit = self.config.daily_cost_limit
+        monthly_limit = self.config.monthly_cost_limit
+        alert_pct = self.config.cost_alert_threshold
+
+        # Hard limits
+        if daily >= daily_limit:
+            return False, f"Daily cost limit reached: ${daily:.2f} / ${daily_limit:.2f}"
+        if monthly >= monthly_limit:
+            return False, f"Monthly cost limit reached: ${monthly:.2f} / ${monthly_limit:.2f}"
+
+        # Alert thresholds (warning, not blocking)
+        if daily >= daily_limit * alert_pct:
+            self.notifier.notify(
+                f"Budget warning: daily spend ${daily:.2f} ({daily/daily_limit*100:.0f}% of ${daily_limit:.2f} limit)",
+                "warning",
+            )
+        if monthly >= monthly_limit * alert_pct:
+            self.notifier.notify(
+                f"Budget warning: monthly spend ${monthly:.2f} ({monthly/monthly_limit*100:.0f}% of ${monthly_limit:.2f} limit)",
+                "warning",
+            )
+
+        return True, ""
+
     def is_within_schedule(self) -> bool:
         """Check if current time is within the configured schedule window."""
         now = datetime.now()
@@ -469,8 +503,17 @@ class CycleOrchestrator:
                 self.audit_logger.log_error("triage", error_msg)
                 self.notifier.notify(f"Gate 1 (triage) FAILED: {str(e)}", "error")
 
+        # Budget check before build dispatch
+        budget_ok, budget_msg = self.check_budget()
+        if not budget_ok:
+            errors.append(f"Budget exceeded: {budget_msg}")
+            print(f"! {budget_msg} — skipping builds this cycle")
+            self.notifier.notify(f"BUDGET EXCEEDED: {budget_msg}", "error")
+
         # Gate 2: Build (pulls from priority queue, dispatches to YCE Harness)
-        if self.circuit_breaker.is_halted("build"):
+        if not budget_ok:
+            pass  # Skip build gate when over budget
+        elif self.circuit_breaker.is_halted("build"):
             error_msg = "Gate 2 (build) halted by circuit breaker"
             errors.append(error_msg)
             print(f"! {error_msg}")
@@ -653,8 +696,10 @@ class CycleOrchestrator:
             error_text = f", {len(errors)} errors" if errors else ""
             pub_text = f", {publish_count} published" if publish_count > 0 else ""
             disp_text = f", {dispatch_count} dispatched" if dispatch_count > 0 else ""
+            summary_level = "warning" if errors else "info"
             self.notifier.notify(
-                f"Metroplex: {triage_count} triaged, {build_count} built{pub_text}{disp_text}, {patch_count} patched{error_text}"
+                f"Metroplex: {triage_count} triaged, {build_count} built{pub_text}{disp_text}, {patch_count} patched{error_text}",
+                summary_level,
             )
 
         # Update cycle result

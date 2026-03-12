@@ -69,6 +69,36 @@ class TelegramNotifier:
             return False
 
 
+class FilteredNotifier:
+    """Wraps a Notifier and filters messages based on notify_mode.
+
+    Modes:
+        all     — forward everything (no filtering)
+        anomaly — only forward warning + error level messages
+        summary — same as anomaly, plus cycle summaries that contain errors
+    """
+
+    def __init__(self, inner: Notifier, mode: str = "all"):
+        self._inner = inner
+        self.mode = mode
+
+    def notify(self, message: str, level: str = "info") -> bool:
+        if self.mode == "all":
+            return self._inner.notify(message, level)
+
+        # anomaly and summary: forward warning/error
+        if level in ("warning", "error"):
+            return self._inner.notify(message, level)
+
+        # summary mode: also forward cycle summaries that mention errors
+        if self.mode == "summary" and "error" in message.lower():
+            return self._inner.notify(message, level)
+
+        # Suppressed — still log locally
+        logger.debug("[filtered:%s] %s", level, message)
+        return True
+
+
 def create_notifier(bot_token: str | None, chat_id: str | None) -> Notifier:
     """Factory: returns TelegramNotifier if configured, else LogNotifier."""
     if bot_token and chat_id:

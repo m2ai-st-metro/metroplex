@@ -90,12 +90,31 @@ def write_back_to_metroplex(idea_id: int, um_idea_id: str, outcome: str) -> None
         conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
 
-        # Update build_jobs: status + project_dir
+        # Update build_jobs: status + project_dir + estimated_cost
+        build_cost_estimate = float(os.getenv("METROPLEX_BUILD_COST_ESTIMATE", "3.0"))
         cursor.execute(
-            "UPDATE build_jobs SET status = ?, project_dir = ? WHERE queue_job_id = ? AND status != ?",
-            (build_status, project_dir_str, queue_job_id, build_status),
+            "UPDATE build_jobs SET status = ?, project_dir = ?, estimated_cost = ? WHERE queue_job_id = ? AND status != ?",
+            (build_status, project_dir_str, build_cost_estimate, queue_job_id, build_status),
         )
         build_changed = cursor.rowcount > 0
+
+        # Record build cost in ledger
+        if build_changed:
+            try:
+                cursor.execute("""
+                    INSERT INTO cost_ledger (timestamp, source, model, input_tokens, output_tokens, estimated_cost, queue_job_id, details)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    datetime.now(timezone.utc).isoformat(),
+                    "um_bridge",
+                    os.getenv("METROPLEX_BUILD_MODEL", "opus"),
+                    0, 0,
+                    build_cost_estimate,
+                    queue_job_id,
+                    json.dumps({"type": "flat_estimate"}),
+                ))
+            except Exception as e:
+                logger.warning("Failed to record cost ledger entry: %s", e)
 
         # Update priority_queue: status + completed_at
         if build_changed:

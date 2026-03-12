@@ -18,7 +18,7 @@ from gates.patcher import PatchGate
 from gates.publish import PublishGate
 from gates.review import ReviewGate
 from orchestrator import CycleOrchestrator
-from notifier import create_notifier
+from notifier import create_notifier, FilteredNotifier
 from readers.ideaforge_reader import IdeaForgeReader
 from readers.linear_reader import LinearReader
 from readers.academy_reader import AcademyReader
@@ -122,10 +122,10 @@ def initialize_components(config: Config):
         audit_logger=audit_logger
     )
 
-    # Initialize spec generator
+    # Initialize spec generator (pass state_db for cost recording)
     template_dir = Path("spec_templates")
     try:
-        spec_generator = SpecGenerator(config, template_dir)
+        spec_generator = SpecGenerator(config, template_dir, state_db=state_db)
     except FileNotFoundError:
         print(f"Warning: Template directory not found at {template_dir}")
         spec_generator = None
@@ -156,8 +156,9 @@ def initialize_components(config: Config):
         audit_logger=audit_logger,
     )
 
-    # Initialize notifier
-    notifier = create_notifier(config.telegram_bot_token, config.telegram_chat_id)
+    # Initialize notifier (wrapped with FilteredNotifier for anomaly/summary modes)
+    raw_notifier = create_notifier(config.telegram_bot_token, config.telegram_chat_id)
+    notifier = FilteredNotifier(raw_notifier, config.notify_mode)
 
     # Initialize dispatcher for non-buildable queue items (Sky-Lynx -> ClaudeClaw)
     dispatcher = create_dispatcher(config.dispatch_db, config.dispatch_chat_id)
@@ -641,6 +642,40 @@ def cmd_retry(args, config: Config):
         state_db.close()
 
 
+def cmd_cost(args, config: Config):
+    """Show cost tracking summary."""
+    state_db = StateDB()
+    state_db.init_db()
+
+    try:
+        daily = state_db.get_daily_spend()
+        monthly = state_db.get_monthly_spend()
+
+        print(f"{'='*60}")
+        print("METROPLEX COST TRACKER")
+        print(f"{'='*60}\n")
+
+        print(f"Today's spend:       ${daily:.2f} / ${config.daily_cost_limit:.2f}")
+        print(f"This month's spend:  ${monthly:.2f} / ${config.monthly_cost_limit:.2f}")
+        print(f"Alert threshold:     {config.cost_alert_threshold*100:.0f}%")
+        print(f"Build cost estimate: ${config.build_cost_estimate:.2f}\n")
+
+        breakdown = state_db.get_cost_breakdown(days=args.days)
+        if breakdown:
+            print(f"Daily breakdown (last {args.days} days):")
+            for entry in breakdown:
+                print(f"  {entry['date']}  ${entry['total_cost']:.2f}  ({entry['entry_count']} entries)")
+        else:
+            print("No cost data recorded yet.")
+
+        return 0
+    except Exception as e:
+        print(f"ERROR: {e}")
+        return 1
+    finally:
+        state_db.close()
+
+
 def cmd_reset(args, config: Config):
     """
     Reset circuit breaker for gate(s).
@@ -812,6 +847,10 @@ def main():
     retry_parser = subparsers.add_parser("retry", help="Re-dispatch a failed build")
     retry_parser.add_argument("build_id", help="Queue job ID to retry (e.g. metroplex-ideaforge-79)")
 
+    # cost command
+    cost_parser = subparsers.add_parser("cost", help="Show cost tracking summary")
+    cost_parser.add_argument("--days", type=int, default=7, help="Number of days for breakdown (default: 7)")
+
     # reset command
     reset_parser = subparsers.add_parser("reset", help="Reset circuit breaker")
     reset_parser.add_argument("--gate", required=True, choices=["triage", "build", "publish", "patch", "all"], help="Gate to reset")
@@ -852,6 +891,8 @@ def main():
         sys.exit(cmd_builds(args, config))
     elif args.command == "retry":
         sys.exit(cmd_retry(args, config))
+    elif args.command == "cost":
+        sys.exit(cmd_cost(args, config))
     elif args.command == "reset":
         sys.exit(cmd_reset(args, config))
     else:
