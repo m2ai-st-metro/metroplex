@@ -4,14 +4,43 @@ Reads scored ideas from IdeaForge, applies threshold-based decisions.
 Approved ideas are enqueued into the priority queue for build dispatch.
 """
 import json
+import logging
+import re
 from datetime import datetime
+from difflib import SequenceMatcher
 from typing import TYPE_CHECKING
+
+logger = logging.getLogger(__name__)
 
 from config import Config
 from models import TriageDecision, PriorityItem
 from db import StateDB
 from audit import AuditLogger
 from readers.ideaforge_reader import IdeaForgeReader
+
+
+def _normalize_title(title: str) -> str:
+    """Normalize a title for dedup comparison."""
+    t = title.lower().strip()
+    t = re.sub(r"[^a-z0-9\s]", "", t)
+    t = re.sub(r"\s+", " ", t)
+    return t
+
+
+def _is_duplicate(title: str, existing_titles: list[str], threshold: float = 0.85) -> str | None:
+    """Check if a title is a duplicate of any existing title.
+
+    Returns the matching title if found, None otherwise.
+    Uses SequenceMatcher for fuzzy matching — catches 'AgentGuard' vs 'Agent Guard',
+    'AI Circuit Breaker' vs 'AI Agent Circuit Breaker', etc.
+    """
+    norm = _normalize_title(title)
+    for existing in existing_titles:
+        norm_existing = _normalize_title(existing)
+        ratio = SequenceMatcher(None, norm, norm_existing).ratio()
+        if ratio >= threshold:
+            return existing
+    return None
 
 
 class TriageGate:
@@ -62,22 +91,41 @@ class TriageGate:
 
         ideas = self.ideaforge_reader.get_unprocessed_ideas()
 
-        # Filter out ideas already triaged in a previous cycle
+        # Filter out ideas that already have ANY triage decision (approve/reject/defer).
+        # This prevents re-triaging the same idea every cycle (loop bug).
         already_triaged = self.state_db.get_triaged_idea_ids()
         ideas = [i for i in ideas if i["id"] not in already_triaged]
 
         if not ideas:
             return []
 
+        # Load titles of already-approved/built ideas for dedup
+        approved_titles = self.state_db.get_approved_titles()
+
         decisions = []
         approve_count = 0
 
         for idea in ideas:
-            # Scale score from 0-10 to 0-100
-            scaled_score = idea["weighted_score"] * 10
+            # IdeaForge scores are 0-10; scale to 0-100 for threshold comparison.
+            # Guard: if a score is already >10, it's likely pre-scaled or corrupt.
+            raw_score = idea["weighted_score"]
+            if raw_score is None or raw_score < 0:
+                continue
+            if raw_score > 10:
+                logger.warning(
+                    "Idea %s has weighted_score %.1f (expected 0-10). Skipping.",
+                    idea["id"], raw_score,
+                )
+                continue
+            scaled_score = raw_score * 10
 
+            # Dedup: reject if title matches an already-approved idea
+            dup_match = _is_duplicate(idea["title"], approved_titles)
+            if dup_match:
+                decision = "reject"
+                reason = f"duplicate of already-approved: {dup_match}"
             # Apply threshold-based decision
-            if scaled_score >= self.config.approve_threshold:
+            elif scaled_score >= self.config.approve_threshold:
                 if approve_count < self.config.max_approve_per_cycle:
                     decision = "approve"
                     reason = "meets approval threshold"
@@ -124,6 +172,9 @@ class TriageGate:
                         idea_data=json.dumps(idea, default=str),
                     )
                     self.state_db.enqueue_item(item)
+
+                # Claim idea in IdeaForge (without changing its status)
+                self.ideaforge_reader.claim_idea(idea["id"])
 
                 # Log decision in audit log
                 self.audit_logger.log_decision(

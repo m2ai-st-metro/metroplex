@@ -43,6 +43,7 @@ class Config:
     # Scoring thresholds
     approve_threshold: int = field(default=68)
     reject_threshold: int = field(default=40)
+    max_deferrals: int = field(default=3)
 
     # Cycle limits
     max_approve_per_cycle: int = field(default=3)
@@ -120,6 +121,11 @@ class Config:
 
         try:
             self.reject_threshold = int(os.environ.get("METROPLEX_REJECT_THRESHOLD", self.reject_threshold))
+        except ValueError:
+            pass
+
+        try:
+            self.max_deferrals = int(os.environ.get("METROPLEX_MAX_DEFERRALS", self.max_deferrals))
         except ValueError:
             pass
 

@@ -126,9 +126,9 @@ class TestCircuitBreaker:
 
         statuses = breaker.get_status()
 
-        assert len(statuses) == 3
+        assert len(statuses) == 4
         gates = {s.gate for s in statuses}
-        assert gates == {"triage", "build", "patch"}
+        assert gates == {"triage", "build", "publish", "patch"}
 
         # Find specific gate statuses
         triage = next(s for s in statuses if s.gate == "triage")

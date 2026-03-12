@@ -86,6 +86,21 @@ L5 autonomy layer for the ST Metro ecosystem. Closes all three human gates in th
 - [x] Fix: CWD bug in 7 CLI/SIGTERM subprocess tests
 - [x] **221 tests passing** (51 new Phase 9 tests: 15 queue DB, 16 notifier, 8 schedule, 5 notification integration, 3 status, 1 CLI queue, 3 triage-queue integration)
 
+## Phase 9.5: Dispatcher-Orchestrator Integration
+
+- [x] Added `dispatcher` parameter to `CycleOrchestrator.__init__`
+- [x] `dispatch_queue_items()` — routes non-buildable queue items (skylynx) to ClaudeClaw workers via `EAClaudeDispatcher`
+- [x] Wired into `run_cycle()` between build status sync and Gate 4 (publish)
+- [x] `initialize_components()` in `metroplex.py` creates dispatcher from config
+- [x] Per-cycle cap respected (`max_approve_per_cycle`)
+- [x] Dry-run safe (no dispatches, no status updates)
+- [x] Non-fatal — dispatch errors logged but don't halt cycle
+- [x] Notifications on successful dispatch
+- [x] Dispatch count included in cycle summary notifications
+- [x] Fixed pre-existing test assertions (gate count 3→4 from publish gate addition)
+- [x] **8 new tests** in `TestDispatchIntegration` (dispatch skylynx items, skip buildable sources, dry run, cycle integration, error handling, notifications, per-cycle cap)
+- [x] **229+ tests passing** (88 orchestrator+dispatcher+safety verified)
+
 ## Architecture
 
 ```

@@ -4,7 +4,7 @@ Manages metroplex.db SQLite database for tracking all decisions, jobs, patches, 
 """
 import sqlite3
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
 
@@ -93,6 +93,7 @@ class StateDB:
                 triage_count INTEGER DEFAULT 0,
                 build_count INTEGER DEFAULT 0,
                 patch_count INTEGER DEFAULT 0,
+                publish_count INTEGER DEFAULT 0,
                 errors TEXT DEFAULT '[]'
             )
         """)
@@ -137,9 +138,38 @@ class StateDB:
                 idea_data TEXT NOT NULL DEFAULT '{}',
                 created_at TEXT NOT NULL,
                 dispatched_at TEXT,
-                completed_at TEXT
+                completed_at TEXT,
+                dispatch_task_id TEXT
             )
         """)
+
+        # Migrate: add dispatch_task_id if missing (schema added after initial deploy)
+        cursor.execute("PRAGMA table_info(priority_queue)")
+        pq_columns = {row[1] for row in cursor.fetchall()}
+        if "dispatch_task_id" not in pq_columns:
+            cursor.execute("ALTER TABLE priority_queue ADD COLUMN dispatch_task_id TEXT")
+
+        # Migrate: add project_dir to build_jobs (UM bridge writes actual dir path)
+        cursor.execute("PRAGMA table_info(build_jobs)")
+        bj_columns = {row[1] for row in cursor.fetchall()}
+        if "project_dir" not in bj_columns:
+            cursor.execute("ALTER TABLE build_jobs ADD COLUMN project_dir TEXT")
+
+        # Migrate: add review_status to build_jobs (Phase 13c review gate)
+        if "review_status" not in bj_columns:
+            cursor.execute("ALTER TABLE build_jobs ADD COLUMN review_status TEXT DEFAULT NULL")
+
+        # Migrate: add retry columns to build_jobs (Phase 13f auto-retry)
+        if "retry_count" not in bj_columns:
+            cursor.execute("ALTER TABLE build_jobs ADD COLUMN retry_count INTEGER DEFAULT 0")
+        if "next_retry_at" not in bj_columns:
+            cursor.execute("ALTER TABLE build_jobs ADD COLUMN next_retry_at TEXT DEFAULT NULL")
+
+        # Migrate: add publish_count to cycles if missing
+        cursor.execute("PRAGMA table_info(cycles)")
+        cy_columns = {row[1] for row in cursor.fetchall()}
+        if "publish_count" not in cy_columns:
+            cursor.execute("ALTER TABLE cycles ADD COLUMN publish_count INTEGER DEFAULT 0")
 
         # Publish jobs table
         cursor.execute("""
@@ -215,12 +245,45 @@ class StateDB:
 
         self.conn.commit()
 
-    def get_triaged_idea_ids(self) -> set[int]:
-        """Return set of idea IDs that already have a triage decision."""
+    def get_triaged_idea_ids(self, decisions: tuple[str, ...] | None = None) -> set[int]:
+        """Return set of idea IDs that already have a triage decision.
+
+        Args:
+            decisions: If provided, only return IDs with these decision types.
+                       e.g. ("approve", "reject") to exclude deferred ideas
+                       from the filter, allowing them to be re-triaged.
+                       If None, returns all triaged idea IDs (legacy behavior).
+        """
         self.connect()
         cursor = self.conn.cursor()
-        cursor.execute("SELECT DISTINCT idea_id FROM triage_decisions")
+        if decisions:
+            placeholders = ",".join("?" for _ in decisions)
+            cursor.execute(
+                f"SELECT DISTINCT idea_id FROM triage_decisions WHERE decision IN ({placeholders})",
+                decisions,
+            )
+        else:
+            cursor.execute("SELECT DISTINCT idea_id FROM triage_decisions")
         return {row[0] for row in cursor.fetchall()}
+
+    def get_approved_titles(self) -> list[str]:
+        """Get titles of all approved ideas (for dedup checking)."""
+        self.connect()
+        cursor = self.conn.cursor()
+        cursor.execute(
+            "SELECT DISTINCT title FROM triage_decisions WHERE decision = 'approve'"
+        )
+        return [row[0] for row in cursor.fetchall()]
+
+    def get_deferral_count(self, idea_id: int) -> int:
+        """Count how many times an idea has been deferred."""
+        self.connect()
+        cursor = self.conn.cursor()
+        cursor.execute(
+            "SELECT COUNT(*) FROM triage_decisions WHERE idea_id = ? AND decision = 'defer'",
+            (idea_id,),
+        )
+        return cursor.fetchone()[0]
 
     def record_patch_application(self, patch: PatchApplication):
         """Record a patch application."""
@@ -266,7 +329,7 @@ class StateDB:
             errors=[]
         )
 
-    def end_cycle(self, cycle_id: str, triage_count: int, build_count: int, patch_count: int, errors: list[str]):
+    def end_cycle(self, cycle_id: str, triage_count: int, build_count: int, patch_count: int, errors: list[str], publish_count: int = 0):
         """End a cycle."""
         self.connect()
         cursor = self.conn.cursor()
@@ -275,13 +338,14 @@ class StateDB:
 
         cursor.execute("""
             UPDATE cycles
-            SET completed_at = ?, triage_count = ?, build_count = ?, patch_count = ?, errors = ?
+            SET completed_at = ?, triage_count = ?, build_count = ?, patch_count = ?, publish_count = ?, errors = ?
             WHERE cycle_id = ?
         """, (
             completed_at.isoformat(),
             triage_count,
             build_count,
             patch_count,
+            publish_count,
             json.dumps(errors),
             cycle_id
         ))
@@ -408,6 +472,46 @@ class StateDB:
 
         self.conn.commit()
 
+    def set_dispatch_task_id(self, item_id: int, task_id: str):
+        """Store the ClaudeClaw dispatch_queue task ID on a priority queue item."""
+        self.connect()
+        self.conn.execute(
+            "UPDATE priority_queue SET dispatch_task_id = ? WHERE id = ?",
+            (task_id, item_id),
+        )
+        self.conn.commit()
+
+    def get_dispatched_items(self, sources: tuple[str, ...] | None = None) -> list[dict]:
+        """Get all priority_queue items with status='dispatched' and a dispatch_task_id.
+
+        Args:
+            sources: If provided, only return items from these sources.
+
+        Returns:
+            List of dicts with id, source, source_id, dispatch_task_id.
+        """
+        self.connect()
+        cursor = self.conn.cursor()
+
+        if sources:
+            placeholders = ",".join("?" for _ in sources)
+            cursor.execute(f"""
+                SELECT id, source, source_id, dispatch_task_id
+                FROM priority_queue
+                WHERE status = 'dispatched'
+                  AND dispatch_task_id IS NOT NULL
+                  AND source IN ({placeholders})
+            """, sources)
+        else:
+            cursor.execute("""
+                SELECT id, source, source_id, dispatch_task_id
+                FROM priority_queue
+                WHERE status = 'dispatched'
+                  AND dispatch_task_id IS NOT NULL
+            """)
+
+        return [dict(row) for row in cursor.fetchall()]
+
     def get_queue_summary(self) -> dict:
         """Get priority queue summary counts by status."""
         self.connect()
@@ -452,7 +556,7 @@ class StateDB:
 
         parts = queue_job_id.split("-", 2)  # Split into at most 3 parts
 
-        if len(parts) >= 3 and parts[0] == "metroplex" and parts[1] in ("ideaforge", "skylynx", "linear"):
+        if len(parts) >= 3 and parts[0] == "metroplex" and parts[1] in ("ideaforge", "skylynx", "linear", "academy"):
             # New format: metroplex-source-source_id (source_id may contain hyphens)
             source = parts[1]
             source_id = parts[2]
@@ -483,26 +587,212 @@ class StateDB:
         self.conn.commit()
         return changed
 
-    # --- Publish Jobs ---
+    def update_build_job_project_dir(self, queue_job_id: str, project_dir: str) -> bool:
+        """Store the actual project directory path on a build job.
 
-    def get_unpublished_builds(self) -> list[dict]:
-        """Get completed builds that haven't been published yet.
+        Called by UM bridge worker after build completes, so the publish
+        gate can find the output regardless of naming convention.
+        """
+        self.connect()
+        cursor = self.conn.cursor()
+        cursor.execute(
+            "UPDATE build_jobs SET project_dir = ? WHERE queue_job_id = ?",
+            (project_dir, queue_job_id),
+        )
+        self.conn.commit()
+        return cursor.rowcount > 0
 
-        Returns distinct queue_job_ids with status='completed' that have
-        no entry (or only 'failed' entries) in publish_jobs.
+    def reset_build_for_retry(self, queue_job_id: str) -> bool:
+        """Reset a failed build so it can be re-dispatched.
+
+        Resets the latest build_jobs entry from 'failed' to 'queued' and
+        the priority_queue entry from 'failed' to 'pending'.
+
+        Returns:
+            True if the build was found and reset.
+        """
+        self.connect()
+        cursor = self.conn.cursor()
+
+        # Reset the latest build_jobs entry for this queue_job_id
+        cursor.execute(
+            "UPDATE build_jobs SET status = 'queued', project_dir = NULL "
+            "WHERE id = (SELECT MAX(id) FROM build_jobs WHERE queue_job_id = ? AND status = 'failed')",
+            (queue_job_id,),
+        )
+        if cursor.rowcount == 0:
+            return False
+
+        # Parse queue_job_id to find the priority_queue entry
+        parts = queue_job_id.split("-", 2)
+        source = None
+        source_id = None
+
+        if len(parts) >= 3 and parts[0] == "metroplex" and parts[1] in ("ideaforge", "skylynx", "linear", "academy"):
+            source = parts[1]
+            source_id = parts[2]
+        elif len(parts) == 2 and parts[0] == "metroplex" and parts[1].isdigit():
+            source = "ideaforge"
+            source_id = parts[1]
+
+        if source and source_id:
+            cursor.execute(
+                "UPDATE priority_queue SET status = 'pending', completed_at = NULL "
+                "WHERE source = ? AND source_id = ? AND status = 'failed'",
+                (source, source_id),
+            )
+
+        self.conn.commit()
+        return True
+
+    # --- Review Gate (Phase 13c) ---
+
+    def get_reviewable_builds(self) -> list[dict]:
+        """Get completed builds that haven't been reviewed yet.
+
+        Returns builds with status='completed' and review_status IS NULL.
         """
         self.connect()
         cursor = self.conn.cursor()
 
         cursor.execute("""
-            SELECT DISTINCT b.queue_job_id, b.title
+            SELECT DISTINCT b.queue_job_id, b.title, b.project_dir
             FROM build_jobs b
             WHERE b.status = 'completed'
+            AND (b.review_status IS NULL OR b.review_status = '')
+        """)
+        return [
+            {"queue_job_id": row["queue_job_id"], "title": row["title"], "project_dir": row["project_dir"]}
+            for row in cursor.fetchall()
+        ]
+
+    def update_build_review_status(self, queue_job_id: str, review_status: str) -> bool:
+        """Set the review_status on a completed build.
+
+        Args:
+            queue_job_id: Build job queue ID
+            review_status: 'reviewed' (passed) or 'review_failed'
+
+        Returns:
+            True if row was updated.
+        """
+        self.connect()
+        cursor = self.conn.cursor()
+        cursor.execute(
+            "UPDATE build_jobs SET review_status = ? WHERE queue_job_id = ? AND status = 'completed'",
+            (review_status, queue_job_id),
+        )
+        self.conn.commit()
+        return cursor.rowcount > 0
+
+    # --- Build Retry (Phase 13f) ---
+
+    MAX_RETRIES = 3
+    RETRY_BACKOFF_MINUTES = [5, 20, 60]  # Exponential-ish backoff
+
+    def get_retryable_builds(self) -> list[dict]:
+        """Get failed builds eligible for automatic retry.
+
+        A build is retryable if:
+        - status = 'failed'
+        - retry_count < MAX_RETRIES
+        - next_retry_at <= now (or next_retry_at is NULL for first retry)
+        """
+        self.connect()
+        cursor = self.conn.cursor()
+        now = datetime.now().isoformat()
+
+        cursor.execute("""
+            SELECT queue_job_id, title, idea_id, retry_count
+            FROM build_jobs
+            WHERE status = 'failed'
+            AND (retry_count IS NULL OR retry_count < ?)
+            AND (next_retry_at IS NULL OR next_retry_at <= ?)
+            AND id IN (
+                SELECT MAX(id) FROM build_jobs GROUP BY queue_job_id
+            )
+        """, (self.MAX_RETRIES, now))
+        return [dict(row) for row in cursor.fetchall()]
+
+    def mark_build_for_retry(self, queue_job_id: str) -> bool:
+        """Reset a failed build for retry, incrementing retry_count and setting next_retry_at.
+
+        Returns:
+            True if the build was reset for retry.
+        """
+        self.connect()
+        cursor = self.conn.cursor()
+
+        # Get current retry count
+        cursor.execute(
+            "SELECT retry_count FROM build_jobs "
+            "WHERE queue_job_id = ? AND status = 'failed' ORDER BY id DESC LIMIT 1",
+            (queue_job_id,),
+        )
+        row = cursor.fetchone()
+        if not row:
+            return False
+
+        current_count = row["retry_count"] or 0
+        if current_count >= self.MAX_RETRIES:
+            return False
+
+        new_count = current_count + 1
+        backoff_idx = min(new_count - 1, len(self.RETRY_BACKOFF_MINUTES) - 1)
+        backoff_minutes = self.RETRY_BACKOFF_MINUTES[backoff_idx]
+        next_retry = (datetime.now() + timedelta(minutes=backoff_minutes)).isoformat()
+
+        # Reset status to queued, bump retry_count, set next_retry_at
+        cursor.execute(
+            "UPDATE build_jobs SET status = 'queued', retry_count = ?, next_retry_at = ?, project_dir = NULL "
+            "WHERE id = (SELECT MAX(id) FROM build_jobs WHERE queue_job_id = ? AND status = 'failed')",
+            (new_count, next_retry, queue_job_id),
+        )
+        build_updated = cursor.rowcount > 0
+
+        # Also reset priority_queue entry
+        parts = queue_job_id.split("-", 2)
+        source = None
+        source_id = None
+        if len(parts) >= 3 and parts[0] == "metroplex" and parts[1] in ("ideaforge", "skylynx", "linear", "academy"):
+            source = parts[1]
+            source_id = parts[2]
+        elif len(parts) == 2 and parts[0] == "metroplex" and parts[1].isdigit():
+            source = "ideaforge"
+            source_id = parts[1]
+
+        if source and source_id:
+            cursor.execute(
+                "UPDATE priority_queue SET status = 'pending', completed_at = NULL "
+                "WHERE source = ? AND source_id = ? AND status = 'failed'",
+                (source, source_id),
+            )
+
+        self.conn.commit()
+        return build_updated
+
+    # --- Publish Jobs ---
+
+    def get_unpublished_builds(self) -> list[dict]:
+        """Get reviewed builds that haven't been published yet.
+
+        Returns distinct queue_job_ids with status='completed' and
+        review_status='reviewed' that have no 'published' entry in publish_jobs.
+        Falls back to unreviewed completed builds for backward compatibility.
+        """
+        self.connect()
+        cursor = self.conn.cursor()
+
+        cursor.execute("""
+            SELECT DISTINCT b.queue_job_id, b.title, b.project_dir
+            FROM build_jobs b
+            WHERE b.status = 'completed'
+            AND (b.review_status = 'reviewed' OR b.review_status IS NULL)
             AND b.queue_job_id NOT IN (
                 SELECT build_job_id FROM publish_jobs WHERE status = 'published'
             )
         """)
-        return [{"queue_job_id": row["queue_job_id"], "title": row["title"]} for row in cursor.fetchall()]
+        return [{"queue_job_id": row["queue_job_id"], "title": row["title"], "project_dir": row["project_dir"]} for row in cursor.fetchall()]
 
     def record_publish_job(self, job: PublishJob):
         """Record a publish job. Uses INSERT OR REPLACE to handle retries of failed jobs."""

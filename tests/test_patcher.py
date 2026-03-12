@@ -492,9 +492,13 @@ def test_git_push_failure_continues_to_next_patch(create_stfactory_db, tmp_path)
     git_dir = work_dir / ".git"
     git_dir.mkdir()
 
-    # Create persona YAML files
-    (personas_dir / "persona-1.yaml").write_text("name: Persona1\nvoice: {}\n")
-    (personas_dir / "persona-2.yaml").write_text("name: Persona2\nvoice: {}\n")
+    # Create persona YAML files (subdirectory structure)
+    p1_dir = personas_dir / "persona-1"
+    p1_dir.mkdir()
+    (p1_dir / "persona.yaml").write_text("name: Persona1\nvoice: {}\n")
+    p2_dir = personas_dir / "persona-2"
+    p2_dir.mkdir()
+    (p2_dir / "persona.yaml").write_text("name: Persona2\nvoice: {}\n")
 
     # Mock subprocess: first patch fails on push, second succeeds
     call_count = {"push": 0}
@@ -668,7 +672,9 @@ def test_successful_patch_updates_stfactory_status(create_stfactory_db, tmp_path
     git_dir = work_dir / ".git"
     git_dir.mkdir()
 
-    yaml_file = personas_dir / "persona-1.yaml"
+    p1_dir = personas_dir / "persona-1"
+    p1_dir.mkdir()
+    yaml_file = p1_dir / "persona.yaml"
     yaml_file.write_text("name: TestPersona\nvoice: {}\n")
 
     # Mock git operations to succeed

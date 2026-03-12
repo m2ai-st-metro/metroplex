@@ -254,10 +254,11 @@ class TestCycleOrchestrator:
         assert "pending_builds" in status
 
         # Verify gate statuses
-        assert len(status["gate_statuses"]) == 3
+        assert len(status["gate_statuses"]) == 4
         gate_names = [gs["gate"] for gs in status["gate_statuses"]]
         assert "triage" in gate_names
         assert "build" in gate_names
+        assert "publish" in gate_names
         assert "patch" in gate_names
 
         # Verify recent cycles
@@ -923,6 +924,224 @@ class TestSkyLynxIntake:
 
         # Sky-Lynx reader should have been called
         mock_reader.get_pending_recommendations.assert_called_once()
+
+
+class TestDispatchIntegration:
+    """Test dispatcher integration in orchestrator cycle."""
+
+    def _make_orchestrator_with_dispatcher(
+        self, config, state_db, audit_logger, dispatcher=None
+    ):
+        """Helper to create orchestrator with a dispatcher and empty gates."""
+        mock_triage = Mock(spec=TriageGate)
+        mock_triage.run.return_value = []
+        mock_build = Mock(spec=BuildOrchestrator)
+        mock_build.run_from_queue.return_value = []
+        mock_build.is_runner_active.return_value = False
+        mock_build.poll_and_sync_status.return_value = {
+            "running": [], "running_count": 0,
+            "completed": [], "failed": [], "newly_synced": [],
+        }
+        mock_patch = Mock(spec=PatchGate)
+        mock_patch.run.return_value = []
+        cb = CircuitBreaker(threshold=3, state_db=state_db)
+        cc = CycleCaps(config)
+        sh = ShutdownHandler()
+
+        from dispatcher import LogDispatcher
+        return CycleOrchestrator(
+            config=config,
+            triage_gate=mock_triage,
+            build_orchestrator=mock_build,
+            patch_gate=mock_patch,
+            circuit_breaker=cb,
+            cycle_caps=cc,
+            shutdown_handler=sh,
+            state_db=state_db,
+            audit_logger=audit_logger,
+            dispatcher=dispatcher or LogDispatcher(),
+        )
+
+    def test_dispatch_skylynx_items_from_queue(self, config, state_db, audit_logger):
+        """Sky-Lynx items in the queue get dispatched to ClaudeClaw workers."""
+        from models import PriorityItem
+        from dispatcher import LogDispatcher
+
+        # Enqueue a skylynx item
+        item = PriorityItem(
+            source="skylynx",
+            source_id="sl-dispatch-001",
+            title="Fix Session Tracking",
+            description="Session tracking is broken",
+            priority_score=85.0,
+            idea_data='{"_recommendation_type": "pipeline_change", "description": "Session tracking is broken"}',
+        )
+        state_db.enqueue_item(item)
+
+        dispatcher = LogDispatcher()
+        orch = self._make_orchestrator_with_dispatcher(config, state_db, audit_logger, dispatcher)
+
+        count = orch.dispatch_queue_items(dry_run=False)
+
+        assert count == 1
+        assert len(dispatcher.dispatched) == 1
+        assert dispatcher.dispatched[0]["worker_type"] == "ravage"
+
+    def test_dispatch_skips_buildable_sources(self, config, state_db, audit_logger):
+        """IdeaForge/linear/academy items are NOT dispatched (handled by Gate 2)."""
+        from models import PriorityItem
+        from dispatcher import LogDispatcher
+
+        for source in ("ideaforge", "linear", "academy"):
+            item = PriorityItem(
+                source=source,
+                source_id=f"{source}-001",
+                title=f"Test {source}",
+                description="Test",
+                priority_score=80.0,
+            )
+            state_db.enqueue_item(item)
+
+        dispatcher = LogDispatcher()
+        orch = self._make_orchestrator_with_dispatcher(config, state_db, audit_logger, dispatcher)
+
+        count = orch.dispatch_queue_items(dry_run=False)
+
+        assert count == 0
+        assert len(dispatcher.dispatched) == 0
+
+    def test_dispatch_dry_run_no_writes(self, config, state_db, audit_logger):
+        """Dry run counts items but doesn't dispatch or update status."""
+        from models import PriorityItem
+        from dispatcher import LogDispatcher
+
+        item = PriorityItem(
+            source="skylynx",
+            source_id="sl-dry-001",
+            title="Dry Run Dispatch",
+            description="Test",
+            priority_score=70.0,
+        )
+        state_db.enqueue_item(item)
+
+        dispatcher = LogDispatcher()
+        orch = self._make_orchestrator_with_dispatcher(config, state_db, audit_logger, dispatcher)
+
+        count = orch.dispatch_queue_items(dry_run=True)
+
+        assert count == 1
+        assert len(dispatcher.dispatched) == 0  # Not actually dispatched
+        # Item should still be pending
+        summary = state_db.get_queue_summary()
+        assert summary.get("pending", 0) == 1
+
+    def test_dispatch_called_in_run_cycle(self, config, state_db, audit_logger):
+        """run_cycle calls dispatch_queue_items."""
+        from dispatcher import LogDispatcher
+
+        dispatcher = LogDispatcher()
+        orch = self._make_orchestrator_with_dispatcher(config, state_db, audit_logger, dispatcher)
+
+        with patch.object(orch, "dispatch_queue_items", return_value=0) as mock_dispatch:
+            orch.run_cycle(dry_run=True)
+            mock_dispatch.assert_called_once_with(dry_run=True)
+
+    def test_dispatch_error_does_not_halt_cycle(self, config, state_db, audit_logger):
+        """Dispatch errors are non-fatal — cycle continues to Gate 4 and Gate 3."""
+        mock_dispatcher = Mock()
+        mock_dispatcher.dispatch.side_effect = Exception("DB locked")
+
+        from models import PriorityItem
+        item = PriorityItem(
+            source="skylynx",
+            source_id="sl-err-001",
+            title="Error Test",
+            description="Test",
+            priority_score=70.0,
+        )
+        state_db.enqueue_item(item)
+
+        orch = self._make_orchestrator_with_dispatcher(config, state_db, audit_logger, mock_dispatcher)
+        result = orch.run_cycle(dry_run=False)
+
+        # Cycle should complete despite dispatch error
+        assert result.completed_at is not None
+
+    def test_dispatch_notifies_on_success(self, config, state_db, audit_logger):
+        """Dispatch success triggers a notification."""
+        from models import PriorityItem
+        from dispatcher import LogDispatcher
+
+        item = PriorityItem(
+            source="skylynx",
+            source_id="sl-notify-001",
+            title="Notify Test",
+            description="Test",
+            priority_score=70.0,
+        )
+        state_db.enqueue_item(item)
+
+        mock_notifier = Mock()
+        mock_notifier.notify.return_value = True
+        dispatcher = LogDispatcher()
+
+        mock_triage = Mock(spec=TriageGate)
+        mock_triage.run.return_value = []
+        mock_build = Mock(spec=BuildOrchestrator)
+        mock_build.run_from_queue.return_value = []
+        mock_build.is_runner_active.return_value = False
+        mock_build.poll_and_sync_status.return_value = {
+            "running": [], "running_count": 0,
+            "completed": [], "failed": [], "newly_synced": [],
+        }
+        mock_patch = Mock(spec=PatchGate)
+        mock_patch.run.return_value = []
+
+        orch = CycleOrchestrator(
+            config=config,
+            triage_gate=mock_triage,
+            build_orchestrator=mock_build,
+            patch_gate=mock_patch,
+            circuit_breaker=CircuitBreaker(threshold=3, state_db=state_db),
+            cycle_caps=CycleCaps(config),
+            shutdown_handler=ShutdownHandler(),
+            state_db=state_db,
+            audit_logger=audit_logger,
+            notifier=mock_notifier,
+            dispatcher=dispatcher,
+        )
+
+        orch.run_cycle(dry_run=False)
+
+        notify_calls = [str(c) for c in mock_notifier.notify.call_args_list]
+        dispatched_notified = any("Dispatched" in c or "dispatched" in c for c in notify_calls)
+        assert dispatched_notified, f"Expected dispatch notification, got: {notify_calls}"
+
+    def test_dispatch_respects_per_cycle_cap(self, config, state_db, audit_logger):
+        """Dispatch respects max_approve_per_cycle cap."""
+        from models import PriorityItem
+        from dispatcher import LogDispatcher
+
+        config.max_approve_per_cycle = 2
+
+        # Enqueue 5 items
+        for i in range(5):
+            item = PriorityItem(
+                source="skylynx",
+                source_id=f"sl-cap-{i:03d}",
+                title=f"Cap Test {i}",
+                description="Test",
+                priority_score=80.0 - i,
+            )
+            state_db.enqueue_item(item)
+
+        dispatcher = LogDispatcher()
+        orch = self._make_orchestrator_with_dispatcher(config, state_db, audit_logger, dispatcher)
+
+        count = orch.dispatch_queue_items(dry_run=False)
+
+        assert count == 2  # Capped at max_approve_per_cycle
+        assert len(dispatcher.dispatched) == 2
 
 
 class TestCLIQueue:

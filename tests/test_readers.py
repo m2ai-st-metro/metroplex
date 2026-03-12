@@ -167,21 +167,45 @@ def stfactory_test_db():
         )
     """)
 
-    # Create improvement_recommendations table
+    # Create improvement_recommendations table (matches real persona_metrics.db schema)
     cursor.execute("""
         CREATE TABLE improvement_recommendations (
             id INTEGER PRIMARY KEY,
-            recommendation TEXT,
-            status TEXT
+            recommendation_id TEXT,
+            session_id TEXT,
+            recommendation_type TEXT,
+            target_system TEXT,
+            title TEXT,
+            priority TEXT,
+            scope TEXT,
+            target_department TEXT,
+            status TEXT,
+            emitted_at TEXT,
+            raw_json TEXT,
+            effectiveness TEXT,
+            effectiveness_score REAL,
+            effectiveness_evaluated_at TEXT
         )
     """)
 
-    # Create outcome_records table
+    # Create outcome_records table (matches real persona_metrics.db schema)
     cursor.execute("""
         CREATE TABLE outcome_records (
             id INTEGER PRIMARY KEY,
-            event_type TEXT,
-            emitted_at TEXT
+            idea_id INTEGER,
+            idea_title TEXT,
+            outcome TEXT,
+            overall_score REAL,
+            recommendation TEXT,
+            capabilities_fit TEXT,
+            build_outcome TEXT,
+            artifact_count INTEGER,
+            tech_stack TEXT,
+            total_duration_seconds REAL,
+            tags TEXT,
+            github_url TEXT,
+            emitted_at TEXT,
+            raw_json TEXT
         )
     """)
 
@@ -204,18 +228,32 @@ def stfactory_test_db():
 
     # Insert test recommendations
     cursor.execute("""
-        INSERT INTO improvement_recommendations (id, recommendation, status)
-        VALUES (1, 'Optimize performance', 'pending'),
-               (2, 'Refactor module X', 'pending'),
-               (3, 'Already done', 'completed')
+        INSERT INTO improvement_recommendations (
+            id, recommendation_id, session_id, recommendation_type,
+            target_system, title, priority, scope, target_department,
+            status, emitted_at, raw_json
+        ) VALUES
+            (1, 'rec-001', 'sess-001', 'optimization', 'metroplex', 'Optimize performance',
+             'high', 'module', 'engineering', 'pending', '2024-01-01T10:00:00', '{}'),
+            (2, 'rec-002', 'sess-002', 'refactor', 'metroplex', 'Refactor module X',
+             'medium', 'module', 'engineering', 'pending', '2024-01-01T11:00:00', '{}'),
+            (3, 'rec-003', 'sess-003', 'optimization', 'metroplex', 'Already done',
+             'low', 'module', 'engineering', 'completed', '2024-01-01T09:00:00', '{}')
     """)
 
     # Insert test outcome records
     cursor.execute("""
-        INSERT INTO outcome_records (id, event_type, emitted_at)
-        VALUES (1, 'build_success', '2024-01-01T10:00:00'),
-               (2, 'test_pass', '2024-01-01T11:00:00'),
-               (3, 'deploy_complete', '2024-01-01T12:00:00')
+        INSERT INTO outcome_records (
+            id, idea_id, idea_title, outcome, overall_score, recommendation,
+            capabilities_fit, build_outcome, artifact_count, tech_stack,
+            total_duration_seconds, tags, github_url, emitted_at, raw_json
+        ) VALUES
+            (1, 101, 'Idea A', 'success', 8.5, 'Ship it', 'high', 'build_success',
+             3, 'python', 120.0, 'ai,tool', 'https://github.com/org/a', '2024-01-01T10:00:00', '{}'),
+            (2, 102, 'Idea B', 'success', 7.0, 'Approve', 'medium', 'test_pass',
+             2, 'typescript', 90.0, 'web', 'https://github.com/org/b', '2024-01-01T11:00:00', '{}'),
+            (3, 103, 'Idea C', 'success', 9.0, 'Ship it', 'high', 'deploy_complete',
+             5, 'python', 200.0, 'agent', 'https://github.com/org/c', '2024-01-01T12:00:00', '{}')
     """)
 
     conn.commit()
@@ -284,8 +322,8 @@ def test_stfactory_get_pending_recommendations(stfactory_test_db):
     # Should return only pending recommendations
     assert len(recommendations) == 2
 
-    assert recommendations[0]["recommendation"] == "Optimize performance"
-    assert recommendations[1]["recommendation"] == "Refactor module X"
+    assert recommendations[0]["title"] == "Optimize performance"
+    assert recommendations[1]["title"] == "Refactor module X"
 
     reader.close()
 
@@ -319,8 +357,8 @@ def test_stfactory_get_outcome_records(stfactory_test_db):
 
     # Should return most recent 2 records in DESC order
     assert len(records) == 2
-    assert records[0]["event_type"] == "deploy_complete"  # Most recent
-    assert records[1]["event_type"] == "test_pass"
+    assert records[0]["build_outcome"] == "deploy_complete"  # Most recent
+    assert records[1]["build_outcome"] == "test_pass"
 
     # Test with default limit
     all_records = reader.get_outcome_records()
@@ -348,23 +386,44 @@ def um_test_db():
         )
     """)
 
-    # Create build_results table
+    # Create build_results table (matches real idea-factory.db schema)
     cursor.execute("""
         CREATE TABLE build_results (
-            id INTEGER PRIMARY KEY,
             idea_id TEXT,
+            github_repo TEXT,
+            artifacts TEXT,
             outcome TEXT,
-            github_repo TEXT
+            started_at TEXT,
+            completed_at TEXT,
+            google_drive_url TEXT,
+            google_drive_file_id TEXT,
+            test_results TEXT,
+            total_cost REAL,
+            run_instructions TEXT,
+            ralph_execution_id TEXT
         )
     """)
 
-    # Create evaluation_results table
+    # Create evaluation_results table (matches real idea-factory.db schema)
     cursor.execute("""
         CREATE TABLE evaluation_results (
-            id INTEGER PRIMARY KEY,
             idea_id TEXT,
+            jtbd_analysis TEXT,
+            disruption_potential TEXT,
+            disruption_score REAL,
+            capabilities_fit TEXT,
+            recommendation TEXT,
+            recommendation_rationale TEXT,
+            key_risks TEXT,
+            case_study_matches TEXT,
             overall_score REAL,
-            recommendation TEXT
+            evaluated_at TEXT,
+            evaluated_by TEXT,
+            jtbd_clarity_score REAL,
+            market_size_score REAL,
+            competitive_intensity_score REAL,
+            feasibility_score REAL,
+            risk_severity_score REAL
         )
     """)
 
@@ -377,15 +436,30 @@ def um_test_db():
 
     # Insert test build results
     cursor.execute("""
-        INSERT INTO build_results (id, idea_id, outcome, github_repo)
-        VALUES (1, 'idea-001', 'success', 'org/ai-assistant'),
-               (2, 'idea-002', 'success', 'org/data-tool')
+        INSERT INTO build_results (
+            idea_id, github_repo, artifacts, outcome, started_at, completed_at,
+            test_results, total_cost, run_instructions, ralph_execution_id
+        ) VALUES
+            ('idea-001', 'org/ai-assistant', '[]', 'success',
+             '2024-01-01T08:00:00', '2024-01-01T09:00:00', '{}', 1.50, 'npm start', 'exec-001'),
+            ('idea-002', 'org/data-tool', '[]', 'success',
+             '2024-01-01T10:00:00', '2024-01-01T11:00:00', '{}', 2.00, 'python main.py', 'exec-002')
     """)
 
     # Insert test evaluation results
     cursor.execute("""
-        INSERT INTO evaluation_results (id, idea_id, overall_score, recommendation)
-        VALUES (1, 'idea-002', 8.5, 'Approve for production')
+        INSERT INTO evaluation_results (
+            idea_id, jtbd_analysis, disruption_potential, disruption_score,
+            capabilities_fit, recommendation, recommendation_rationale,
+            key_risks, case_study_matches, overall_score, evaluated_at, evaluated_by,
+            jtbd_clarity_score, market_size_score, competitive_intensity_score,
+            feasibility_score, risk_severity_score
+        ) VALUES (
+            'idea-002', 'Strong JTBD fit', 'Medium', 7.0,
+            'High', 'Approve for production', 'Solid market fit',
+            'Low competition risk', '[]', 8.5, '2024-01-01T12:00:00', 'evaluator-1',
+            8.0, 7.5, 6.0, 9.0, 3.0
+        )
     """)
 
     conn.commit()

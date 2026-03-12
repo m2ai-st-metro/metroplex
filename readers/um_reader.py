@@ -88,13 +88,13 @@ class UMReader:
 
         cursor.execute("""
             SELECT
-                br.*,
-                i.title,
-                i.current_stage,
-                i.current_status
+                br.idea_id, br.github_repo, br.artifacts, br.outcome,
+                br.started_at, br.completed_at, br.test_results, br.total_cost,
+                br.run_instructions, br.ralph_execution_id,
+                i.title, i.current_stage, i.current_status
             FROM build_results br
             LEFT JOIN ideas i ON br.idea_id = i.id
-            ORDER BY br.id DESC
+            ORDER BY br.completed_at DESC
             LIMIT ?
         """, (limit,))
 
@@ -115,7 +115,13 @@ class UMReader:
         cursor = self.conn.cursor()
 
         cursor.execute("""
-            SELECT *
+            SELECT
+                idea_id, overall_score, disruption_score, recommendation,
+                recommendation_rationale, capabilities_fit, key_risks,
+                jtbd_analysis, disruption_potential, case_study_matches,
+                evaluated_at, evaluated_by,
+                jtbd_clarity_score, market_size_score,
+                competitive_intensity_score, feasibility_score, risk_severity_score
             FROM evaluation_results
             WHERE idea_id = ?
         """, (idea_id,))

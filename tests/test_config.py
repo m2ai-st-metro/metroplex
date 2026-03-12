@@ -20,7 +20,7 @@ class TestConfigDefaults:
 
     def test_default_thresholds(self):
         config = Config()
-        assert config.approve_threshold == 70
+        assert config.approve_threshold == 68
         assert config.reject_threshold == 40
 
     def test_default_caps(self):
@@ -128,7 +128,7 @@ class TestConfigEnvOverrides:
     def test_invalid_int_env_keeps_default(self):
         with patch.dict(os.environ, {"METROPLEX_APPROVE_THRESHOLD": "not_a_number"}):
             config = Config()
-            assert config.approve_threshold == 70  # default preserved
+            assert config.approve_threshold == 68  # default preserved
 
     def test_override_max_concurrent_builds(self):
         with patch.dict(os.environ, {"METROPLEX_MAX_CONCURRENT_BUILDS": "4"}):

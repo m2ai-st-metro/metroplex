@@ -8,7 +8,7 @@ Follows the Notifier/LogNotifier pattern:
 - LogDispatcher is a no-op fallback for testing/dry-run
 - create_dispatcher() factory selects based on config
 
-Phase 9 scope: CLI-only dispatch. Full orchestrator integration deferred to Phase 10.
+Phase 9: CLI dispatch. Phase 9.5: Orchestrator integration (dispatch_queue_items in run_cycle).
 """
 import sqlite3
 import uuid

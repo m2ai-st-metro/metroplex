@@ -72,9 +72,10 @@ class PublishGate:
         for build in unpublished:
             queue_job_id = build["queue_job_id"]
             title = build["title"]
+            stored_dir = build.get("project_dir")
 
             # Resolve project directory
-            project_dir = self._resolve_project_dir(queue_job_id)
+            project_dir = self._resolve_project_dir(queue_job_id, title, stored_dir)
             if not project_dir:
                 job = PublishJob(
                     build_job_id=queue_job_id,
@@ -158,21 +159,34 @@ class PublishGate:
 
         return results
 
-    def _resolve_project_dir(self, queue_job_id: str) -> Path | None:
+    def _resolve_project_dir(
+        self, queue_job_id: str, title: str = "", stored_dir: str | None = None
+    ) -> Path | None:
         """
         Resolve the generation directory for a build job.
 
-        Checks generations/<queue_job_id>/ under the YCE harness directory.
+        Resolution order:
+        1. Stored project_dir from build_jobs (set by UM bridge writeback)
+        2. generations/<queue_job_id>/ (direct queue_runner builds)
+        3. Scan um-* directories for matching UM idea UUID prefix
 
         Args:
-            queue_job_id: The build job queue ID (e.g. 'metroplex-2', 'metroplex-ideaforge-10')
+            queue_job_id: The build job queue ID
+            title: Project title (unused, kept for interface compat)
+            stored_dir: Pre-resolved path from build_jobs.project_dir
 
         Returns:
             Path to the project directory, or None if not found
         """
+        # 1. Stored path from UM bridge writeback
+        if stored_dir:
+            stored = Path(stored_dir)
+            if stored.is_dir() and (stored / ".git").is_dir():
+                return stored
+
+        # 2. Direct match (queue_runner builds)
         generations_dir = Path(self.config.yce_dir) / "generations"
         project_dir = generations_dir / queue_job_id
-
         if project_dir.is_dir() and (project_dir / ".git").is_dir():
             return project_dir
 

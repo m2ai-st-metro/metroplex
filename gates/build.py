@@ -1,10 +1,11 @@
 """
 Build Gate - Gate 2
-Generates yce-harness app spec files from approved ideas.
-Primary: LLM expansion via Claude for idea-specific specs.
-Fallback: Jinja2 template rendering for generic specs.
-Orchestrates build queue via queue_runner.py subprocess calls.
-Supports background dispatch (Popen) and status polling.
+Routes approved ideas to Ultra-Magnus pipeline for full lifecycle
+processing (enrichment → evaluation → scaffolding → build → deploy).
+
+Legacy path (spec generation + YCE queue) retained for fallback.
+UM bridge runs as fire-and-forget subprocess; results written back
+to IdeaForge DB on completion.
 """
 import json
 import logging
@@ -22,6 +23,7 @@ from models import BuildJob, PriorityItem
 from db import StateDB
 from audit import AuditLogger
 from gates.llm_expander import LLMSpecExpander
+from um_bridge import submit_to_um
 
 logger = logging.getLogger(__name__)
 
@@ -597,8 +599,12 @@ class BuildOrchestrator:
 
     def run_from_queue(self, state_db: StateDB, dry_run: bool = False) -> list[BuildJob]:
         """
-        Pull items from the priority queue and dispatch builds.
-        This is the primary entry point for autonomous operation.
+        Pull items from the priority queue and dispatch to Ultra-Magnus.
+
+        Routes buildable ideas (ideaforge, linear, academy) to UM's full
+        pipeline via fire-and-forget subprocess. UM handles enrichment,
+        evaluation, scaffolding, and building (via YCE). Results are
+        written back to IdeaForge DB on completion.
 
         Args:
             state_db: StateDB instance (for priority queue access)
@@ -607,29 +613,13 @@ class BuildOrchestrator:
         Returns:
             List of BuildJob results
         """
-        # Check capacity: how many more builds can we dispatch?
-        max_concurrent = self.config.max_concurrent_builds
-        available_slots = max_concurrent
-
-        if self.is_runner_active():
-            print("Queue runner active, checking capacity...")
-            sync = self.poll_and_sync_status()
-            running_count = sync.get("running_count", 0)
-            available_slots = max(0, max_concurrent - running_count)
-
-            if available_slots == 0:
-                print(f"At capacity ({running_count}/{max_concurrent} builds running), skipping dispatch")
-                return []
-            else:
-                print(f"Capacity available: {available_slots} slot(s) free ({running_count}/{max_concurrent} running)")
-
         # Pull pending BUILDABLE items from sources that produce app specs.
         # Sky-Lynx recommendations are internal tasks dispatched via the
-        # EA-Claude dispatcher, not through the YCE build pipeline.
-        # Academy promotions produce agent builds via tier1_agent_template.
+        # EA-Claude dispatcher, not through the build pipeline.
         buildable_sources = ("ideaforge", "linear", "academy")
-        dispatch_limit = min(available_slots, self.config.max_approve_per_cycle)
-        approved_ideas = []
+        dispatch_limit = self.config.max_approve_per_cycle
+        jobs = []
+
         for _ in range(dispatch_limit):
             item = state_db.get_next_pending(sources=buildable_sources)
             if item is None:
@@ -647,31 +637,46 @@ class BuildOrchestrator:
                     "target_audience": "General",
                     "artifact_type": "tool",
                 }
-            # Propagate source for job_id encoding
             idea["_source"] = item.source
 
-            approved_ideas.append(idea)
+            # Route to Ultra-Magnus pipeline (fire-and-forget)
+            source = idea.get("_source", "ideaforge")
+            job_id = f"metroplex-{source}-{idea['id']}"
+            queued_at = datetime.now()
 
-            # Mark as dispatched immediately (prevents get_next_pending re-selecting)
+            launched = submit_to_um(idea, dry_run=dry_run)
+
+            status = "queued" if launched else "failed"
+            job = BuildJob(
+                idea_id=idea["id"],
+                title=idea["title"],
+                spec_path="",  # UM generates its own spec
+                queue_job_id=job_id,
+                status=status,
+                queued_at=queued_at,
+            )
+            self.state_db.record_build_job(job)
+            jobs.append(job)
+
+            self.audit_logger.log_decision(
+                gate="build",
+                action="submit_to_um",
+                details={
+                    "idea_id": idea["id"],
+                    "job_id": job_id,
+                    "title": idea["title"],
+                    "status": status,
+                    "route": "ultra-magnus",
+                },
+            )
+
+            # Mark as dispatched in priority queue
             if not dry_run and item.id:
-                state_db.update_item_status(item.id, "dispatched", "dispatched_at")
-                # Track item for rollback on failure
-                if not hasattr(self, '_dispatch_items'):
-                    self._dispatch_items = {}
-                self._dispatch_items[idea.get("id", idea.get("source_id"))] = item.id
+                dispatch_status = "dispatched" if launched else "failed"
+                timestamp_col = "dispatched_at" if launched else "completed_at"
+                state_db.update_item_status(item.id, dispatch_status, timestamp_col)
 
-        if not approved_ideas:
+        if not jobs:
             print("No pending items in priority queue")
-            return []
-
-        jobs = self.run(approved_ideas, dry_run=dry_run)
-
-        # Rollback dispatched -> failed for any jobs that failed to queue
-        if not dry_run and hasattr(self, '_dispatch_items'):
-            for job in jobs:
-                if job.status == "failed" and job.idea_id in self._dispatch_items:
-                    item_id = self._dispatch_items[job.idea_id]
-                    state_db.update_item_status(item_id, "failed", "completed_at")
-            self._dispatch_items = {}
 
         return jobs

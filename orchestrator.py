@@ -17,7 +17,9 @@ from gates.triage import TriageGate
 from gates.build import BuildOrchestrator
 from gates.patcher import PatchGate
 from gates.publish import PublishGate
+from gates.review import ReviewGate
 from notifier import Notifier, LogNotifier
+from dispatcher import Dispatcher, LogDispatcher, route_to_worker, build_dispatch_prompt
 from readers.academy_reader import AcademyReader
 from readers.skylynx_reader import SkyLynxReader
 from readers.linear_reader import LinearReader
@@ -43,6 +45,8 @@ class CycleOrchestrator:
         linear_reader: LinearReader | None = None,
         academy_reader: AcademyReader | None = None,
         publish_gate: PublishGate | None = None,
+        review_gate: ReviewGate | None = None,
+        dispatcher: Dispatcher | None = None,
     ):
         """
         Initialize Cycle Orchestrator.
@@ -63,12 +67,15 @@ class CycleOrchestrator:
             linear_reader: LinearReader instance (optional, enables Linear intake)
             academy_reader: AcademyReader instance (optional, enables Academy promotion intake)
             publish_gate: PublishGate instance (optional, enables Gate 4)
+            review_gate: ReviewGate instance (optional, enables Gate 4.5 code review)
+            dispatcher: Dispatcher for routing non-buildable items to ClaudeClaw workers
         """
         self.config = config
         self.triage_gate = triage_gate
         self.build_orchestrator = build_orchestrator
         self.patch_gate = patch_gate
         self.publish_gate = publish_gate
+        self.review_gate = review_gate
         self.circuit_breaker = circuit_breaker
         self.cycle_caps = cycle_caps
         self.shutdown_handler = shutdown_handler
@@ -79,6 +86,7 @@ class CycleOrchestrator:
         self.skylynx_reader = skylynx_reader
         self.linear_reader = linear_reader
         self.academy_reader = academy_reader
+        self.dispatcher = dispatcher or LogDispatcher()
         # Track which gates have already sent a halted notification.
         # Prevents spamming Telegram every cycle while a breaker is tripped.
         self._halted_notified: set[str] = set()
@@ -279,6 +287,112 @@ class CycleOrchestrator:
 
         return count
 
+    def dispatch_queue_items(self, dry_run: bool = False) -> int:
+        """
+        Dispatch non-buildable priority queue items to ClaudeClaw workers.
+
+        Buildable items (ideaforge/linear/academy) are handled by Gate 2 (build).
+        Non-buildable items (skylynx) route to ClaudeClaw workers via the dispatcher.
+
+        Args:
+            dry_run: If True, log but don't actually dispatch
+
+        Returns:
+            Number of items dispatched
+        """
+        dispatch_sources = ("skylynx",)
+        dispatched = 0
+        max_dispatch = self.config.max_approve_per_cycle
+        seen_ids: set[int] = set()
+
+        for _ in range(max_dispatch):
+            item = self.state_db.get_next_pending(sources=dispatch_sources)
+            if item is None or item.id in seen_ids:
+                break
+            seen_ids.add(item.id)
+
+            idea_data = {}
+            if item.idea_data:
+                try:
+                    idea_data = json.loads(item.idea_data)
+                except (json.JSONDecodeError, TypeError):
+                    pass
+
+            worker = route_to_worker(
+                item.source,
+                idea_data.get("_recommendation_type", ""),
+            )
+            item_dict = {
+                "source": item.source,
+                "source_id": item.source_id,
+                "title": item.title,
+                "description": item.description,
+                "priority_score": item.priority_score,
+                "idea_data": item.idea_data,
+            }
+            prompt = build_dispatch_prompt(item_dict)
+
+            if dry_run:
+                print(f"  [DRY RUN] Would dispatch #{item.id} [{item.source}:{item.source_id}] -> {worker}")
+                dispatched += 1
+            else:
+                try:
+                    task_id = self.dispatcher.dispatch(prompt, worker)
+                    self.state_db.update_item_status(item.id, "dispatched", "dispatched_at")
+                    self.state_db.set_dispatch_task_id(item.id, task_id)
+                    self.audit_logger.log_decision(
+                        "dispatch", "dispatched",
+                        {"source_id": item.source_id, "worker": worker, "task_id": task_id[:8]}
+                    )
+                    dispatched += 1
+                except Exception as e:
+                    self.audit_logger.log_error(
+                        "dispatch",
+                        f"Failed to dispatch #{item.id} [{item.source}:{item.source_id}]: {e}"
+                    )
+                    self.state_db.update_item_status(item.id, "failed", "completed_at")
+
+        return dispatched
+
+    def sync_dispatch_status(self) -> dict:
+        """
+        Poll ClaudeClaw's dispatch_queue for completed/failed tasks and update
+        the corresponding priority_queue entries.
+
+        Returns:
+            Dict with 'synced' count and lists of 'completed' and 'failed' source_ids.
+        """
+        result = {"synced": 0, "completed": [], "failed": []}
+
+        dispatched_items = self.state_db.get_dispatched_items(sources=("skylynx",))
+        if not dispatched_items:
+            return result
+
+        for item in dispatched_items:
+            try:
+                task = self.dispatcher.check_result(item["dispatch_task_id"])
+            except Exception as e:
+                self.audit_logger.log_error(
+                    "dispatch_sync",
+                    f"Failed to check task {item['dispatch_task_id']}: {e}",
+                )
+                continue
+
+            if task is None:
+                continue
+
+            status = task.get("status", "")
+            if status in ("completed", "done"):
+                self.state_db.update_item_status(item["id"], "completed", "completed_at")
+                result["completed"].append(item["source_id"])
+                result["synced"] += 1
+            elif status in ("failed", "error"):
+                self.state_db.update_item_status(item["id"], "failed", "completed_at")
+                result["failed"].append(item["source_id"])
+                result["synced"] += 1
+
+        return result
+
     def run_cycle(self, dry_run: bool = False) -> CycleResult:
         """
         Run a single Metroplex cycle: intake -> triage -> build -> patch.
@@ -401,6 +515,70 @@ class CycleOrchestrator:
             # Non-fatal -- log and continue to publish gate
             self.audit_logger.log_error("build", f"Status poll failed: {e}")
 
+        # Auto-retry failed builds (Phase 13f)
+        try:
+            retryable = self.state_db.get_retryable_builds()
+            for build in retryable:
+                if self.state_db.mark_build_for_retry(build["queue_job_id"]):
+                    retry_num = (build.get("retry_count") or 0) + 1
+                    print(f"  Auto-retry #{retry_num}: {build['title']} ({build['queue_job_id']})")
+                    self.audit_logger.log_decision(
+                        "build", "auto_retry",
+                        {"queue_job_id": build["queue_job_id"], "retry_count": retry_num}
+                    )
+                    self.notifier.notify(
+                        f"Build auto-retry #{retry_num}: {build['title']}"
+                    )
+        except Exception as e:
+            self.audit_logger.log_error("build", f"Auto-retry check failed: {e}")
+
+        # Dispatch: route non-buildable queue items to ClaudeClaw workers
+        dispatch_count = 0
+        try:
+            dispatch_count = self.dispatch_queue_items(dry_run=dry_run)
+            if dispatch_count > 0:
+                print(f"+ Dispatch: {dispatch_count} items sent to ClaudeClaw workers")
+                self.notifier.notify(f"Dispatched {dispatch_count} items to ClaudeClaw workers")
+        except Exception as e:
+            self.audit_logger.log_error("dispatch", f"Dispatch failed: {e}")
+
+        # Dispatch Status Sync (poll ClaudeClaw for completed/failed dispatched tasks)
+        try:
+            sync_result = self.sync_dispatch_status()
+            if sync_result["synced"] > 0:
+                completed = sync_result["completed"]
+                failed = sync_result["failed"]
+                if completed:
+                    self.notifier.notify(f"Dispatch completed: {', '.join(completed)}")
+                if failed:
+                    self.notifier.notify(f"Dispatch failed: {', '.join(failed)}", "error")
+        except Exception as e:
+            # Non-fatal -- log and continue
+            self.audit_logger.log_error("dispatch_sync", f"Dispatch sync failed: {e}")
+
+        # Gate 4.5: Review (automated quality checks on completed builds)
+        review_count = 0
+        if self.review_gate is not None:
+            try:
+                print(f"Running Gate 4.5 (review)...")
+                review_results = self.review_gate.run(dry_run=dry_run)
+                review_count = len(review_results)
+                passed = sum(1 for r in review_results if r.verdict == "pass")
+                failed = sum(1 for r in review_results if r.verdict == "fail")
+
+                if review_count > 0:
+                    print(f"+ Gate 4.5 completed: {review_count} reviewed, {passed} passed, {failed} failed")
+                    if failed > 0:
+                        failed_titles = [r.title for r in review_results if r.verdict == "fail"]
+                        self.notifier.notify(
+                            f"Review gate: {failed} builds failed checks: {', '.join(failed_titles)}",
+                            "warning",
+                        )
+                    if passed > 0:
+                        self.notifier.notify(f"Review gate: {passed} builds passed, ready to publish")
+            except Exception as e:
+                self.audit_logger.log_error("review", f"Review gate failed: {e}")
+
         # Gate 4: Publish (push completed builds to GitHub)
         publish_count = 0
         if self.publish_gate is not None:
@@ -461,18 +639,22 @@ class CycleOrchestrator:
                 self.audit_logger.log_error("patch", error_msg)
 
         # End cycle
-        self.state_db.end_cycle(cycle_id, triage_count, build_count, patch_count, errors)
+        self.state_db.end_cycle(cycle_id, triage_count, build_count, patch_count, errors, publish_count)
         self.audit_logger.log_cycle_end(cycle_id, triage_count, build_count, patch_count, errors)
 
         # Only notify on cycles with actual activity or new errors.
         # Suppress summary when the only "errors" are halted-gate messages (already notified once).
         halted_only = all("halted by circuit breaker" in e for e in errors)
-        has_activity = triage_count > 0 or build_count > 0 or publish_count > 0 or patch_count > 0
+        has_activity = (
+            triage_count > 0 or build_count > 0 or publish_count > 0
+            or dispatch_count > 0 or patch_count > 0
+        )
         if has_activity or (errors and not halted_only):
             error_text = f", {len(errors)} errors" if errors else ""
             pub_text = f", {publish_count} published" if publish_count > 0 else ""
+            disp_text = f", {dispatch_count} dispatched" if dispatch_count > 0 else ""
             self.notifier.notify(
-                f"Metroplex: {triage_count} triaged, {build_count} built{pub_text}, {patch_count} patched{error_text}"
+                f"Metroplex: {triage_count} triaged, {build_count} built{pub_text}{disp_text}, {patch_count} patched{error_text}"
             )
 
         # Update cycle result

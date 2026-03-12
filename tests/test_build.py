@@ -18,8 +18,9 @@ from audit import AuditLogger
 
 
 @pytest.fixture
-def config():
-    """Create test configuration."""
+def config(monkeypatch):
+    """Create test configuration with LLM disabled to avoid real API calls."""
+    monkeypatch.setenv("METROPLEX_SPEC_USE_LLM", "false")
     return Config()
 
 
@@ -834,6 +835,7 @@ class TestBuildOrchestrator:
             call_count["n"] += 1
             if call_count["n"] == 1:
                 raise Exception("DB locked")
+            return True
         with patch.object(orchestrator, 'check_status', return_value=status_dict), \
              patch.object(orchestrator, 'is_runner_active', return_value=True):
             mock_state_db.update_build_job_status = Mock(side_effect=side_effect)
@@ -852,10 +854,10 @@ class TestBuildOrchestrator:
             assert result["newly_synced"] == []
 
     def test_run_from_queue_capacity_dispatch(self, mock_state_db, mock_spec_generator, mock_audit_logger):
-        """Test run_from_queue dispatches up to available_slots."""
+        """Test run_from_queue dispatches up to max_approve_per_cycle items."""
         config = Config()
         config.max_concurrent_builds = 3
-        config.max_approve_per_cycle = 5
+        config.max_approve_per_cycle = 2
 
         orch = BuildOrchestrator(
             config=config,
@@ -864,46 +866,33 @@ class TestBuildOrchestrator:
             audit_logger=mock_audit_logger,
         )
 
-        # Simulate 1 running job, so 2 slots available
-        mock_sync = {
-            "running": ["metroplex-old"],
-            "running_count": 1,
-            "completed": [],
-            "failed": [],
-            "newly_synced": [],
-        }
-
-        # Create mock priority items
+        # Create mock priority items (3 available, but per-cycle cap is 2)
         mock_items = [
-            Mock(id=10, source_id=10, title="Idea A", description="Desc A",
+            Mock(id=10, source="ideaforge", source_id=10, title="Idea A", description="Desc A",
                  idea_data=json.dumps({"id": 10, "title": "Idea A", "description": "Desc A",
                                        "problem_statement": "P", "target_audience": "T",
                                        "artifact_type": "tool"})),
-            Mock(id=11, source_id=11, title="Idea B", description="Desc B",
+            Mock(id=11, source="ideaforge", source_id=11, title="Idea B", description="Desc B",
                  idea_data=json.dumps({"id": 11, "title": "Idea B", "description": "Desc B",
                                        "problem_statement": "P", "target_audience": "T",
                                        "artifact_type": "tool"})),
-            None,  # Third call returns None (queue empty)
         ]
-        mock_state_db.get_next_pending = Mock(side_effect=mock_items)
+        mock_state_db.get_next_pending = Mock(side_effect=mock_items + [None])
         mock_state_db.update_item_status = Mock()
 
-        with patch.object(orch, 'is_runner_active', return_value=True), \
-             patch.object(orch, 'poll_and_sync_status', return_value=mock_sync), \
-             patch.object(orch, 'run', return_value=[]) as mock_run:
-            orch.run_from_queue(mock_state_db, dry_run=False)
+        with patch('gates.build.submit_to_um', return_value=True) as mock_submit:
+            jobs = orch.run_from_queue(mock_state_db, dry_run=False)
 
-            # Should have pulled 2 items (min(2 available, 5 per-cycle))
-            assert mock_run.called
-            ideas_arg = mock_run.call_args[0][0]
-            assert len(ideas_arg) == 2
-            assert ideas_arg[0]["id"] == 10
-            assert ideas_arg[1]["id"] == 11
+            # Should have dispatched 2 items (per-cycle cap)
+            assert len(jobs) == 2
+            assert mock_submit.call_count == 2
+            assert jobs[0].title == "Idea A"
+            assert jobs[1].title == "Idea B"
 
-    def test_run_from_queue_at_capacity_skips(self, mock_state_db, mock_spec_generator, mock_audit_logger, capsys):
-        """Test run_from_queue skips dispatch when at capacity."""
+    def test_run_from_queue_empty_queue_prints_message(self, mock_state_db, mock_spec_generator, mock_audit_logger, capsys):
+        """Test run_from_queue prints message when queue is empty."""
         config = Config()
-        config.max_concurrent_builds = 2
+        config.max_approve_per_cycle = 3
 
         orch = BuildOrchestrator(
             config=config,
@@ -912,21 +901,15 @@ class TestBuildOrchestrator:
             audit_logger=mock_audit_logger,
         )
 
-        mock_sync = {
-            "running": ["metroplex-1", "metroplex-2"],
-            "running_count": 2,
-            "completed": [],
-            "failed": [],
-            "newly_synced": [],
-        }
+        # Empty queue
+        mock_state_db.get_next_pending = Mock(return_value=None)
 
-        with patch.object(orch, 'is_runner_active', return_value=True), \
-             patch.object(orch, 'poll_and_sync_status', return_value=mock_sync):
+        with patch('gates.build.submit_to_um', return_value=True):
             jobs = orch.run_from_queue(mock_state_db, dry_run=False)
 
             assert jobs == []
             captured = capsys.readouterr()
-            assert "At capacity" in captured.out
+            assert "No pending items" in captured.out
 
     def test_is_runner_active_no_pid_file(self, orchestrator):
         """Test is_runner_active returns False when PID file doesn't exist."""

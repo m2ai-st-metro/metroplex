@@ -16,6 +16,7 @@ from gates.triage import TriageGate
 from gates.build import SpecGenerator, BuildOrchestrator
 from gates.patcher import PatchGate
 from gates.publish import PublishGate
+from gates.review import ReviewGate
 from orchestrator import CycleOrchestrator
 from notifier import create_notifier
 from readers.ideaforge_reader import IdeaForgeReader
@@ -149,8 +150,17 @@ def initialize_components(config: Config):
         audit_logger=audit_logger,
     )
 
+    review_gate = ReviewGate(
+        config=config,
+        state_db=state_db,
+        audit_logger=audit_logger,
+    )
+
     # Initialize notifier
     notifier = create_notifier(config.telegram_bot_token, config.telegram_chat_id)
+
+    # Initialize dispatcher for non-buildable queue items (Sky-Lynx -> ClaudeClaw)
+    dispatcher = create_dispatcher(config.dispatch_db, config.dispatch_chat_id)
 
     # Initialize orchestrator
     orchestrator = CycleOrchestrator(
@@ -169,6 +179,8 @@ def initialize_components(config: Config):
         linear_reader=linear_reader,
         academy_reader=academy_reader,
         publish_gate=publish_gate,
+        review_gate=review_gate,
+        dispatcher=dispatcher,
     )
 
     return orchestrator, state_db, circuit_breaker
@@ -544,6 +556,91 @@ def cmd_status(args, config: Config):
         state_db.close()
 
 
+def cmd_builds(args, config: Config):
+    """Show build history with output locations and GitHub repos."""
+    state_db = StateDB()
+    state_db.connect()
+
+    try:
+        cursor = state_db.conn.cursor()
+
+        # Get unique builds (deduplicated by queue_job_id, latest entry)
+        cursor.execute("""
+            SELECT b.queue_job_id, b.idea_id, b.title, b.status, b.project_dir,
+                   p.repo_url, p.status as pub_status
+            FROM build_jobs b
+            LEFT JOIN publish_jobs p ON p.build_job_id = b.queue_job_id AND p.status = 'published'
+            WHERE b.id IN (
+                SELECT MAX(id) FROM build_jobs GROUP BY queue_job_id
+            )
+            ORDER BY b.id DESC
+        """)
+        rows = cursor.fetchall()
+
+        print(f"{'='*80}")
+        print("METROPLEX BUILD HISTORY")
+        print(f"{'='*80}\n")
+
+        for r in rows:
+            status_icon = "+" if r["status"] == "completed" else "x"
+            pub_icon = "-> " + r["repo_url"] if r["repo_url"] else "   (not published)"
+            proj = r["project_dir"] or "(no project dir)"
+
+            print(f"  {status_icon} [{r['status']:>9}] {r['title']}")
+            print(f"    ID: {r['queue_job_id']}  Idea: {r['idea_id']}")
+            print(f"    Dir: {proj}")
+            print(f"    {pub_icon}")
+            print()
+
+        # Summary
+        total = len(rows)
+        completed = sum(1 for r in rows if r["status"] == "completed")
+        published = sum(1 for r in rows if r["repo_url"])
+        print(f"Total: {total} builds, {completed} completed, {published} published to GitHub")
+
+        return 0
+    finally:
+        state_db.close()
+
+
+def cmd_retry(args, config: Config):
+    """Re-dispatch a failed build by resetting its status to pending."""
+    state_db = StateDB()
+    state_db.connect()
+
+    try:
+        queue_job_id = args.build_id
+
+        # Show current state before retry
+        cursor = state_db.conn.cursor()
+        cursor.execute(
+            "SELECT queue_job_id, title, status, project_dir FROM build_jobs "
+            "WHERE queue_job_id = ? ORDER BY id DESC LIMIT 1",
+            (queue_job_id,),
+        )
+        row = cursor.fetchone()
+        if not row:
+            print(f"No build found with ID: {queue_job_id}")
+            return 1
+        if row["status"] != "failed":
+            print(f"Build {queue_job_id} has status '{row['status']}' — only failed builds can be retried")
+            return 1
+
+        print(f"Retrying build: {row['title']}")
+        print(f"  ID: {queue_job_id}")
+        print(f"  Current status: {row['status']}")
+
+        if state_db.reset_build_for_retry(queue_job_id):
+            print(f"  Reset to: queued (priority_queue → pending)")
+            print(f"\nBuild will be re-dispatched on next cycle, or run 'metroplex.py build' manually.")
+            return 0
+        else:
+            print("  Failed to reset — build may not be in 'failed' state")
+            return 1
+    finally:
+        state_db.close()
+
+
 def cmd_reset(args, config: Config):
     """
     Reset circuit breaker for gate(s).
@@ -708,6 +805,13 @@ def main():
     dispatch_parser.add_argument("--worker", choices=["starscream", "ravage", "soundwave", "astrotrain", "default"],
                                 help="Override auto-routed worker type")
 
+    # builds command
+    builds_parser = subparsers.add_parser("builds", help="Show build history and output locations")
+
+    # retry command
+    retry_parser = subparsers.add_parser("retry", help="Re-dispatch a failed build")
+    retry_parser.add_argument("build_id", help="Queue job ID to retry (e.g. metroplex-ideaforge-79)")
+
     # reset command
     reset_parser = subparsers.add_parser("reset", help="Reset circuit breaker")
     reset_parser.add_argument("--gate", required=True, choices=["triage", "build", "publish", "patch", "all"], help="Gate to reset")
@@ -744,6 +848,10 @@ def main():
         sys.exit(cmd_status(args, config))
     elif args.command == "dispatch":
         sys.exit(cmd_dispatch(args, config))
+    elif args.command == "builds":
+        sys.exit(cmd_builds(args, config))
+    elif args.command == "retry":
+        sys.exit(cmd_retry(args, config))
     elif args.command == "reset":
         sys.exit(cmd_reset(args, config))
     else:

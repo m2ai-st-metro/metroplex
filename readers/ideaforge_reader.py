@@ -98,6 +98,64 @@ class IdeaForgeReader:
         rows = cursor.fetchall()
         return [dict(row) for row in rows]
 
+    def claim_idea(self, idea_id: int, claimed_by: str = "metroplex") -> bool:
+        """
+        Mark an idea as claimed in IdeaForge without changing its status.
+
+        Writes to claimed_by/claimed_at columns so IdeaForge knows the idea
+        has been processed by an external system, while preserving IdeaForge's
+        own status lifecycle (classified/dismissed/exported).
+
+        Args:
+            idea_id: The idea ID to claim
+            claimed_by: System name claiming the idea (default: 'metroplex')
+
+        Returns:
+            True if a row was updated, False otherwise
+        """
+        try:
+            write_conn = sqlite3.connect(self.db_path)
+            cursor = write_conn.cursor()
+            cursor.execute(
+                "UPDATE ideas SET claimed_by = ?, claimed_at = datetime('now') WHERE id = ?",
+                (claimed_by, idea_id),
+            )
+            changed = cursor.rowcount > 0
+            write_conn.commit()
+            write_conn.close()
+            return changed
+        except Exception:
+            return False
+
+    def update_idea_status(self, idea_id: int, status: str) -> bool:
+        """
+        Update an idea's status in the IdeaForge database.
+
+        Opens a separate writable connection (the default connection is read-only)
+        to perform the update, then closes it immediately.
+
+        NOTE: Only use for terminal statuses like 'exported'. Do NOT write
+        'triaged' — use claim_idea() instead to avoid stomping IdeaForge's
+        status lifecycle.
+
+        Args:
+            idea_id: The idea ID to update
+            status: The new status value (e.g. 'exported')
+
+        Returns:
+            True if a row was updated, False otherwise
+        """
+        try:
+            write_conn = sqlite3.connect(self.db_path)
+            cursor = write_conn.cursor()
+            cursor.execute("UPDATE ideas SET status = ? WHERE id = ?", (status, idea_id))
+            changed = cursor.rowcount > 0
+            write_conn.commit()
+            write_conn.close()
+            return changed
+        except Exception:
+            return False
+
     def get_idea_by_id(self, idea_id: int) -> dict | None:
         """
         Get a specific idea by ID.

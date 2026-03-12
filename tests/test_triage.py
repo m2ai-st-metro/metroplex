@@ -21,9 +21,11 @@ from models import TriageDecision
 
 @pytest.fixture
 def triage_config():
-    """Provide test configuration with default thresholds."""
+    """Provide test configuration with pinned thresholds."""
     config = Config()
-    # Use defaults: approve_threshold=70, reject_threshold=40, max_approve_per_cycle=3
+    config.approve_threshold = 70
+    config.reject_threshold = 40
+    config.max_approve_per_cycle = 3
     return config
 
 

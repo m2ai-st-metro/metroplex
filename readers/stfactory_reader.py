@@ -108,7 +108,11 @@ class STFactoryReader:
         cursor = self.conn.cursor()
 
         cursor.execute("""
-            SELECT *
+            SELECT
+                id, recommendation_id, session_id, recommendation_type,
+                target_system, title, priority, scope, target_department,
+                status, emitted_at, raw_json,
+                effectiveness, effectiveness_score, effectiveness_evaluated_at
             FROM improvement_recommendations
             WHERE status = 'pending'
         """)
@@ -155,7 +159,11 @@ class STFactoryReader:
         cursor = self.conn.cursor()
 
         cursor.execute("""
-            SELECT *
+            SELECT
+                id, idea_id, idea_title, outcome, overall_score,
+                recommendation, capabilities_fit, build_outcome,
+                artifact_count, tech_stack, total_duration_seconds,
+                tags, github_url, emitted_at, raw_json
             FROM outcome_records
             ORDER BY emitted_at DESC
             LIMIT ?

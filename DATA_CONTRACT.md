@@ -61,6 +61,10 @@ One row per build job queued by Gate 2.
 | `queue_job_id` | TEXT | NOT NULL | queue_runner.py job identifier |
 | `status` | TEXT | NOT NULL, CHECK IN ('queued','started','completed','failed') | Job status |
 | `queued_at` | TEXT | NOT NULL | ISO 8601 datetime |
+| `project_dir` | TEXT | nullable | Actual project directory (set by UM bridge on completion) |
+| `review_status` | TEXT | nullable | `reviewed` (passed Gate 4.5) or `review_failed` |
+| `retry_count` | INTEGER | DEFAULT 0 | Number of automatic retries attempted |
+| `next_retry_at` | TEXT | nullable | ISO 8601 datetime for next retry (exponential backoff) |
 
 **Index**: `idx_build_jobs_status` on `status`
 

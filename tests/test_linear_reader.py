@@ -61,8 +61,9 @@ def _make_execute_result(issues=None, issue=None):
 # --- Initialization Tests ---
 
 
-def test_linear_reader_init_no_key():
+def test_linear_reader_init_no_key(monkeypatch):
     """LinearReader raises ValueError when no API key is provided."""
+    monkeypatch.delenv("ARCADE_API_KEY", raising=False)
     with pytest.raises(ValueError, match="ARCADE_API_KEY"):
         LinearReader(arcade_api_key="", arcade_user_id="test")
 
