@@ -16,6 +16,7 @@ import time
 import json
 from typing import Protocol, runtime_checkable
 from pathlib import Path
+from oz_bridge import submit_to_oz, poll_oz_run
 
 
 # Worker routing: map (source, recommendation_type) -> worker_type
@@ -32,7 +33,7 @@ WORKER_ROUTES = {
     ("ideaforge", ""): "ravage",
 }
 
-VALID_WORKER_TYPES = {"starscream", "ravage", "soundwave", "astrotrain", "default"}
+VALID_WORKER_TYPES = {"starscream", "ravage", "soundwave", "astrotrain", "default", "oz-cloud"}
 
 
 @runtime_checkable
@@ -199,13 +200,81 @@ class LogDispatcher:
         return None
 
 
-def create_dispatcher(dispatch_db: str, dispatch_chat_id: str) -> Dispatcher:
+
+
+class OzCloudDispatcher:
+    """Dispatches tasks to Oz cloud agents. Used for batch/background work
+    that doesn't need Telegram interaction."""
+
+    def __init__(self, environment_id: str, model_id: str = "claude-sonnet-4-20250514"):
+        self.environment_id = environment_id
+        self.model_id = model_id
+        self._runs: dict[str, str] = {}  # task_id -> oz_run_id
+
+    def dispatch(
+        self,
+        prompt: str,
+        worker_type: str,
+        chat_id: str = "",
+        metadata: dict | None = None,
+    ) -> str:
+        """Dispatch to Oz cloud agent. worker_type is ignored (cloud handles routing)."""
+        # Build a synthetic idea dict from the prompt for submit_to_oz
+        idea = {
+            "id": str(uuid.uuid4())[:8],
+            "title": prompt.split("\n")[0][:100],
+            "description": prompt,
+            "problem_statement": prompt,
+            "target_audience": "ST Metro ecosystem",
+            "artifact_type": "task",
+        }
+        run_id = submit_to_oz(
+            idea,
+            environment_id=self.environment_id,
+            model_id=self.model_id,
+        )
+        task_id = str(uuid.uuid4())
+        if run_id:
+            self._runs[task_id] = run_id
+        return task_id
+
+    def check_result(self, task_id: str) -> dict | None:
+        """Poll Oz run status."""
+        run_id = self._runs.get(task_id)
+        if not run_id:
+            return None
+        result = poll_oz_run(run_id)
+        if result is None:
+            return None
+        # Map Oz states to dispatcher status convention
+        state = result.get("state", "")
+        status_map = {
+            "SUCCEEDED": "completed",
+            "FAILED": "failed",
+            "QUEUED": "queued",
+            "INPROGRESS": "running",
+        }
+        return {
+            "id": task_id,
+            "status": status_map.get(state, "unknown"),
+            "oz_run_id": run_id,
+            "session_link": result.get("session_link", ""),
+        }
+
+def create_dispatcher(
+    dispatch_db: str,
+    dispatch_chat_id: str,
+    oz_environment_id: str = "",
+    oz_build_model: str = "claude-sonnet-4-20250514",
+) -> Dispatcher:
     """
     Factory: create the appropriate dispatcher based on config.
 
     Args:
         dispatch_db: Path to claudeclaw.db (empty string = use LogDispatcher)
         dispatch_chat_id: Telegram chat ID for result delivery
+        oz_environment_id: Oz environment ID (enables OzCloudDispatcher)
+        oz_build_model: Model ID for Oz cloud agents
 
     Returns:
         EAClaudeDispatcher if db exists, LogDispatcher otherwise
@@ -216,6 +285,11 @@ def create_dispatcher(dispatch_db: str, dispatch_chat_id: str) -> Dispatcher:
         if dispatch_db:
             print(f"Warning: Dispatch DB not found at {dispatch_db}, using log dispatcher")
         return LogDispatcher()
+
+
+def create_oz_dispatcher(environment_id: str, model_id: str = "claude-sonnet-4-20250514") -> OzCloudDispatcher:
+    """Create an Oz cloud dispatcher for overflow/background work."""
+    return OzCloudDispatcher(environment_id, model_id)
 
 
 def route_to_worker(source: str, recommendation_type: str = "") -> str:
