@@ -1,0 +1,27 @@
+name: Oz PR Review
+on:
+  pull_request:
+    types: [opened, ready_for_review]
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    if: github.event.pull_request.draft == false
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: warpdotdev/oz-agent-action@v1
+        with:
+          prompt: |
+            Review the code changes on this PR.
+            PR title: ${{ github.event.pull_request.title }}
+            PR body: ${{ github.event.pull_request.body }}
+
+            1. Use `git diff origin/${{ github.event.pull_request.base.ref }}...HEAD` to see changes.
+            2. Check for correctness, security issues, missing tests, and style.
+            3. Post a review comment using `gh pr review ${{ github.event.pull_request.number }} --comment --body "..."`.
+            4. If there are specific line-level issues, use `gh` to post inline comments.
+          warp_api_key: ${{ secrets.WARP_API_KEY }}
+          profile: ${{ vars.WARP_AGENT_PROFILE || '' }}

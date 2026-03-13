@@ -24,6 +24,7 @@ from db import StateDB
 from audit import AuditLogger
 from gates.llm_expander import LLMSpecExpander
 from um_bridge import submit_to_um
+from oz_bridge import submit_to_oz
 
 logger = logging.getLogger(__name__)
 
@@ -641,12 +642,32 @@ class BuildOrchestrator:
                 }
             idea["_source"] = item.source
 
-            # Route to Ultra-Magnus pipeline (fire-and-forget)
+            # Route to build target (local UM or Oz cloud)
             source = idea.get("_source", "ideaforge")
             job_id = f"metroplex-{source}-{idea['id']}"
             queued_at = datetime.now()
 
-            launched = submit_to_um(idea, dry_run=dry_run)
+            build_target = self.config.build_target
+            oz_run_id = None
+
+            if build_target == "cloud" or (
+                build_target == "auto" and self.config.oz_environment_id
+                and self.is_runner_active()  # local slot busy -> try cloud
+            ):
+                if self.config.oz_environment_id:
+                    oz_run_id = submit_to_oz(
+                        idea,
+                        environment_id=self.config.oz_environment_id,
+                        model_id=self.config.oz_build_model,
+                        dry_run=dry_run,
+                    )
+
+            # Fallback to local UM if cloud not configured or failed
+            if oz_run_id:
+                launched = True
+                job_id = f"oz-{oz_run_id[:12]}"
+            else:
+                launched = submit_to_um(idea, dry_run=dry_run)
 
             status = "queued" if launched else "failed"
             job = BuildJob(

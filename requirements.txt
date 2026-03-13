@@ -4,3 +4,4 @@ pyyaml
 pytest
 arcadepy
 anthropic>=0.40.0
+oz-agent-sdk>=0.6.0

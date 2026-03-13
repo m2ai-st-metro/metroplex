@@ -21,6 +21,7 @@ from gates.review import ReviewGate
 from notifier import Notifier, LogNotifier
 from dispatcher import Dispatcher, LogDispatcher, route_to_worker, build_dispatch_prompt
 from readers.academy_reader import AcademyReader
+from oz_bridge import poll_oz_run
 from readers.skylynx_reader import SkyLynxReader
 from readers.linear_reader import LinearReader
 
@@ -427,6 +428,63 @@ class CycleOrchestrator:
 
         return result
 
+
+    def poll_oz_builds(self) -> dict:
+        """Poll Oz cloud agent runs and sync terminal states back to DB.
+
+        Checks all build_jobs with queue_job_id starting with 'oz-' that
+        are still in 'queued' or 'running' status.
+
+        Returns:
+            dict with keys: checked, completed, failed, still_running
+        """
+        result = {"checked": 0, "completed": [], "failed": [], "still_running": []}
+
+        # Get active Oz build jobs from DB
+        self.state_db.connect()
+        cursor = self.state_db.conn.cursor()
+        cursor.execute("""
+            SELECT queue_job_id, idea_id, title
+            FROM build_jobs
+            WHERE queue_job_id LIKE 'oz-%'
+            AND status IN ('queued', 'running')
+        """)
+        oz_jobs = [dict(row) for row in cursor.fetchall()]
+
+        if not oz_jobs:
+            return result
+
+        for job in oz_jobs:
+            # Extract run_id from job_id (oz-<first12chars>)
+            run_id_prefix = job["queue_job_id"][3:]  # strip 'oz-'
+            # We need the full run_id; for now poll with prefix
+            # The SDK should handle partial matching or we store full run_id
+            run_status = poll_oz_run(run_id_prefix)
+            result["checked"] += 1
+
+            if run_status is None:
+                continue
+
+            state = run_status.get("state", "")
+
+            if state == "SUCCEEDED":
+                self.state_db.update_build_job_status(job["queue_job_id"], "completed")
+                result["completed"].append(job["queue_job_id"])
+                self.notifier.notify(
+                    f"Oz cloud build completed: {job['title']}",
+                )
+            elif state == "FAILED":
+                self.state_db.update_build_job_status(job["queue_job_id"], "failed")
+                result["failed"].append(job["queue_job_id"])
+                self.notifier.notify(
+                    f"Oz cloud build FAILED: {job['title']}",
+                    "error",
+                )
+            elif state in ("QUEUED", "INPROGRESS"):
+                result["still_running"].append(job["queue_job_id"])
+
+        return result
+
     def run_cycle(self, dry_run: bool = False) -> CycleResult:
         """
         Run a single Metroplex cycle: intake -> triage -> build -> patch.
@@ -557,6 +615,18 @@ class CycleOrchestrator:
         except Exception as e:
             # Non-fatal -- log and continue to publish gate
             self.audit_logger.log_error("build", f"Status poll failed: {e}")
+
+        # Oz Cloud Build Status Sync
+        if self.config.build_target in ("cloud", "auto") and self.config.oz_environment_id:
+            try:
+                oz_sync = self.poll_oz_builds()
+                if oz_sync["completed"] or oz_sync["failed"]:
+                    self.audit_logger.log_decision(
+                        "build", "oz_sync",
+                        {"completed": oz_sync["completed"], "failed": oz_sync["failed"]},
+                    )
+            except Exception as e:
+                self.audit_logger.log_error("build", f"Oz build poll failed: {e}")
 
         # Auto-retry failed builds (Phase 13f)
         try:

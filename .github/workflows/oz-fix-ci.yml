@@ -1,0 +1,32 @@
+name: Oz Fix Failing CI
+on:
+  workflow_run:
+    workflows: ["CI", "Tests", "test"]
+    types: [completed]
+
+jobs:
+  fix:
+    runs-on: ubuntu-latest
+    if: github.event.workflow_run.conclusion == 'failure' && github.event.workflow_run.head_branch != 'main'
+    permissions:
+      contents: write
+      pull-requests: write
+      actions: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_branch }}
+      - uses: warpdotdev/oz-agent-action@v1
+        with:
+          prompt: |
+            The CI workflow "${{ github.event.workflow_run.name }}" failed on branch "${{ github.event.workflow_run.head_branch }}".
+            Run ID: ${{ github.event.workflow_run.id }}
+
+            1. Use `gh run view ${{ github.event.workflow_run.id }} --log-failed` to get failure logs.
+            2. Diagnose the root cause from the logs.
+            3. Fix the issue in the code.
+            4. Run the tests locally to verify the fix.
+            5. Commit and push the fix to the branch.
+            6. Comment on any open PR for this branch with what you fixed.
+          warp_api_key: ${{ secrets.WARP_API_KEY }}
+          profile: ${{ vars.WARP_AGENT_PROFILE || '' }}

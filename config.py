@@ -239,6 +239,14 @@ class Config:
             pass
         self.active_days = os.environ.get("METROPLEX_ACTIVE_DAYS", self.active_days)
 
+        # Oz Cloud Agent settings
+        self.build_target = os.environ.get("METROPLEX_BUILD_TARGET", self.build_target)
+        if self.build_target not in ("local", "cloud", "auto"):
+            self.build_target = "local"
+        self.oz_environment_id = os.environ.get("METROPLEX_OZ_ENVIRONMENT_ID", self.oz_environment_id)
+        self.oz_build_model = os.environ.get("METROPLEX_OZ_BUILD_MODEL", self.oz_build_model)
+
+
     def validate(self) -> list[str]:
         """
         Validate configuration settings.
@@ -278,3 +286,9 @@ class Config:
             warnings.append(f"notify_mode '{self.notify_mode}' invalid — must be all/anomaly/summary")
 
         return warnings
+
+    # Oz Cloud Agent settings
+    build_target: str = field(default="local")  # local|cloud|auto
+    oz_environment_id: str = field(default="")
+    oz_build_model: str = field(default="claude-sonnet-4-20250514")
+
