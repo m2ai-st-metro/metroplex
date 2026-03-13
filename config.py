@@ -16,6 +16,15 @@ if _env_file.exists():
             key, _, value = line.partition("=")
             os.environ.setdefault(key.strip(), value.strip())
 
+# Load ~/.env.shared for Oz and shared settings
+_shared_env = Path.home() / ".env.shared"
+if _shared_env.exists():
+    for line in _shared_env.read_text().splitlines():
+        line = line.strip()
+        if line and not line.startswith("#") and "=" in line:
+            key, _, value = line.partition("=")
+            os.environ.setdefault(key.strip(), value.strip())
+
 
 @dataclass
 class Config:
