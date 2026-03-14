@@ -54,6 +54,32 @@ def setup_um_imports(um_path: Path) -> None:
         sys.path.insert(0, str(um_path))
 
 
+def _find_project_dir(queue_job_id: str, um_idea_id: str) -> str | None:
+    """Find the YCE generations directory for a build.
+
+    Searches two naming conventions:
+    1. queue_job_id match (e.g., 'metroplex-ideaforge-43/')
+    2. um-{title}-{uuid_prefix} match (e.g., 'um-my-project-214a34e3-8bf/')
+    """
+    yce_generations = Path(__file__).parent.parent / "yce-harness" / "generations"
+    if not yce_generations.is_dir():
+        return None
+
+    # Convention 1: directory named after queue_job_id
+    candidate = yce_generations / queue_job_id
+    if candidate.is_dir():
+        return str(candidate)
+
+    # Convention 2: um-{title}-{uuid_prefix} (UM bridge naming)
+    if um_idea_id:
+        uuid_prefix = um_idea_id[:12]
+        for entry in yce_generations.iterdir():
+            if entry.is_dir() and entry.name.startswith("um-") and uuid_prefix in entry.name:
+                return str(entry)
+
+    return None
+
+
 def write_back_to_metroplex(idea_id: int, um_idea_id: str, outcome: str) -> None:
     """Write build results back to Metroplex's database.
 
@@ -75,15 +101,8 @@ def write_back_to_metroplex(idea_id: int, um_idea_id: str, outcome: str) -> None
     queue_job_id = f"metroplex-{source}-{idea_id}"
     build_status = "completed" if outcome in ("success", "partial") else "failed"
 
-    # Find the YCE project directory
-    project_dir_str = None
-    yce_generations = Path(__file__).parent.parent / "yce-harness" / "generations"
-    if yce_generations.is_dir() and um_idea_id:
-        uuid_prefix = um_idea_id[:12]
-        for entry in yce_generations.iterdir():
-            if entry.is_dir() and entry.name.startswith("um-") and uuid_prefix in entry.name:
-                project_dir_str = str(entry)
-                break
+    # Find the YCE project directory (two naming conventions)
+    project_dir_str = _find_project_dir(queue_job_id, um_idea_id)
 
     try:
         conn = sqlite3.connect(str(metroplex_db))
@@ -91,12 +110,20 @@ def write_back_to_metroplex(idea_id: int, um_idea_id: str, outcome: str) -> None
         cursor = conn.cursor()
 
         # Update build_jobs: status + project_dir + estimated_cost
+        # Split into two updates: status (idempotent) and project_dir (always write if found)
         build_cost_estimate = float(os.getenv("METROPLEX_BUILD_COST_ESTIMATE", "3.0"))
         cursor.execute(
-            "UPDATE build_jobs SET status = ?, project_dir = ?, estimated_cost = ? WHERE queue_job_id = ? AND status != ?",
-            (build_status, project_dir_str, build_cost_estimate, queue_job_id, build_status),
+            "UPDATE build_jobs SET status = ?, estimated_cost = ? WHERE queue_job_id = ? AND status != ?",
+            (build_status, build_cost_estimate, queue_job_id, build_status),
         )
         build_changed = cursor.rowcount > 0
+
+        # Always write project_dir if we found one, regardless of status changes
+        if project_dir_str:
+            cursor.execute(
+                "UPDATE build_jobs SET project_dir = ? WHERE queue_job_id = ? AND (project_dir IS NULL OR project_dir = '')",
+                (project_dir_str, queue_job_id),
+            )
 
         # Record build cost in ledger
         if build_changed:
