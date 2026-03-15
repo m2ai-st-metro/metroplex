@@ -34,6 +34,14 @@ SECRET_FILE_PATTERNS = {
 # Max file size that suggests a binary blob was committed (10MB)
 MAX_FILE_SIZE_BYTES = 10 * 1024 * 1024
 
+# Directories to skip when scanning (dependency/build artifacts, not project source)
+IGNORED_DIRS = {
+    "node_modules", "venv", ".venv", "__pycache__",
+    "dist", "build", ".next", ".nuxt", ".output",
+    ".tox", ".mypy_cache", ".pytest_cache", ".ruff_cache",
+    "target", "vendor", ".git",
+}
+
 
 @dataclass
 class ReviewResult:
@@ -139,9 +147,16 @@ class ReviewGate:
 
         return results
 
+    def _walk_project_files(self, project_dir: Path):
+        """Walk project files, skipping dependency/build/VCS directories."""
+        for f in project_dir.rglob("*"):
+            if f.is_file() and not (IGNORED_DIRS & set(f.relative_to(project_dir).parts)):
+                yield f
+
     def _run_checks(self, project_dir: Path) -> tuple[list[str], list[str]]:
         """
         Run all quality checks on a project directory.
+        Skips dependency/build directories (node_modules, venv, etc.).
 
         Returns:
             Tuple of (passed_check_names, failed_check_names)
@@ -149,8 +164,11 @@ class ReviewGate:
         passed = []
         failed = []
 
+        # Collect files once for all checks
+        files = list(self._walk_project_files(project_dir))
+
         # 1. Has source code files
-        if self._has_source_code(project_dir):
+        if any(f.suffix in CODE_EXTENSIONS for f in files):
             passed.append("has_source_code")
         else:
             failed.append("has_source_code")
@@ -162,14 +180,20 @@ class ReviewGate:
             failed.append("has_readme")
 
         # 3. No secret files committed
-        secrets = self._find_secret_files(project_dir)
+        secrets = [str(f.relative_to(project_dir)) for f in files if f.name in SECRET_FILE_PATTERNS]
         if not secrets:
             passed.append("no_secrets")
         else:
             failed.append(f"no_secrets({','.join(secrets)})")
 
         # 4. No oversized files (binary blobs)
-        large_files = self._find_large_files(project_dir)
+        large_files = []
+        for f in files:
+            try:
+                if f.stat().st_size > MAX_FILE_SIZE_BYTES:
+                    large_files.append(str(f.relative_to(project_dir)))
+            except OSError:
+                pass
         if not large_files:
             passed.append("no_large_files")
         else:
@@ -182,7 +206,7 @@ class ReviewGate:
             failed.append("has_git")
 
         # 6. Reasonable file count (not empty, not bloated)
-        file_count = sum(1 for _ in project_dir.rglob("*") if _.is_file() and ".git" not in _.parts)
+        file_count = len(files)
         if 1 <= file_count <= 5000:
             passed.append(f"file_count_ok({file_count})")
         elif file_count == 0:
@@ -192,36 +216,9 @@ class ReviewGate:
 
         return passed, failed
 
-    def _has_source_code(self, project_dir: Path) -> bool:
-        """Check if project has at least one source code file."""
-        for f in project_dir.rglob("*"):
-            if f.is_file() and f.suffix in CODE_EXTENSIONS and ".git" not in f.parts:
-                return True
-        return False
-
     def _has_readme(self, project_dir: Path) -> bool:
         """Check if project has a README file."""
         for name in DOC_FILES:
             if (project_dir / name).exists():
                 return True
         return False
-
-    def _find_secret_files(self, project_dir: Path) -> list[str]:
-        """Find files that look like secrets."""
-        found = []
-        for f in project_dir.rglob("*"):
-            if f.is_file() and f.name in SECRET_FILE_PATTERNS and ".git" not in f.parts:
-                found.append(str(f.relative_to(project_dir)))
-        return found
-
-    def _find_large_files(self, project_dir: Path) -> list[str]:
-        """Find files larger than MAX_FILE_SIZE_BYTES."""
-        found = []
-        for f in project_dir.rglob("*"):
-            if f.is_file() and ".git" not in f.parts:
-                try:
-                    if f.stat().st_size > MAX_FILE_SIZE_BYTES:
-                        found.append(str(f.relative_to(project_dir)))
-                except OSError:
-                    pass
-        return found
