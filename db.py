@@ -165,6 +165,10 @@ class StateDB:
         if "next_retry_at" not in bj_columns:
             cursor.execute("ALTER TABLE build_jobs ADD COLUMN next_retry_at TEXT DEFAULT NULL")
 
+        # Migrate: add quality_score to build_jobs (Phase 14b structural quality)
+        if "quality_score" not in bj_columns:
+            cursor.execute("ALTER TABLE build_jobs ADD COLUMN quality_score REAL DEFAULT NULL")
+
         # Migrate: add publish_count to cycles if missing
         cursor.execute("PRAGMA table_info(cycles)")
         cy_columns = {row[1] for row in cursor.fetchall()}
@@ -1021,6 +1025,17 @@ class StateDB:
             ORDER BY date DESC
         """, (start_date,))
         return [dict(row) for row in cursor.fetchall()]
+
+    def update_build_quality_score(self, queue_job_id: str, quality_score: float) -> bool:
+        """Set quality_score on a build job (Phase 14b)."""
+        self.connect()
+        cursor = self.conn.cursor()
+        cursor.execute(
+            "UPDATE build_jobs SET quality_score = ? WHERE queue_job_id = ?",
+            (quality_score, queue_job_id),
+        )
+        self.conn.commit()
+        return cursor.rowcount > 0
 
     def update_build_estimated_cost(self, queue_job_id: str, estimated_cost: float) -> bool:
         """Set estimated_cost on a build job."""

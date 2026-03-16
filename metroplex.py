@@ -812,6 +812,230 @@ def cmd_dispatch(args, config: Config):
         state_db.close()
 
 
+def cmd_backfill_outcomes(args, config: Config):
+    """
+    Backfill OutcomeRecords for all terminal-state ideas missing outcomes.
+
+    Scans triage_decisions, build_jobs, and publish_jobs to find terminal
+    states that were never emitted as OutcomeRecords.
+
+    Args:
+        args: Parsed command-line arguments
+        config: Metroplex configuration
+
+    Returns:
+        Exit code (0=success, 1=error)
+    """
+    from outcome_emitter import create_outcome_emitter
+
+    emitter = create_outcome_emitter()
+    if emitter is None:
+        print("ERROR: OutcomeEmitter unavailable (st-factory not found)")
+        return 1
+
+    state_db = StateDB()
+    state_db.init_db()
+
+    # Load existing outcome idea_ids to avoid duplicates
+    try:
+        existing_ids = set()
+        for rec in emitter.store.read_outcomes(limit=10000):
+            existing_ids.add(rec.idea_id)
+        print(f"Existing outcome records: {len(existing_ids)}")
+    except Exception as e:
+        print(f"Warning: Could not read existing outcomes: {e}")
+        existing_ids = set()
+
+    emitted = 0
+    skipped = 0
+
+    try:
+        state_db.connect()
+        cursor = state_db.conn.cursor()
+
+        # 1. Triage rejects
+        cursor.execute(
+            "SELECT idea_id, title, scaled_score, reason FROM triage_decisions WHERE decision = 'reject'"
+        )
+        for row in cursor.fetchall():
+            if row["idea_id"] in existing_ids:
+                skipped += 1
+                continue
+            if args.dry_run:
+                print(f"  [DRY RUN] Would emit REJECTED: {row['title']} (idea {row['idea_id']})")
+            else:
+                emitter.emit(
+                    idea_id=row["idea_id"],
+                    idea_title=row["title"],
+                    outcome="rejected",
+                    overall_score=row["scaled_score"],
+                    build_outcome=f"triage_rejected: {row['reason']}",
+                    tags=["triage", "backfill"],
+                )
+            existing_ids.add(row["idea_id"])
+            emitted += 1
+
+        # 2. Failed builds (latest status per queue_job_id)
+        cursor.execute("""
+            SELECT b.idea_id, b.title, b.queue_job_id, b.status, b.review_status
+            FROM build_jobs b
+            WHERE b.id IN (SELECT MAX(id) FROM build_jobs GROUP BY queue_job_id)
+            AND b.status = 'failed'
+        """)
+        for row in cursor.fetchall():
+            idea_id = int(row["idea_id"]) if str(row["idea_id"]).isdigit() else 0
+            if idea_id in existing_ids:
+                skipped += 1
+                continue
+            if args.dry_run:
+                print(f"  [DRY RUN] Would emit BUILD_FAILED: {row['title']} ({row['queue_job_id']})")
+            else:
+                emitter.emit(
+                    idea_id=idea_id,
+                    idea_title=row["title"],
+                    outcome="build_failed",
+                    build_outcome=f"build_failed: {row['queue_job_id']}",
+                    tags=["build", "backfill"],
+                )
+            existing_ids.add(idea_id)
+            emitted += 1
+
+        # 3. Review-failed builds
+        cursor.execute("""
+            SELECT b.idea_id, b.title, b.queue_job_id
+            FROM build_jobs b
+            WHERE b.id IN (SELECT MAX(id) FROM build_jobs GROUP BY queue_job_id)
+            AND b.status = 'completed'
+            AND b.review_status IN ('review_failed', 'tyrest_rejected')
+        """)
+        for row in cursor.fetchall():
+            idea_id = int(row["idea_id"]) if str(row["idea_id"]).isdigit() else 0
+            if idea_id in existing_ids:
+                skipped += 1
+                continue
+            if args.dry_run:
+                print(f"  [DRY RUN] Would emit BUILD_FAILED (review): {row['title']}")
+            else:
+                emitter.emit(
+                    idea_id=idea_id,
+                    idea_title=row["title"],
+                    outcome="build_failed",
+                    build_outcome=f"review_or_tyrest_failed: {row['queue_job_id']}",
+                    tags=["review", "backfill"],
+                )
+            existing_ids.add(idea_id)
+            emitted += 1
+
+        # 4. Published builds
+        cursor.execute("""
+            SELECT p.build_job_id, p.title, p.repo_url, b.idea_id
+            FROM publish_jobs p
+            JOIN build_jobs b ON b.queue_job_id = p.build_job_id
+            WHERE p.status = 'published'
+            AND b.id IN (SELECT MAX(id) FROM build_jobs GROUP BY queue_job_id)
+        """)
+        for row in cursor.fetchall():
+            idea_id = int(row["idea_id"]) if str(row["idea_id"]).isdigit() else 0
+            if idea_id in existing_ids:
+                skipped += 1
+                continue
+            if args.dry_run:
+                print(f"  [DRY RUN] Would emit PUBLISHED: {row['title']} -> {row['repo_url']}")
+            else:
+                emitter.emit(
+                    idea_id=idea_id,
+                    idea_title=row["title"],
+                    outcome="published",
+                    build_outcome="published_to_github",
+                    github_url=row["repo_url"],
+                    tags=["publish", "backfill"],
+                )
+            existing_ids.add(idea_id)
+            emitted += 1
+
+        action = "Would emit" if args.dry_run else "Emitted"
+        print(f"\n{action}: {emitted} outcome records ({skipped} already existed)")
+        return 0
+
+    except Exception as e:
+        print(f"ERROR: {e}")
+        return 1
+    finally:
+        emitter.close()
+        state_db.close()
+
+
+def cmd_score_builds(args, config: Config):
+    """
+    Score completed builds that don't have a quality_score yet.
+
+    Scans build_jobs for completed builds with NULL quality_score,
+    resolves their project directories, and runs the structural scorer.
+
+    Args:
+        args: Parsed command-line arguments
+        config: Metroplex configuration
+
+    Returns:
+        Exit code (0=success, 1=error)
+    """
+    from gates.quality_scorer import score_project
+
+    state_db = StateDB()
+    state_db.init_db()
+
+    try:
+        state_db.connect()
+        cursor = state_db.conn.cursor()
+
+        cursor.execute("""
+            SELECT DISTINCT b.queue_job_id, b.title, b.project_dir, b.quality_score
+            FROM build_jobs b
+            WHERE b.status = 'completed'
+            AND b.id IN (SELECT MAX(id) FROM build_jobs GROUP BY queue_job_id)
+            AND (b.quality_score IS NULL)
+        """)
+        rows = cursor.fetchall()
+
+        if not rows:
+            print("No unscored completed builds found.")
+            return 0
+
+        scored = 0
+        skipped = 0
+
+        for row in rows:
+            project_dir = row["project_dir"]
+            if not project_dir or not Path(project_dir).is_dir():
+                skipped += 1
+                if args.verbose:
+                    print(f"  Skip (no dir): {row['title']}")
+                continue
+
+            breakdown = score_project(Path(project_dir))
+
+            if args.dry_run:
+                print(f"  [DRY RUN] {row['title']}: {breakdown.total_score}/100 "
+                      f"(static={breakdown.static_score}, src={breakdown.source_file_count}, "
+                      f"tests={breakdown.test_file_count})")
+            else:
+                state_db.update_build_quality_score(row["queue_job_id"], breakdown.total_score)
+                print(f"  {row['title']}: {breakdown.total_score}/100 "
+                      f"(static={breakdown.static_score}, src={breakdown.source_file_count}, "
+                      f"tests={breakdown.test_file_count})")
+            scored += 1
+
+        action = "Would score" if args.dry_run else "Scored"
+        print(f"\n{action}: {scored} builds ({skipped} skipped — no project dir)")
+        return 0
+
+    except Exception as e:
+        print(f"ERROR: {e}")
+        return 1
+    finally:
+        state_db.close()
+
+
 def main():
     """Main CLI entry point."""
     parser = argparse.ArgumentParser(
@@ -872,6 +1096,14 @@ def main():
     cost_parser = subparsers.add_parser("cost", help="Show cost tracking summary")
     cost_parser.add_argument("--days", type=int, default=7, help="Number of days for breakdown (default: 7)")
 
+    # backfill-outcomes command
+    backfill_parser = subparsers.add_parser("backfill-outcomes", help="Backfill OutcomeRecords for terminal-state ideas")
+    backfill_parser.add_argument("--dry-run", action="store_true", help="Show what would be emitted without writing")
+
+    # score-builds command
+    score_parser = subparsers.add_parser("score-builds", help="Score completed builds for structural quality (Phase 14b)")
+    score_parser.add_argument("--dry-run", action="store_true", help="Show scores without writing to DB")
+
     # reset command
     reset_parser = subparsers.add_parser("reset", help="Reset circuit breaker")
     reset_parser.add_argument("--gate", required=True, choices=["triage", "build", "publish", "patch", "all"], help="Gate to reset")
@@ -916,6 +1148,10 @@ def main():
         sys.exit(cmd_cost(args, config))
     elif args.command == "reset":
         sys.exit(cmd_reset(args, config))
+    elif args.command == "backfill-outcomes":
+        sys.exit(cmd_backfill_outcomes(args, config))
+    elif args.command == "score-builds":
+        sys.exit(cmd_score_builds(args, config))
     else:
         parser.print_help()
         sys.exit(1)

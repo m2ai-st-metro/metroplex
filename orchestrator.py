@@ -26,6 +26,8 @@ from readers.academy_reader import AcademyReader
 from oz_bridge import poll_oz_run
 from readers.skylynx_reader import SkyLynxReader
 from readers.linear_reader import LinearReader
+from outcome_emitter import OutcomeEmitter
+from gates.quality_scorer import score_project
 
 
 class CycleOrchestrator:
@@ -51,6 +53,7 @@ class CycleOrchestrator:
         review_gate: ReviewGate | None = None,
         tyrest_gate: TyrestGate | None = None,
         dispatcher: Dispatcher | None = None,
+        outcome_emitter: OutcomeEmitter | None = None,
     ):
         """
         Initialize Cycle Orchestrator.
@@ -74,6 +77,7 @@ class CycleOrchestrator:
             review_gate: ReviewGate instance (optional, enables Gate 4.5 code review)
             tyrest_gate: TyrestGate instance (optional, enables Gate 4.25 LLM QA review)
             dispatcher: Dispatcher for routing non-buildable items to ClaudeClaw workers
+            outcome_emitter: OutcomeEmitter for writing terminal-state outcomes to ST Factory
         """
         self.config = config
         self.triage_gate = triage_gate
@@ -93,6 +97,7 @@ class CycleOrchestrator:
         self.linear_reader = linear_reader
         self.academy_reader = academy_reader
         self.dispatcher = dispatcher or LogDispatcher()
+        self.outcome_emitter = outcome_emitter
         # Track which gates have already sent a halted notification.
         # Prevents spamming Telegram every cycle while a breaker is tripped.
         self._halted_notified: set[str] = set()
@@ -515,6 +520,7 @@ class CycleOrchestrator:
         build_count = 0
         patch_count = 0
         errors = []
+        outcome_count_before = self.outcome_emitter.emit_count if self.outcome_emitter else 0
 
         # Sky-Lynx Intake (enqueue recommendations directly into priority queue)
         skylynx_count = self.ingest_skylynx(dry_run=dry_run)
@@ -552,6 +558,30 @@ class CycleOrchestrator:
                 approved_count = sum(1 for d in decisions if d.decision == "approve")
                 self.circuit_breaker.record_success("triage")
                 print(f"+ Gate 1 completed: {triage_count} decisions, {approved_count} approved")
+
+                # Emit outcomes for terminal triage decisions (Phase 14a)
+                if self.outcome_emitter:
+                    for d in decisions:
+                        if d.decision == "reject":
+                            self.outcome_emitter.emit(
+                                idea_id=d.idea_id,
+                                idea_title=d.title,
+                                outcome="rejected",
+                                overall_score=d.scaled_score,
+                                build_outcome=f"triage_rejected: {d.reason}",
+                                tags=["triage"],
+                            )
+                        elif d.decision == "defer":
+                            deferral_count = self.state_db.get_deferral_count(d.idea_id)
+                            if deferral_count >= self.config.max_deferrals:
+                                self.outcome_emitter.emit(
+                                    idea_id=d.idea_id,
+                                    idea_title=d.title,
+                                    outcome="deferred",
+                                    overall_score=d.scaled_score,
+                                    build_outcome=f"max_deferrals_reached ({deferral_count})",
+                                    tags=["triage"],
+                                )
 
                 if approved_count > 0:
                     titles = [d.title for d in decisions if d.decision == "approve"]
@@ -617,6 +647,19 @@ class CycleOrchestrator:
                     self.notifier.notify(f"Build completed: {', '.join(completed)}")
                 if failed:
                     self.notifier.notify(f"Build failed: {', '.join(failed)}", "error")
+
+                # Emit outcomes for newly failed builds (Phase 14a)
+                if self.outcome_emitter and failed:
+                    for job_id in failed:
+                        build = self.state_db.get_build_by_queue_job_id(job_id)
+                        if build:
+                            self.outcome_emitter.emit(
+                                idea_id=int(build["idea_id"]) if str(build["idea_id"]).isdigit() else 0,
+                                idea_title=build["title"],
+                                outcome="build_failed",
+                                build_outcome=f"yce_build_failed: {job_id}",
+                                tags=["build"],
+                            )
         except Exception as e:
             # Non-fatal -- log and continue to publish gate
             self.audit_logger.log_error("build", f"Status poll failed: {e}")
@@ -692,6 +735,18 @@ class CycleOrchestrator:
                             f"Review gate: {failed} builds failed checks: {', '.join(failed_titles)}",
                             "warning",
                         )
+                        # Emit outcomes for review failures (Phase 14a)
+                        if self.outcome_emitter:
+                            for r in review_results:
+                                if r.verdict == "fail":
+                                    build = self.state_db.get_build_by_queue_job_id(r.queue_job_id)
+                                    self.outcome_emitter.emit(
+                                        idea_id=int(build["idea_id"]) if build and str(build["idea_id"]).isdigit() else 0,
+                                        idea_title=r.title,
+                                        outcome="build_failed",
+                                        build_outcome=f"review_failed: {', '.join(r.checks_failed)}",
+                                        tags=["review"],
+                                    )
                     if passed > 0:
                         self.notifier.notify(f"Review gate: {passed} builds passed, ready to publish")
             except Exception as e:
@@ -735,6 +790,16 @@ class CycleOrchestrator:
                             f"Tyrest REJECTED: {review.title} — {tyrest_result.reasoning}",
                             "warning",
                         )
+                        # Emit outcome for Tyrest rejection (Phase 14a)
+                        if self.outcome_emitter:
+                            build = self.state_db.get_build_by_queue_job_id(review.queue_job_id)
+                            self.outcome_emitter.emit(
+                                idea_id=int(build["idea_id"]) if build and str(build["idea_id"]).isdigit() else 0,
+                                idea_title=review.title,
+                                outcome="rejected",
+                                build_outcome=f"tyrest_rejected: {tyrest_result.reasoning}",
+                                tags=["tyrest"],
+                            )
                     else:
                         self.audit_logger.log_decision(
                             gate="tyrest",
@@ -751,6 +816,52 @@ class CycleOrchestrator:
                     print(f"+ Gate 4.25 completed: {tyrest_count} Tyrest-reviewed")
             except Exception as e:
                 self.audit_logger.log_error("tyrest", f"Tyrest gate failed: {e}")
+
+        # Quality scoring (Phase 14b) — score builds that passed review
+        if review_count > 0:
+            try:
+                scored_builds = 0
+                for r in review_results:
+                    if r.verdict != "pass":
+                        continue
+                    build = self.state_db.get_build_by_queue_job_id(r.queue_job_id)
+                    if not build or not build.get("project_dir"):
+                        continue
+                    project_dir = Path(build["project_dir"])
+                    if not project_dir.is_dir():
+                        continue
+
+                    # Use Tyrest overall score if this build was Tyrest-reviewed
+                    tyrest_overall = None
+                    if self.tyrest_gate is not None and build.get("review_status") not in ("tyrest_rejected",):
+                        # Check if we have a Tyrest result from this cycle
+                        # The tyrest_result is only available for the current iteration;
+                        # for already-reviewed builds, we don't re-score Tyrest
+                        pass  # Tyrest score will be None for now; 14c can enhance
+
+                    breakdown = score_project(project_dir, tyrest_overall=tyrest_overall)
+                    if not dry_run:
+                        self.state_db.update_build_quality_score(
+                            r.queue_job_id, breakdown.total_score,
+                        )
+                    scored_builds += 1
+                    self.audit_logger.log_decision(
+                        gate="quality",
+                        action="scored",
+                        details={
+                            "queue_job_id": r.queue_job_id,
+                            "title": r.title,
+                            "quality_score": breakdown.total_score,
+                            "static_score": breakdown.static_score,
+                            "source_files": breakdown.source_file_count,
+                            "test_files": breakdown.test_file_count,
+                        },
+                    )
+
+                if scored_builds > 0:
+                    print(f"+ Quality scored: {scored_builds} builds")
+            except Exception as e:
+                self.audit_logger.log_error("quality", f"Quality scoring failed: {e}")
 
         # Gate 4: Publish (push completed builds to GitHub)
         publish_count = 0
@@ -777,6 +888,19 @@ class CycleOrchestrator:
                             self.notifier.notify(
                                 f"Published: {self.config.github_org}/{job.repo_name} ({job.title})"
                             )
+                            # Emit outcome for published builds (Phase 14a)
+                            if self.outcome_emitter:
+                                build = self.state_db.get_build_by_queue_job_id(job.build_job_id)
+                                quality = build.get("quality_score") if build else None
+                                self.outcome_emitter.emit(
+                                    idea_id=int(build["idea_id"]) if build and str(build["idea_id"]).isdigit() else 0,
+                                    idea_title=job.title,
+                                    outcome="published",
+                                    overall_score=quality,
+                                    build_outcome="published_to_github",
+                                    github_url=job.repo_url,
+                                    tags=["publish"],
+                                )
                         elif job.status == "failed":
                             self.notifier.notify(f"Publish FAILED: {job.title} -- {job.error}", "error")
                 except Exception as e:
@@ -810,6 +934,12 @@ class CycleOrchestrator:
                 print(f"x {error_msg}")
                 self.circuit_breaker.record_failure("patch", error_msg)
                 self.audit_logger.log_error("patch", error_msg)
+
+        # Log outcome emission count for this cycle
+        if self.outcome_emitter:
+            cycle_outcomes = self.outcome_emitter.emit_count - outcome_count_before
+            if cycle_outcomes > 0:
+                print(f"+ Outcomes emitted: {cycle_outcomes}")
 
         # End cycle
         self.state_db.end_cycle(cycle_id, triage_count, build_count, patch_count, errors, publish_count)
