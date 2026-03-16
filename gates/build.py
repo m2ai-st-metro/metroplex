@@ -1,11 +1,7 @@
 """
 Build Gate - Gate 2
-Routes approved ideas to Ultra-Magnus pipeline for full lifecycle
-processing (enrichment → evaluation → scaffolding → build → deploy).
-
-Legacy path (spec generation + YCE queue) retained for fallback.
-UM bridge runs as fire-and-forget subprocess; results written back
-to IdeaForge DB on completion.
+Generates specs from approved ideas via LLM, runs Tyrest pre-build
+review, then dispatches to YCE Harness for autonomous building.
 """
 import json
 import logging
