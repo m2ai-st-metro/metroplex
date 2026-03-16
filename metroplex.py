@@ -1036,6 +1036,122 @@ def cmd_score_builds(args, config: Config):
         state_db.close()
 
 
+def cmd_quality_digest(args, config: Config):
+    """
+    Print a concise quality digest for inclusion in daily reports.
+
+    Outputs: outcome counts, quality score stats by terminal state,
+    suggested threshold, and recent builds. Designed for Telegram consumption.
+
+    Returns:
+        Exit code (0=success, 1=error)
+    """
+    state_db = StateDB()
+    state_db.init_db()
+
+    try:
+        state_db.connect()
+        cursor = state_db.conn.cursor()
+
+        lines = ["Build Quality Digest"]
+        lines.append("=" * 30)
+
+        # Outcome summary (from st-factory)
+        try:
+            from outcome_emitter import create_outcome_emitter
+            emitter = create_outcome_emitter()
+            if emitter:
+                records = emitter.store.read_outcomes(limit=1000)
+                from collections import Counter
+                outcomes = Counter(r.outcome.value for r in records)
+                total = len(records)
+                lines.append(f"\nOutcomes ({total} total):")
+                for outcome, count in outcomes.most_common():
+                    lines.append(f"  {outcome}: {count}")
+                emitter.close()
+        except Exception:
+            pass
+
+        # Quality scores by terminal state
+        cursor.execute("""
+            SELECT
+                b.queue_job_id, b.title, b.status, b.review_status, b.quality_score,
+                p.status as pub_status
+            FROM build_jobs b
+            LEFT JOIN publish_jobs p ON p.build_job_id = b.queue_job_id AND p.status = 'published'
+            WHERE b.quality_score IS NOT NULL
+            AND b.id IN (SELECT MAX(id) FROM build_jobs GROUP BY queue_job_id)
+            ORDER BY b.quality_score DESC
+        """)
+        rows = cursor.fetchall()
+
+        if rows:
+            # Group by state
+            groups: dict[str, list[float]] = {}
+            for r in rows:
+                if r["review_status"] in ("review_failed", "tyrest_rejected"):
+                    state = r["review_status"]
+                elif r["status"] == "failed":
+                    state = "build_failed"
+                elif r["pub_status"] == "published":
+                    state = "published"
+                else:
+                    state = "other"
+                groups.setdefault(state, []).append(r["quality_score"])
+
+            lines.append(f"\nQuality Scores ({len(rows)} builds):")
+            for state, scores in sorted(groups.items(), key=lambda x: -sum(x[1])/len(x[1])):
+                avg = sum(scores) / len(scores)
+                lines.append(f"  {state}: avg {avg:.0f}/100 (n={len(scores)})")
+
+            all_scores = [r["quality_score"] for r in rows]
+            avg_all = sum(all_scores) / len(all_scores)
+            lines.append(f"  overall: avg {avg_all:.0f}/100")
+
+            # Threshold suggestion
+            pub_scores = groups.get("published", [])
+            fail_scores = (
+                groups.get("build_failed", []) +
+                groups.get("review_failed", []) +
+                groups.get("tyrest_rejected", [])
+            )
+            if pub_scores and fail_scores:
+                pub_avg = sum(pub_scores) / len(pub_scores)
+                fail_avg = sum(fail_scores) / len(fail_scores)
+                threshold = (pub_avg + fail_avg) / 2
+                lines.append(f"\nSuggested threshold: {threshold:.0f}/100")
+                lines.append(f"  (published avg {pub_avg:.0f} vs failed avg {fail_avg:.0f})")
+
+            # Top and bottom builds
+            lines.append(f"\nTop builds:")
+            for r in rows[:3]:
+                lines.append(f"  {r['quality_score']:.0f} {r['title'][:50]}")
+            if len(rows) > 3:
+                bottom = sorted(rows, key=lambda r: r["quality_score"])[:3]
+                lines.append(f"Bottom builds:")
+                for r in bottom:
+                    lines.append(f"  {r['quality_score']:.0f} {r['title'][:50]}")
+        else:
+            lines.append("\nNo scored builds yet.")
+
+        # Recent cycle activity
+        cursor.execute("""
+            SELECT COUNT(*) as cnt FROM cycles
+            WHERE started_at >= datetime('now', '-24 hours')
+        """)
+        recent_cycles = cursor.fetchone()["cnt"]
+        lines.append(f"\nLast 24h: {recent_cycles} cycles")
+
+        print("\n".join(lines))
+        return 0
+
+    except Exception as e:
+        print(f"ERROR: {e}")
+        return 1
+    finally:
+        state_db.close()
+
+
 def main():
     """Main CLI entry point."""
     parser = argparse.ArgumentParser(
@@ -1104,6 +1220,9 @@ def main():
     score_parser = subparsers.add_parser("score-builds", help="Score completed builds for structural quality (Phase 14b)")
     score_parser.add_argument("--dry-run", action="store_true", help="Show scores without writing to DB")
 
+    # quality-digest command
+    digest_parser = subparsers.add_parser("quality-digest", help="Print quality digest for daily reports (Phase 14d)")
+
     # reset command
     reset_parser = subparsers.add_parser("reset", help="Reset circuit breaker")
     reset_parser.add_argument("--gate", required=True, choices=["triage", "build", "publish", "patch", "all"], help="Gate to reset")
@@ -1152,6 +1271,8 @@ def main():
         sys.exit(cmd_backfill_outcomes(args, config))
     elif args.command == "score-builds":
         sys.exit(cmd_score_builds(args, config))
+    elif args.command == "quality-digest":
+        sys.exit(cmd_quality_digest(args, config))
     else:
         parser.print_help()
         sys.exit(1)

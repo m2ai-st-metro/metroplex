@@ -28,6 +28,7 @@ from readers.skylynx_reader import SkyLynxReader
 from readers.linear_reader import LinearReader
 from outcome_emitter import OutcomeEmitter
 from gates.quality_scorer import score_project
+from quality_ratchet import evaluate_ratchet
 
 
 class CycleOrchestrator:
@@ -862,6 +863,23 @@ class CycleOrchestrator:
                     print(f"+ Quality scored: {scored_builds} builds")
             except Exception as e:
                 self.audit_logger.log_error("quality", f"Quality scoring failed: {e}")
+
+        # Quality ratchet evaluation (Phase 14e)
+        try:
+            ratchet_result = evaluate_ratchet(self.state_db)
+            if ratchet_result["activated"]:
+                if ratchet_result["tightened"]:
+                    print(f"+ Quality ratchet: {ratchet_result['reason']}")
+                    self.notifier.notify(
+                        f"Quality ratchet tightened: {ratchet_result['reason']}",
+                    )
+                self.audit_logger.log_decision(
+                    gate="quality_ratchet",
+                    action="tightened" if ratchet_result["tightened"] else "unchanged",
+                    details=ratchet_result,
+                )
+        except Exception as e:
+            self.audit_logger.log_error("quality_ratchet", f"Ratchet evaluation failed: {e}")
 
         # Gate 4: Publish (push completed builds to GitHub)
         publish_count = 0
