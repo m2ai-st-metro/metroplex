@@ -26,6 +26,7 @@ from readers.academy_reader import AcademyReader
 from readers.skylynx_reader import SkyLynxReader
 from readers.stfactory_reader import STFactoryReader
 from dispatcher import create_dispatcher, route_to_worker, build_dispatch_prompt
+from outcome_emitter import create_outcome_emitter
 
 
 def setup_logging(verbose: bool):
@@ -175,6 +176,9 @@ def initialize_components(config: Config):
     raw_notifier = create_notifier(config.telegram_bot_token, config.telegram_chat_id)
     notifier = FilteredNotifier(raw_notifier, config.notify_mode)
 
+    # Initialize outcome emitter (Phase 14a — write OutcomeRecords to ST Factory)
+    outcome_emitter = create_outcome_emitter()
+
     # Initialize dispatcher for non-buildable queue items (Sky-Lynx -> ClaudeClaw)
     dispatcher = create_dispatcher(config.dispatch_db, config.dispatch_chat_id)
 
@@ -198,6 +202,7 @@ def initialize_components(config: Config):
         review_gate=review_gate,
         tyrest_gate=tyrest_gate,
         dispatcher=dispatcher,
+        outcome_emitter=outcome_emitter,
     )
 
     return orchestrator, state_db, circuit_breaker
