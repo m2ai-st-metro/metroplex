@@ -15,7 +15,7 @@ class TestConfigDefaults:
     def test_default_db_paths(self):
         config = Config()
         assert config.ideaforge_db == "/home/apexaipc/projects/ideaforge/data/ideaforge.db"
-        assert config.um_db == "/home/apexaipc/projects/ultra-magnus/idea-factory/data/idea-factory.db"
+        assert config.um_db == ""  # Deprecated
         assert config.stfactory_db == "/home/apexaipc/projects/st-factory/data/persona_metrics.db"
 
     def test_default_thresholds(self):
@@ -67,7 +67,6 @@ class TestConfigEnvOverrides:
         with patch.dict(os.environ, env):
             config = Config()
             assert config.ideaforge_db == "/tmp/test_ideaforge.db"
-            assert config.um_db == "/tmp/test_um.db"
             assert config.stfactory_db == "/tmp/test_stfactory.db"
 
     def test_override_thresholds(self):
@@ -156,14 +155,12 @@ class TestConfigValidation:
     def test_validate_missing_db_paths(self):
         config = Config()
         config.ideaforge_db = "/nonexistent/path.db"
-        config.um_db = "/nonexistent/path2.db"
         config.stfactory_db = "/nonexistent/path3.db"
         config.yce_dir = "/nonexistent/dir"
 
         warnings = config.validate()
-        assert len(warnings) >= 4
+        assert len(warnings) >= 3
         assert any("IdeaForge DB" in w for w in warnings)
-        assert any("Ultra-Magnus DB" in w for w in warnings)
         assert any("ST Factory DB" in w for w in warnings)
         assert any("YCE directory" in w for w in warnings)
 
@@ -194,7 +191,6 @@ class TestConfigValidation:
 
         config = Config()
         config.ideaforge_db = str(db_file)
-        config.um_db = str(db_file)
         config.stfactory_db = str(db_file)
         config.yce_dir = str(tmp_path)
 

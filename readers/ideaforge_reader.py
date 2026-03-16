@@ -47,28 +47,19 @@ class IdeaForgeReader:
 
     def get_unprocessed_ideas(self) -> list[dict]:
         """
-        Get classified ideas ready for triage.
+        Get scored ideas ready for triage.
 
-        Returns ideas where status = 'classified' AND weighted_score IS NOT NULL.
-        These have passed through IdeaForge's full pipeline (score + classify)
-        and were not dismissed. Results sorted by weighted_score DESC.
+        Returns ideas where status IN ('scored', 'classified') AND
+        weighted_score IS NOT NULL AND not already claimed by Metroplex.
+        Classification is no longer required — score threshold handles
+        dismissal directly. Results sorted by weighted_score DESC.
 
         Returns:
             List of idea dictionaries with fields:
-            - id (int)
-            - title (str)
-            - description (str)
-            - problem_statement (str)
-            - target_audience (str)
-            - weighted_score (float)
-            - opportunity_score (float)
-            - problem_score (float)
-            - feasibility_score (float)
-            - why_now_score (float)
-            - competition_score (float)
-            - artifact_type (str)
-            - signal_count (int)
-            - status (str)
+            - id, title, description, problem_statement, target_audience
+            - weighted_score, opportunity_score, problem_score, feasibility_score,
+              why_now_score, competition_score
+            - artifact_type, signal_count, status
         """
         self._connect()
         cursor = self.conn.cursor()
@@ -90,8 +81,9 @@ class IdeaForgeReader:
                 signal_count,
                 status
             FROM ideas
-            WHERE status = 'classified'
+            WHERE status IN ('scored', 'classified')
                 AND weighted_score IS NOT NULL
+                AND (claimed_by IS NULL OR claimed_by = '')
             ORDER BY weighted_score DESC
         """)
 

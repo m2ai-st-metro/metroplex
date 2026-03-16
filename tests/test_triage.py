@@ -79,7 +79,9 @@ def create_ideaforge_db():
                 competition_score REAL,
                 artifact_type TEXT,
                 signal_count INTEGER,
-                status TEXT
+                status TEXT,
+                claimed_by TEXT,
+                claimed_at TEXT
             )
         """)
 

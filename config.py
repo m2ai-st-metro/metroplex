@@ -32,7 +32,7 @@ class Config:
 
     # Database paths
     ideaforge_db: str = field(default="/home/apexaipc/projects/ideaforge/data/ideaforge.db")
-    um_db: str = field(default="/home/apexaipc/projects/ultra-magnus/idea-factory/data/idea-factory.db")
+    um_db: str = field(default="")  # Deprecated: UM removed from pipeline (2026-03-15)
     stfactory_db: str = field(default="/home/apexaipc/projects/st-factory/data/persona_metrics.db")
 
     # Directory paths
@@ -104,6 +104,12 @@ class Config:
     monthly_cost_limit: float = field(default=500.0)
     cost_alert_threshold: float = field(default=0.8)
     build_cost_estimate: float = field(default=3.0)
+
+    # Tyrest QA gate (GPT-based independent review)
+    tyrest_enabled: bool = field(default=True)
+    tyrest_model: str = field(default="gpt-4o")
+    tyrest_approve_confidence: float = field(default=0.75)
+    tyrest_reject_confidence: float = field(default=0.75)
 
     # Schedule windows (24h clock, 0-23)
     schedule_start: int = field(default=0)    # midnight
@@ -205,6 +211,18 @@ class Config:
         self.dispatch_db = os.environ.get("METROPLEX_DISPATCH_DB", self.dispatch_db)
         self.dispatch_chat_id = os.environ.get("METROPLEX_DISPATCH_CHAT_ID", self.dispatch_chat_id)
 
+        # Tyrest QA gate
+        self.tyrest_enabled = os.environ.get("TYREST_ENABLED", "true").lower() in ("true", "1", "yes")
+        self.tyrest_model = os.environ.get("TYREST_MODEL", self.tyrest_model)
+        try:
+            self.tyrest_approve_confidence = float(os.environ.get("TYREST_APPROVE_MIN_CONFIDENCE", self.tyrest_approve_confidence))
+        except ValueError:
+            pass
+        try:
+            self.tyrest_reject_confidence = float(os.environ.get("TYREST_REJECT_MIN_CONFIDENCE", self.tyrest_reject_confidence))
+        except ValueError:
+            pass
+
         # Telegram
         self.telegram_bot_token = os.environ.get("METROPLEX_TELEGRAM_BOT_TOKEN", self.telegram_bot_token)
         self.telegram_chat_id = os.environ.get("METROPLEX_TELEGRAM_CHAT_ID", self.telegram_chat_id)
@@ -266,7 +284,6 @@ class Config:
         # Check database paths
         db_paths = [
             ("IdeaForge DB", self.ideaforge_db),
-            ("Ultra-Magnus DB", self.um_db),
             ("ST Factory DB", self.stfactory_db),
         ]
 

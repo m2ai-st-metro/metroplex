@@ -6,6 +6,7 @@ Includes notifications, schedule windows, and priority queue dispatch.
 import json
 import time
 from datetime import datetime
+from pathlib import Path
 from typing import Optional, Protocol
 
 from config import Config
@@ -18,6 +19,7 @@ from gates.build import BuildOrchestrator
 from gates.patcher import PatchGate
 from gates.publish import PublishGate
 from gates.review import ReviewGate
+from gates.tyrest import TyrestGate
 from notifier import Notifier, LogNotifier
 from dispatcher import Dispatcher, LogDispatcher, route_to_worker, build_dispatch_prompt
 from readers.academy_reader import AcademyReader
@@ -47,6 +49,7 @@ class CycleOrchestrator:
         academy_reader: AcademyReader | None = None,
         publish_gate: PublishGate | None = None,
         review_gate: ReviewGate | None = None,
+        tyrest_gate: TyrestGate | None = None,
         dispatcher: Dispatcher | None = None,
     ):
         """
@@ -69,6 +72,7 @@ class CycleOrchestrator:
             academy_reader: AcademyReader instance (optional, enables Academy promotion intake)
             publish_gate: PublishGate instance (optional, enables Gate 4)
             review_gate: ReviewGate instance (optional, enables Gate 4.5 code review)
+            tyrest_gate: TyrestGate instance (optional, enables Gate 4.25 LLM QA review)
             dispatcher: Dispatcher for routing non-buildable items to ClaudeClaw workers
         """
         self.config = config
@@ -77,6 +81,7 @@ class CycleOrchestrator:
         self.patch_gate = patch_gate
         self.publish_gate = publish_gate
         self.review_gate = review_gate
+        self.tyrest_gate = tyrest_gate
         self.circuit_breaker = circuit_breaker
         self.cycle_caps = cycle_caps
         self.shutdown_handler = shutdown_handler
@@ -691,6 +696,61 @@ class CycleOrchestrator:
                         self.notifier.notify(f"Review gate: {passed} builds passed, ready to publish")
             except Exception as e:
                 self.audit_logger.log_error("review", f"Review gate failed: {e}")
+
+        # Gate 4.25: Tyrest LLM QA review (on builds that passed ReviewGate)
+        if self.tyrest_gate is not None and review_count > 0:
+            try:
+                passed_reviews = [r for r in review_results if r.verdict == "pass"]
+                tyrest_count = 0
+                for review in passed_reviews:
+                    # Get spec path and project_dir for this build
+                    build = self.state_db.get_build_by_queue_job_id(review.queue_job_id)
+                    if not build:
+                        continue
+                    spec_path = build.get("spec_path", "")
+                    project_dir = build.get("project_dir", "")
+                    if not project_dir:
+                        continue
+
+                    spec_text = ""
+                    if spec_path and Path(spec_path).is_file():
+                        spec_text = Path(spec_path).read_text(encoding="utf-8")
+
+                    if dry_run:
+                        print(f"  [DRY RUN] Would Tyrest-review: {review.title}")
+                        tyrest_count += 1
+                        continue
+
+                    tyrest_result = self.tyrest_gate.review_build(
+                        Path(project_dir), spec_text, idea_title=review.title,
+                    )
+                    tyrest_count += 1
+
+                    if tyrest_result.rejected:
+                        # Downgrade review_status so publish gate skips it
+                        self.state_db.update_build_review_status(
+                            review.queue_job_id, "tyrest_rejected",
+                        )
+                        self.notifier.notify(
+                            f"Tyrest REJECTED: {review.title} — {tyrest_result.reasoning}",
+                            "warning",
+                        )
+                    else:
+                        self.audit_logger.log_decision(
+                            gate="tyrest",
+                            action=tyrest_result.verdict.lower(),
+                            details={
+                                "queue_job_id": review.queue_job_id,
+                                "title": review.title,
+                                "overall": tyrest_result.overall,
+                                "confidence": tyrest_result.confidence,
+                            },
+                        )
+
+                if tyrest_count > 0:
+                    print(f"+ Gate 4.25 completed: {tyrest_count} Tyrest-reviewed")
+            except Exception as e:
+                self.audit_logger.log_error("tyrest", f"Tyrest gate failed: {e}")
 
         # Gate 4: Publish (push completed builds to GitHub)
         publish_count = 0

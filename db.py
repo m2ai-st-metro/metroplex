@@ -732,6 +732,17 @@ class StateDB:
             for row in cursor.fetchall()
         ]
 
+    def get_build_by_queue_job_id(self, queue_job_id: str) -> dict | None:
+        """Get a build job by its queue_job_id."""
+        self.connect()
+        cursor = self.conn.cursor()
+        cursor.execute(
+            "SELECT * FROM build_jobs WHERE queue_job_id = ? ORDER BY id DESC LIMIT 1",
+            (queue_job_id,),
+        )
+        row = cursor.fetchone()
+        return dict(row) if row else None
+
     def update_build_review_status(self, queue_job_id: str, review_status: str) -> bool:
         """Set the review_status on a completed build.
 

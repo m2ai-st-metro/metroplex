@@ -7,7 +7,7 @@ import json
 import tempfile
 from pathlib import Path
 
-from readers import IdeaForgeReader, SkyLynxReader, STFactoryReader, UMReader
+from readers import IdeaForgeReader, SkyLynxReader, STFactoryReader
 
 
 # --- IdeaForge Reader Tests ---
@@ -35,7 +35,9 @@ def ideaforge_test_db():
             competition_score REAL,
             artifact_type TEXT,
             signal_count INTEGER,
-            status TEXT
+            status TEXT,
+            claimed_by TEXT,
+            claimed_at TEXT
         )
     """)
 
@@ -100,7 +102,7 @@ def test_ideaforge_get_unprocessed_ideas(ideaforge_test_db):
 
     ideas = reader.get_unprocessed_ideas()
 
-    # Should return only classified ideas with non-null weighted_score
+    # Should return only scored/classified ideas with non-null weighted_score
     assert len(ideas) == 3
 
     # Should be sorted by weighted_score DESC
@@ -367,190 +369,6 @@ def test_stfactory_get_outcome_records(stfactory_test_db):
     reader.close()
 
 
-# --- Ultra-Magnus Reader Tests ---
-
-
-@pytest.fixture
-def um_test_db():
-    """Create an in-memory Ultra-Magnus database with test data."""
-    conn = sqlite3.connect(":memory:")
-    cursor = conn.cursor()
-
-    # Create ideas table
-    cursor.execute("""
-        CREATE TABLE ideas (
-            id TEXT PRIMARY KEY,
-            title TEXT,
-            current_stage TEXT,
-            current_status TEXT
-        )
-    """)
-
-    # Create build_results table (matches real idea-factory.db schema)
-    cursor.execute("""
-        CREATE TABLE build_results (
-            idea_id TEXT,
-            github_repo TEXT,
-            artifacts TEXT,
-            outcome TEXT,
-            started_at TEXT,
-            completed_at TEXT,
-            google_drive_url TEXT,
-            google_drive_file_id TEXT,
-            test_results TEXT,
-            total_cost REAL,
-            run_instructions TEXT,
-            ralph_execution_id TEXT
-        )
-    """)
-
-    # Create evaluation_results table (matches real idea-factory.db schema)
-    cursor.execute("""
-        CREATE TABLE evaluation_results (
-            idea_id TEXT,
-            jtbd_analysis TEXT,
-            disruption_potential TEXT,
-            disruption_score REAL,
-            capabilities_fit TEXT,
-            recommendation TEXT,
-            recommendation_rationale TEXT,
-            key_risks TEXT,
-            case_study_matches TEXT,
-            overall_score REAL,
-            evaluated_at TEXT,
-            evaluated_by TEXT,
-            jtbd_clarity_score REAL,
-            market_size_score REAL,
-            competitive_intensity_score REAL,
-            feasibility_score REAL,
-            risk_severity_score REAL
-        )
-    """)
-
-    # Insert test ideas
-    cursor.execute("""
-        INSERT INTO ideas (id, title, current_stage, current_status)
-        VALUES ('idea-001', 'AI Assistant', 'build', 'in_progress'),
-               ('idea-002', 'Data Tool', 'evaluation', 'completed')
-    """)
-
-    # Insert test build results
-    cursor.execute("""
-        INSERT INTO build_results (
-            idea_id, github_repo, artifacts, outcome, started_at, completed_at,
-            test_results, total_cost, run_instructions, ralph_execution_id
-        ) VALUES
-            ('idea-001', 'org/ai-assistant', '[]', 'success',
-             '2024-01-01T08:00:00', '2024-01-01T09:00:00', '{}', 1.50, 'npm start', 'exec-001'),
-            ('idea-002', 'org/data-tool', '[]', 'success',
-             '2024-01-01T10:00:00', '2024-01-01T11:00:00', '{}', 2.00, 'python main.py', 'exec-002')
-    """)
-
-    # Insert test evaluation results
-    cursor.execute("""
-        INSERT INTO evaluation_results (
-            idea_id, jtbd_analysis, disruption_potential, disruption_score,
-            capabilities_fit, recommendation, recommendation_rationale,
-            key_risks, case_study_matches, overall_score, evaluated_at, evaluated_by,
-            jtbd_clarity_score, market_size_score, competitive_intensity_score,
-            feasibility_score, risk_severity_score
-        ) VALUES (
-            'idea-002', 'Strong JTBD fit', 'Medium', 7.0,
-            'High', 'Approve for production', 'Solid market fit',
-            'Low competition risk', '[]', 8.5, '2024-01-01T12:00:00', 'evaluator-1',
-            8.0, 7.5, 6.0, 9.0, 3.0
-        )
-    """)
-
-    conn.commit()
-
-    # Save to a temporary file for testing
-    with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
-        temp_path = f.name
-
-    # Copy in-memory DB to file
-    file_conn = sqlite3.connect(temp_path)
-    conn.backup(file_conn)
-    file_conn.close()
-    conn.close()
-
-    yield temp_path
-
-    # Cleanup
-    Path(temp_path).unlink(missing_ok=True)
-
-
-def test_um_reader_initialization(um_test_db):
-    """Test Ultra-Magnus reader initialization."""
-    reader = UMReader(um_test_db)
-    assert reader.db_path == um_test_db
-    assert reader.conn is not None
-    reader.close()
-
-
-def test_um_reader_missing_db():
-    """Test Ultra-Magnus reader raises FileNotFoundError for missing DB."""
-    with pytest.raises(FileNotFoundError, match="Ultra-Magnus database not found"):
-        UMReader("/nonexistent/path/to/db.db")
-
-
-def test_um_get_idea_pipeline_status(um_test_db):
-    """Test getting idea pipeline status."""
-    reader = UMReader(um_test_db)
-
-    # Get existing idea
-    idea = reader.get_idea_pipeline_status("idea-001")
-    assert idea is not None
-    assert idea["id"] == "idea-001"
-    assert idea["title"] == "AI Assistant"
-    assert idea["current_stage"] == "build"
-    assert idea["current_status"] == "in_progress"
-
-    # Get non-existent idea
-    idea = reader.get_idea_pipeline_status("idea-999")
-    assert idea is None
-
-    reader.close()
-
-
-def test_um_get_recent_builds(um_test_db):
-    """Test getting recent builds."""
-    reader = UMReader(um_test_db)
-
-    builds = reader.get_recent_builds(limit=1)
-
-    # Should return most recent build (DESC order by id)
-    assert len(builds) == 1
-    assert builds[0]["idea_id"] == "idea-002"
-    assert builds[0]["outcome"] == "success"
-    assert builds[0]["github_repo"] == "org/data-tool"
-    assert builds[0]["title"] == "Data Tool"
-
-    # Test with default limit
-    all_builds = reader.get_recent_builds()
-    assert len(all_builds) == 2
-
-    reader.close()
-
-
-def test_um_get_evaluation_result(um_test_db):
-    """Test getting evaluation results."""
-    reader = UMReader(um_test_db)
-
-    # Get existing evaluation
-    result = reader.get_evaluation_result("idea-002")
-    assert result is not None
-    assert result["idea_id"] == "idea-002"
-    assert result["overall_score"] == 8.5
-    assert result["recommendation"] == "Approve for production"
-
-    # Get non-existent evaluation
-    result = reader.get_evaluation_result("idea-999")
-    assert result is None
-
-    reader.close()
-
-
 # --- Sky-Lynx Reader Tests ---
 
 
@@ -808,11 +626,7 @@ def test_all_readers_raise_filenotfound():
     with pytest.raises(FileNotFoundError):
         STFactoryReader(nonexistent_path)
 
-    with pytest.raises(FileNotFoundError):
-        UMReader(nonexistent_path)
-
-
-def test_all_readers_close_properly(ideaforge_test_db, stfactory_test_db, um_test_db, skylynx_test_db):
+def test_all_readers_close_properly(ideaforge_test_db, stfactory_test_db, skylynx_test_db):
     """Test that all readers close connections properly."""
     # IdeaForge
     reader1 = IdeaForgeReader(ideaforge_test_db)
@@ -831,9 +645,3 @@ def test_all_readers_close_properly(ideaforge_test_db, stfactory_test_db, um_tes
     assert reader2.conn is not None
     reader2.close()
     assert reader2.conn is None
-
-    # Ultra-Magnus
-    reader3 = UMReader(um_test_db)
-    assert reader3.conn is not None
-    reader3.close()
-    assert reader3.conn is None

@@ -17,6 +17,7 @@ from gates.build import SpecGenerator, BuildOrchestrator
 from gates.patcher import PatchGate
 from gates.publish import PublishGate
 from gates.review import ReviewGate
+from gates.tyrest import TyrestGate
 from orchestrator import CycleOrchestrator
 from notifier import create_notifier, FilteredNotifier
 from readers.ideaforge_reader import IdeaForgeReader
@@ -130,11 +131,25 @@ def initialize_components(config: Config):
         print(f"Warning: Template directory not found at {template_dir}")
         spec_generator = None
 
+    # Tyrest gate init (moved earlier so build_orchestrator can use it)
+    tyrest_gate = None
+    if config.tyrest_enabled:
+        try:
+            tyrest_gate = TyrestGate(
+                enabled=True,
+                model=config.tyrest_model,
+                approve_confidence=config.tyrest_approve_confidence,
+                reject_confidence=config.tyrest_reject_confidence,
+            )
+        except ValueError as e:
+            print(f"Warning: Tyrest gate disabled — {e}")
+
     build_orchestrator = BuildOrchestrator(
         config=config,
         state_db=state_db,
         spec_generator=spec_generator,
-        audit_logger=audit_logger
+        audit_logger=audit_logger,
+        tyrest_gate=tyrest_gate,
     )
 
     patch_gate = PatchGate(
@@ -181,6 +196,7 @@ def initialize_components(config: Config):
         academy_reader=academy_reader,
         publish_gate=publish_gate,
         review_gate=review_gate,
+        tyrest_gate=tyrest_gate,
         dispatcher=dispatcher,
     )
 

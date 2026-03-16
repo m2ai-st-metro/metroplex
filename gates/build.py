@@ -23,7 +23,6 @@ from models import BuildJob, PriorityItem
 from db import StateDB
 from audit import AuditLogger
 from gates.llm_expander import LLMSpecExpander
-from um_bridge import submit_to_um
 from oz_bridge import submit_to_oz
 
 logger = logging.getLogger(__name__)
@@ -184,7 +183,7 @@ class SpecGenerator:
 class BuildOrchestrator:
     """Gate 2: Build Orchestration - Queue Runner Integration."""
 
-    def __init__(self, config: Config, state_db: StateDB, spec_generator: SpecGenerator, audit_logger: AuditLogger):
+    def __init__(self, config: Config, state_db: StateDB, spec_generator: SpecGenerator, audit_logger: AuditLogger, tyrest_gate=None):
         """
         Initialize Build Orchestrator.
 
@@ -193,11 +192,13 @@ class BuildOrchestrator:
             state_db: State database for recording build jobs
             spec_generator: Spec generator instance
             audit_logger: Audit logger for tracking decisions
+            tyrest_gate: Optional TyrestGate for pre-build spec review
         """
         self.config = config
         self.state_db = state_db
         self.spec_generator = spec_generator
         self.audit_logger = audit_logger
+        self.tyrest_gate = tyrest_gate
         self.queue_runner_path = Path(config.yce_dir) / "queue_runner.py"
         self.yce_python = Path(config.yce_dir) / "venv" / "bin" / "python"
 
@@ -602,12 +603,10 @@ class BuildOrchestrator:
 
     def run_from_queue(self, state_db: StateDB, dry_run: bool = False) -> list[BuildJob]:
         """
-        Pull items from the priority queue and dispatch to Ultra-Magnus.
+        Pull items from the priority queue, generate specs, and dispatch to YCE.
 
-        Routes buildable ideas (ideaforge, linear, academy) to UM's full
-        pipeline via fire-and-forget subprocess. UM handles enrichment,
-        evaluation, scaffolding, and building (via YCE). Results are
-        written back to IdeaForge DB on completion.
+        Flow: pull pending idea → generate spec (LLMSpecExpander) → Tyrest
+        pre-build review → queue YCE build → start runner.
 
         Args:
             state_db: StateDB instance (for priority queue access)
@@ -616,12 +615,10 @@ class BuildOrchestrator:
         Returns:
             List of BuildJob results
         """
-        # Pull pending BUILDABLE items from sources that produce app specs.
-        # Sky-Lynx recommendations are internal tasks dispatched via the
-        # EA-Claude dispatcher, not through the build pipeline.
         buildable_sources = ("ideaforge", "linear", "academy")
         dispatch_limit = self.config.max_approve_per_cycle
         jobs = []
+        queued_jobs = []
 
         for _ in range(dispatch_limit):
             item = state_db.get_next_pending(sources=buildable_sources)
@@ -642,17 +639,17 @@ class BuildOrchestrator:
                 }
             idea["_source"] = item.source
 
-            # Route to build target (local UM or Oz cloud)
             source = idea.get("_source", "ideaforge")
             job_id = f"metroplex-{source}-{idea['id']}"
             queued_at = datetime.now()
 
+            # Route to Oz cloud if configured and local slot busy
             build_target = self.config.build_target
             oz_run_id = None
 
             if build_target == "cloud" or (
                 build_target == "auto" and self.config.oz_environment_id
-                and self.is_runner_active()  # local slot busy -> try cloud
+                and self.is_runner_active()
             ):
                 if self.config.oz_environment_id:
                     oz_run_id = submit_to_oz(
@@ -662,44 +659,116 @@ class BuildOrchestrator:
                         dry_run=dry_run,
                     )
 
-            # Fallback to local UM if cloud not configured or failed
             if oz_run_id:
-                launched = True
+                # Cloud build — no local spec needed
                 job_id = f"oz-{oz_run_id[:12]}"
+                job = BuildJob(
+                    idea_id=idea["id"],
+                    title=idea["title"],
+                    spec_path="",
+                    queue_job_id=job_id,
+                    status="queued",
+                    queued_at=queued_at,
+                )
+                self.state_db.record_build_job(job)
+                jobs.append(job)
             else:
-                launched = submit_to_um(idea, dry_run=dry_run)
+                # Local build: generate spec → Tyrest review → queue YCE
+                try:
+                    output_dir = Path(__file__).parent.parent / "data" / "specs"
+                    spec_path = self.spec_generator.generate_spec(idea, output_dir)
 
-            status = "queued" if launched else "failed"
-            job = BuildJob(
-                idea_id=idea["id"],
-                title=idea["title"],
-                spec_path="",  # UM generates its own spec
-                queue_job_id=job_id,
-                status=status,
-                queued_at=queued_at,
-            )
-            self.state_db.record_build_job(job)
-            jobs.append(job)
+                    # Tyrest pre-build review (Gate 2.5)
+                    if self.tyrest_gate is not None:
+                        spec_text = spec_path.read_text(encoding="utf-8")
+                        tyrest_result = self.tyrest_gate.review_spec(spec_text, idea_title=idea["title"])
+
+                        if tyrest_result.rejected:
+                            logger.info(
+                                "Tyrest REJECTED spec for %s: %s",
+                                idea["title"], tyrest_result.reasoning,
+                            )
+                            job = BuildJob(
+                                idea_id=idea["id"],
+                                title=idea["title"],
+                                spec_path=str(spec_path),
+                                queue_job_id=job_id,
+                                status="failed",
+                                queued_at=queued_at,
+                            )
+                            self.state_db.record_build_job(job)
+                            jobs.append(job)
+                            self.audit_logger.log_decision(
+                                gate="build",
+                                action="tyrest_rejected",
+                                details={
+                                    "idea_id": idea["id"],
+                                    "title": idea["title"],
+                                    "reasoning": tyrest_result.reasoning,
+                                    "overall": tyrest_result.overall,
+                                    "risk_flags": tyrest_result.risk_flags,
+                                },
+                            )
+                            if not dry_run and item.id:
+                                state_db.update_item_status(item.id, "failed", "completed_at")
+                            continue
+
+                        self.audit_logger.log_decision(
+                            gate="build",
+                            action="tyrest_approved",
+                            details={
+                                "idea_id": idea["id"],
+                                "verdict": tyrest_result.verdict,
+                                "overall": tyrest_result.overall,
+                            },
+                        )
+
+                    # Queue build via YCE queue_runner
+                    job = self.queue_build(idea, spec_path, dry_run=dry_run)
+                    if job:
+                        jobs.append(job)
+                        if job.status == "queued":
+                            queued_jobs.append(job)
+
+                except Exception as e:
+                    error_msg = f"Failed to process idea {idea.get('id')}: {str(e)}"
+                    logger.error(error_msg)
+                    self.audit_logger.log_error(gate="build", error=error_msg)
+                    job = BuildJob(
+                        idea_id=idea.get("id", 0),
+                        title=idea.get("title", "Unknown"),
+                        spec_path="",
+                        queue_job_id=job_id,
+                        status="failed",
+                        queued_at=queued_at,
+                    )
+                    self.state_db.record_build_job(job)
+                    jobs.append(job)
 
             self.audit_logger.log_decision(
                 gate="build",
-                action="submit_to_um",
+                action="dispatch",
                 details={
                     "idea_id": idea["id"],
                     "job_id": job_id,
                     "title": idea["title"],
-                    "status": status,
-                    "route": "ultra-magnus",
+                    "status": jobs[-1].status if jobs else "unknown",
+                    "route": "oz-cloud" if oz_run_id else "yce-local",
                 },
             )
 
             # Mark as dispatched in priority queue
             if not dry_run and item.id:
-                dispatch_status = "dispatched" if launched else "failed"
-                timestamp_col = "dispatched_at" if launched else "completed_at"
+                last_status = jobs[-1].status if jobs else "failed"
+                dispatch_status = "dispatched" if last_status == "queued" else "failed"
+                timestamp_col = "dispatched_at" if dispatch_status == "dispatched" else "completed_at"
                 state_db.update_item_status(item.id, dispatch_status, timestamp_col)
 
         if not jobs:
             print("No pending items in priority queue")
+
+        # Start YCE queue runner if any jobs were queued
+        if not dry_run and queued_jobs:
+            self.start_queue_background(dry_run=dry_run)
 
         return jobs

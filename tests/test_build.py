@@ -880,14 +880,23 @@ class TestBuildOrchestrator:
         mock_state_db.get_next_pending = Mock(side_effect=mock_items + [None])
         mock_state_db.update_item_status = Mock()
 
-        with patch('gates.build.submit_to_um', return_value=True) as mock_submit:
+        # Mock spec generation and queue_build
+        mock_spec_path = Mock()
+        mock_spec_path.read_text.return_value = "test spec"
+        mock_spec_path.resolve.return_value = mock_spec_path
+        mock_spec_generator.generate_spec = Mock(return_value=mock_spec_path)
+
+        with patch.object(orch, 'queue_build') as mock_queue, \
+             patch.object(orch, 'start_queue_background'):
+            mock_queue.return_value = BuildJob(
+                idea_id=10, title="Idea A", spec_path="",
+                queue_job_id="metroplex-ideaforge-10", status="queued",
+                queued_at=datetime.now(),
+            )
             jobs = orch.run_from_queue(mock_state_db, dry_run=False)
 
-            # Should have dispatched 2 items (per-cycle cap)
             assert len(jobs) == 2
-            assert mock_submit.call_count == 2
-            assert jobs[0].title == "Idea A"
-            assert jobs[1].title == "Idea B"
+            assert mock_queue.call_count == 2
 
     def test_run_from_queue_empty_queue_prints_message(self, mock_state_db, mock_spec_generator, mock_audit_logger, capsys):
         """Test run_from_queue prints message when queue is empty."""
@@ -904,12 +913,11 @@ class TestBuildOrchestrator:
         # Empty queue
         mock_state_db.get_next_pending = Mock(return_value=None)
 
-        with patch('gates.build.submit_to_um', return_value=True):
-            jobs = orch.run_from_queue(mock_state_db, dry_run=False)
+        jobs = orch.run_from_queue(mock_state_db, dry_run=False)
 
-            assert jobs == []
-            captured = capsys.readouterr()
-            assert "No pending items" in captured.out
+        assert jobs == []
+        captured = capsys.readouterr()
+        assert "No pending items" in captured.out
 
     def test_is_runner_active_no_pid_file(self, orchestrator):
         """Test is_runner_active returns False when PID file doesn't exist."""
