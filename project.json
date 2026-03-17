@@ -1,0 +1,100 @@
+{
+  "schema_version": "1.0.0",
+  "name": "metroplex",
+  "display_name": "Metroplex",
+  "status": "active",
+  "purpose": "L5 autonomy orchestrator for the ST Metro ecosystem. Runs a 6-gate pipeline (Triage, Build, Patch, Publish, Review, Tyrest) to autonomously evaluate ideas, generate software via YCE, apply persona patches, and publish to GitHub.",
+  "owner": "matthew",
+  "repo": {
+    "org": "m2ai-ultra-magnus-IF",
+    "name": "metroplex",
+    "default_branch": "main",
+    "visibility": "private"
+  },
+  "local_path": "/home/apexaipc/projects/metroplex",
+  "tech_stack": {
+    "languages": [
+      "python"
+    ],
+    "frameworks": [
+      "pydantic",
+      "jinja2",
+      "anthropic-sdk",
+      "oz-agent-sdk",
+      "arcadepy"
+    ],
+    "databases": [
+      "sqlite"
+    ],
+    "runtime": "python-3.12"
+  },
+  "dependencies": [
+    {
+      "project": "ideaforge",
+      "relationship": "consumes",
+      "description": "Reads scored ideas from IdeaForge DB for triage gate."
+    },
+    {
+      "project": "st-factory",
+      "relationship": "consumes",
+      "description": "Reads persona metrics for patch gate."
+    },
+    {
+      "project": "yce-harness",
+      "relationship": "orchestrates",
+      "description": "Dispatches build jobs to YCE via subprocess. Future A2A Tier 1 target."
+    },
+    {
+      "project": "claudeclaw",
+      "relationship": "orchestrates",
+      "description": "Dispatches tasks to Data via SQLite INSERT. Future A2A Tier 1 target."
+    }
+  ],
+  "health": {
+    "score": 95,
+    "factors": {
+      "recency": 100,
+      "build_pass": 95,
+      "test_coverage": 90,
+      "dependency_freshness": 90
+    },
+    "last_computed": "2026-03-17T04:52:10.313193+00:00"
+  },
+  "activity": {
+    "last_commit": "2026-03-13T14:28:03-05:00",
+    "last_build": {
+      "date": "2026-03-16T00:00:00-05:00",
+      "passed": true,
+      "test_count": 452,
+      "coverage_pct": 0
+    },
+    "commits_30d": 16,
+    "stale_threshold_days": 14
+  },
+  "nudge": {
+    "last_nudge": null,
+    "suppressed_until": null,
+    "history": []
+  },
+  "extensions": {
+    "pipeline": {
+      "stages": [
+        "triage",
+        "build",
+        "patch",
+        "publish",
+        "review",
+        "tyrest"
+      ],
+      "current_stage": null,
+      "builds_total": 0,
+      "builds_passed": 0,
+      "last_failure_reason": null
+    },
+    "service": {
+      "process_manager": "systemd",
+      "endpoints": [],
+      "host": "probook"
+    }
+  }
+}
