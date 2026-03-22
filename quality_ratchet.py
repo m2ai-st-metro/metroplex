@@ -11,6 +11,7 @@ Stores threshold state in metroplex.db via a simple key-value table.
 """
 import logging
 from datetime import datetime
+from statistics import median
 
 from db import StateDB
 
@@ -20,6 +21,10 @@ ADVISORY_THRESHOLD = 15
 MIN_RECORDS_TO_ACTIVATE = 30
 # Minimum gap between published avg and threshold to justify tightening
 MIN_HEADROOM = 5.0
+
+# Test coverage ratchet constants
+TEST_RATCHET_MIN_BUILDS = 10
+TEST_RATCHET_HARD_CAP = 0.5
 
 
 def get_quality_threshold(state_db: StateDB) -> float | None:
@@ -196,4 +201,127 @@ def evaluate_ratchet(state_db: StateDB) -> dict:
     result["current_threshold"] = proposed
 
     logger.info("Quality ratchet: %s", result["reason"])
+    return result
+
+
+# --- Test Coverage Ratchet (Phase D2) ---
+
+
+def get_test_coverage_threshold(state_db: StateDB) -> float:
+    """Read the current test coverage threshold from the DB.
+
+    Returns:
+        Current threshold value, or 0.0 if not yet set.
+    """
+    state_db.connect()
+    cursor = state_db.conn.cursor()
+
+    # Ensure the ratchet_state table exists
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS ratchet_state (
+            key TEXT PRIMARY KEY,
+            value REAL NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+    """)
+    state_db.conn.commit()
+
+    cursor.execute("SELECT value FROM ratchet_state WHERE key = 'test_coverage_threshold'")
+    row = cursor.fetchone()
+    return row["value"] if row else 0.0
+
+
+def set_test_coverage_threshold(state_db: StateDB, threshold: float) -> None:
+    """Write the test coverage threshold to the DB."""
+    state_db.connect()
+    cursor = state_db.conn.cursor()
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS ratchet_state (
+            key TEXT PRIMARY KEY,
+            value REAL NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+    """)
+
+    cursor.execute("""
+        INSERT OR REPLACE INTO ratchet_state (key, value, updated_at)
+        VALUES ('test_coverage_threshold', ?, ?)
+    """, (threshold, datetime.now().isoformat()))
+    state_db.conn.commit()
+
+
+def evaluate_test_ratchet(state_db: StateDB) -> dict:
+    """Evaluate whether the test coverage threshold should be tightened.
+
+    Returns a dict with:
+        - activated (bool): whether the ratchet ran (requires 10+ published builds)
+        - current_threshold (float): current threshold
+        - proposed_threshold (float | None): new threshold if tightening
+        - tightened (bool): whether threshold was actually changed
+        - reason (str): explanation
+        - stats (dict): test ratio statistics
+    """
+    result = {
+        "activated": False,
+        "current_threshold": 0.0,
+        "proposed_threshold": None,
+        "tightened": False,
+        "reason": "",
+        "stats": {},
+    }
+
+    current = get_test_coverage_threshold(state_db)
+    result["current_threshold"] = current
+
+    # Get published test ratios
+    ratios = state_db.get_published_test_ratios()
+    result["stats"]["published_count"] = len(ratios)
+
+    if len(ratios) < TEST_RATCHET_MIN_BUILDS:
+        result["reason"] = (
+            f"Insufficient data: {len(ratios)}/{TEST_RATCHET_MIN_BUILDS} "
+            f"published builds with test_ratio"
+        )
+        return result
+
+    result["activated"] = True
+
+    med = round(median(ratios), 4)
+    result["stats"]["median_test_ratio"] = med
+
+    # Proposed = half the median (gives headroom)
+    proposed = round(med * 0.5, 4)
+
+    # Hard cap
+    if proposed > TEST_RATCHET_HARD_CAP:
+        proposed = TEST_RATCHET_HARD_CAP
+
+    result["proposed_threshold"] = proposed
+
+    # Ratchet constraint: only tighten (never loosen)
+    if proposed <= current:
+        result["reason"] = (
+            f"Proposed {proposed} <= current {current} — ratchet prevents loosening"
+        )
+        return result
+
+    # Verify median is > 2x current threshold before tightening
+    if med <= 2 * current and current > 0:
+        result["reason"] = (
+            f"Median {med} not > 2x current {current} — insufficient headroom"
+        )
+        return result
+
+    # Apply the tightening
+    if current == 0.0:
+        result["reason"] = f"Initial test coverage threshold set to {proposed}"
+    else:
+        result["reason"] = f"Tightened from {current} to {proposed}"
+
+    set_test_coverage_threshold(state_db, proposed)
+    result["tightened"] = True
+    result["current_threshold"] = proposed
+
+    logger.info("Test coverage ratchet: %s", result["reason"])
     return result

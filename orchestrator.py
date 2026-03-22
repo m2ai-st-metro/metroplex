@@ -28,7 +28,7 @@ from readers.skylynx_reader import SkyLynxReader
 from readers.linear_reader import LinearReader
 from outcome_emitter import OutcomeEmitter
 from gates.quality_scorer import score_project
-from quality_ratchet import evaluate_ratchet
+from quality_ratchet import evaluate_ratchet, evaluate_test_ratchet
 from postmortem import capture_postmortem, get_failure_patterns
 from feasibility_scorer import resolve_prediction, adjust_feature_weights
 from readers.ideaforge_writer import IdeaForgeWriter
@@ -1028,6 +1028,23 @@ class CycleOrchestrator:
                 )
         except Exception as e:
             self.audit_logger.log_error("quality_ratchet", f"Ratchet evaluation failed: {e}")
+
+        # Test coverage ratchet evaluation (Phase D2)
+        try:
+            test_ratchet_result = evaluate_test_ratchet(self.state_db)
+            if test_ratchet_result["activated"]:
+                if test_ratchet_result["tightened"]:
+                    print(f"+ Test coverage ratchet: {test_ratchet_result['reason']}")
+                    self.notifier.notify(
+                        f"Test coverage ratchet tightened: {test_ratchet_result['reason']}",
+                    )
+                self.audit_logger.log_decision(
+                    gate="test_coverage_ratchet",
+                    action="tightened" if test_ratchet_result["tightened"] else "unchanged",
+                    details=test_ratchet_result,
+                )
+        except Exception as e:
+            self.audit_logger.log_error("test_coverage_ratchet", f"Test ratchet evaluation failed: {e}")
 
         # Gate 4: Publish (push completed builds to GitHub)
         publish_count = 0

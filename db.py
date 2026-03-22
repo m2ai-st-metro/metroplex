@@ -252,6 +252,13 @@ class StateDB:
         if "feasibility_score" not in bj_columns_b2:
             cursor.execute("ALTER TABLE build_jobs ADD COLUMN feasibility_score REAL DEFAULT NULL")
 
+        # Migrate: add test_ratio to build_jobs (L5 D2 — test coverage enforcement)
+        if "test_ratio" not in bj_columns_b2:
+            try:
+                cursor.execute("ALTER TABLE build_jobs ADD COLUMN test_ratio REAL DEFAULT NULL")
+            except sqlite3.OperationalError:
+                pass  # Column already exists
+
         # Create indexes
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_triage_decisions_idea ON triage_decisions(idea_id)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_triage_decisions_decision ON triage_decisions(decision)")
@@ -1212,3 +1219,31 @@ class StateDB:
         )
         self.conn.commit()
         return cursor.rowcount > 0
+
+    def update_build_test_ratio(self, queue_job_id: str, ratio: float) -> bool:
+        """Set test_ratio on a build job (Phase D2 — test coverage enforcement)."""
+        self.connect()
+        cursor = self.conn.cursor()
+        cursor.execute(
+            "UPDATE build_jobs SET test_ratio = ? WHERE queue_job_id = ?",
+            (ratio, queue_job_id),
+        )
+        self.conn.commit()
+        return cursor.rowcount > 0
+
+    def get_published_test_ratios(self) -> list[float]:
+        """Get test_ratios for all published builds (deduped by queue_job_id).
+
+        Joins build_jobs with publish_jobs to find published builds that have
+        a non-null test_ratio.
+        """
+        self.connect()
+        cursor = self.conn.cursor()
+        cursor.execute("""
+            SELECT b.test_ratio
+            FROM build_jobs b
+            JOIN publish_jobs p ON p.build_job_id = b.queue_job_id AND p.status = 'published'
+            WHERE b.test_ratio IS NOT NULL
+            AND b.id IN (SELECT MAX(id) FROM build_jobs GROUP BY queue_job_id)
+        """)
+        return [row[0] for row in cursor.fetchall()]

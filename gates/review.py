@@ -4,7 +4,6 @@ Automated quality checks on completed builds before they can be published.
 Lightweight file-system checks — no LLM calls.
 """
 import logging
-import os
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -12,6 +11,7 @@ from pathlib import Path
 from config import Config
 from db import StateDB
 from audit import AuditLogger
+from quality_ratchet import get_test_coverage_threshold
 
 logger = logging.getLogger(__name__)
 
@@ -107,8 +107,15 @@ class ReviewGate:
                     )
                 continue
 
-            passed, failed = self._run_checks(Path(project_dir))
+            project_path = Path(project_dir)
+            passed, failed = self._run_checks(project_path)
             verdict = "pass" if not failed else "fail"
+
+            # Compute and store test_ratio for ratchet tracking (Phase D2)
+            files = list(self._walk_project_files(project_path))
+            _, test_ratio, _, _ = self._check_test_coverage(project_path, files)
+            if not dry_run:
+                self.state_db.update_build_test_ratio(queue_job_id, test_ratio)
 
             result = ReviewResult(
                 queue_job_id=queue_job_id,
@@ -214,7 +221,67 @@ class ReviewGate:
         else:
             failed.append(f"file_count_excessive({file_count})")
 
+        # 7. Has adequate tests (Phase D2 — test coverage enforcement)
+        test_ok, test_ratio, test_count, non_test_count = self._check_test_coverage(
+            project_dir, files
+        )
+        if test_ok:
+            passed.append(f"has_adequate_tests(ratio={test_ratio:.2f},tests={test_count})")
+        else:
+            threshold = get_test_coverage_threshold(self.state_db)
+            failed.append(
+                f"has_adequate_tests(ratio={test_ratio:.2f}<{threshold:.2f},"
+                f"tests={test_count},src={non_test_count})"
+            )
+
         return passed, failed
+
+    def _is_test_file(self, path: Path, project_root: Path) -> bool:
+        """Check if a file is a test file based on naming patterns.
+
+        Matches quality_scorer._is_test_file logic for consistency.
+        """
+        name = path.name.lower()
+        if any(p in name for p in ("test_", "_test.", ".test.", ".spec.")):
+            return True
+        try:
+            rel_parts = path.relative_to(project_root).parts
+            return any(p in ("tests", "test", "__tests__") for p in rel_parts[:-1])
+        except ValueError:
+            pass
+        return False
+
+    def _check_test_coverage(
+        self, project_dir: Path, files: list[Path]
+    ) -> tuple[bool, float, int, int]:
+        """Check test file coverage against dynamic threshold.
+
+        Returns:
+            (passed, test_ratio, test_count, non_test_count)
+        """
+        source_files = [f for f in files if f.suffix in CODE_EXTENSIONS]
+        test_files = [f for f in source_files if self._is_test_file(f, project_dir)]
+        non_test_files = [f for f in source_files if not self._is_test_file(f, project_dir)]
+
+        test_count = len(test_files)
+        non_test_count = len(non_test_files)
+
+        # Exemption: fewer than 3 non-test source files
+        if non_test_count < 3:
+            return True, 0.0, test_count, non_test_count
+
+        # Compute ratio
+        test_ratio = test_count / non_test_count if non_test_count > 0 else 0.0
+
+        # Hard floor: at least 1 test file
+        if test_count < 1:
+            return False, test_ratio, test_count, non_test_count
+
+        # Dynamic threshold from ratchet
+        threshold = get_test_coverage_threshold(self.state_db)
+
+        passed = test_ratio >= threshold
+        return passed, test_ratio, test_count, non_test_count
 
     def _has_readme(self, project_dir: Path) -> bool:
         """Check if project has a README file."""

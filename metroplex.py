@@ -27,6 +27,7 @@ from readers.skylynx_reader import SkyLynxReader
 from readers.stfactory_reader import STFactoryReader
 from dispatcher import create_dispatcher, route_to_worker, build_dispatch_prompt
 from outcome_emitter import create_outcome_emitter
+from dashboard import compute_funnel_metrics, format_funnel_output
 
 
 def setup_logging(verbose: bool):
@@ -1191,6 +1192,34 @@ def cmd_quality_digest(args, config: Config):
         state_db.close()
 
 
+def cmd_funnel(args, config: Config):
+    """Show pipeline funnel conversion metrics.
+
+    Args:
+        args: Parsed command-line arguments
+        config: Metroplex configuration
+
+    Returns:
+        Exit code (0=success, 1=error)
+    """
+    try:
+        metroplex_db = str(Path("data/metroplex.db").resolve())
+        ideaforge_db = config.ideaforge_db
+
+        metrics = compute_funnel_metrics(
+            metroplex_db_path=metroplex_db,
+            ideaforge_db_path=ideaforge_db,
+            days=args.days,
+        )
+
+        output = format_funnel_output(metrics, as_json=args.json)
+        print(output)
+        return 0
+    except Exception as e:
+        print(f"ERROR: {e}")
+        return 1
+
+
 def main():
     """Main CLI entry point."""
     parser = argparse.ArgumentParser(
@@ -1262,6 +1291,11 @@ def main():
     # quality-digest command
     digest_parser = subparsers.add_parser("quality-digest", help="Print quality digest for daily reports (Phase 14d)")
 
+    # funnel command
+    funnel_parser = subparsers.add_parser("funnel", help="Show pipeline funnel conversion metrics (Phase D1)")
+    funnel_parser.add_argument("--days", type=int, default=7, help="Lookback window in days (default: 7, max: 90)")
+    funnel_parser.add_argument("--json", action="store_true", help="Output raw JSON instead of formatted table")
+
     # postmortems command
     postmortems_parser = subparsers.add_parser("postmortems", help="Show build failure post-mortem summary")
 
@@ -1317,6 +1351,8 @@ def main():
         sys.exit(cmd_score_builds(args, config))
     elif args.command == "quality-digest":
         sys.exit(cmd_quality_digest(args, config))
+    elif args.command == "funnel":
+        sys.exit(cmd_funnel(args, config))
     else:
         parser.print_help()
         sys.exit(1)
