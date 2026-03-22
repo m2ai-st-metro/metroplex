@@ -1,6 +1,6 @@
 """
 LLM Spec Expander - Gate 2 Enhancement
-Calls Claude to expand thin IdeaForge idea data into rich, idea-specific app specs.
+Calls Claude (via DeepInfra) to expand thin IdeaForge idea data into rich, idea-specific app specs.
 Falls back to Jinja2 template rendering on failure.
 """
 import os
@@ -8,7 +8,7 @@ import logging
 from pathlib import Path
 from typing import Optional
 
-import anthropic
+from openai import OpenAI
 
 logger = logging.getLogger(__name__)
 
@@ -95,11 +95,11 @@ IMPORTANT RULES:
 
 
 class LLMSpecExpander:
-    """Expands thin idea data into rich app specs using Claude."""
+    """Expands thin idea data into rich app specs using Claude via DeepInfra."""
 
     def __init__(
         self,
-        model: str = "claude-sonnet-4-20250514",
+        model: str = "anthropic/claude-4-sonnet",
         max_tokens: int = 8192,
         api_key: Optional[str] = None,
         state_db=None,
@@ -108,22 +108,25 @@ class LLMSpecExpander:
         Initialize LLM Spec Expander.
 
         Args:
-            model: Claude model to use for expansion
+            model: Model to use for expansion (DeepInfra model ID)
             max_tokens: Maximum tokens in the response
-            api_key: Anthropic API key (falls back to ANTHROPIC_API_KEY env var)
+            api_key: DeepInfra API key (falls back to DEEPINFRA_API_KEY env var)
         """
         self.model = model
         self.max_tokens = max_tokens
         self.state_db = state_db
 
         # Resolve API key
-        resolved_key = api_key or os.environ.get("ANTHROPIC_API_KEY")
+        resolved_key = api_key or os.environ.get("DEEPINFRA_API_KEY")
         if not resolved_key:
             raise ValueError(
-                "ANTHROPIC_API_KEY not set. Provide api_key or set the environment variable."
+                "DEEPINFRA_API_KEY not set. Provide api_key or set the environment variable."
             )
 
-        self.client = anthropic.Anthropic(api_key=resolved_key)
+        self.client = OpenAI(
+            api_key=resolved_key,
+            base_url="https://api.deepinfra.com/v1/openai",
+        )
 
     def expand(self, idea: dict) -> str:
         """
@@ -137,7 +140,7 @@ class LLMSpecExpander:
             Markdown string containing the full app specification.
 
         Raises:
-            anthropic.APIError: On API failure (caller should handle fallback)
+            openai.APIError: On API failure (caller should handle fallback)
         """
         prompt = SPEC_EXPANSION_PROMPT.format(
             title=idea.get("title", "Untitled"),
@@ -157,20 +160,17 @@ class LLMSpecExpander:
             self.model,
         )
 
-        message = self.client.messages.create(
+        response = self.client.chat.completions.create(
             model=self.model,
             max_tokens=self.max_tokens,
             messages=[{"role": "user", "content": prompt}],
         )
 
         # Extract text from response
-        spec_text = ""
-        for block in message.content:
-            if block.type == "text":
-                spec_text += block.text
+        spec_text = response.choices[0].message.content or ""
 
-        input_tokens = message.usage.input_tokens
-        output_tokens = message.usage.output_tokens
+        input_tokens = response.usage.prompt_tokens
+        output_tokens = response.usage.completion_tokens
 
         logger.info(
             "Spec expansion complete: %d chars, %d input tokens, %d output tokens",

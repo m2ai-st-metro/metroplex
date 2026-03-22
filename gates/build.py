@@ -20,6 +20,7 @@ from db import StateDB
 from audit import AuditLogger
 from gates.llm_expander import LLMSpecExpander
 from oz_bridge import submit_to_oz
+from readers.ideaforge_reader import IdeaForgeReader
 
 logger = logging.getLogger(__name__)
 
@@ -179,7 +180,7 @@ class SpecGenerator:
 class BuildOrchestrator:
     """Gate 2: Build Orchestration - Queue Runner Integration."""
 
-    def __init__(self, config: Config, state_db: StateDB, spec_generator: SpecGenerator, audit_logger: AuditLogger, tyrest_gate=None):
+    def __init__(self, config: Config, state_db: StateDB, spec_generator: SpecGenerator, audit_logger: AuditLogger, tyrest_gate=None, ideaforge_reader: Optional[IdeaForgeReader] = None):
         """
         Initialize Build Orchestrator.
 
@@ -189,12 +190,14 @@ class BuildOrchestrator:
             spec_generator: Spec generator instance
             audit_logger: Audit logger for tracking decisions
             tyrest_gate: Optional TyrestGate for pre-build spec review
+            ideaforge_reader: Optional IdeaForgeReader for refreshing stale snapshot data
         """
         self.config = config
         self.state_db = state_db
         self.spec_generator = spec_generator
         self.audit_logger = audit_logger
         self.tyrest_gate = tyrest_gate
+        self.ideaforge_reader = ideaforge_reader
         self.queue_runner_path = Path(config.yce_dir) / "queue_runner.py"
         self.yce_python = Path(config.yce_dir) / "venv" / "bin" / "python"
 
@@ -519,17 +522,25 @@ class BuildOrchestrator:
                 try:
                     if self.state_db.update_build_job_status(job_id, "completed"):
                         result["newly_synced"].append(job_id)
+                        # Backfill project_dir from runner data
+                        project_dir = job_data.get("project_dir")
+                        if project_dir:
+                            self.state_db.update_build_job_project_dir(job_id, project_dir)
                 except Exception as e:
                     self.audit_logger.log_error(
                         gate="build",
                         error=f"Failed to sync completed status for {job_id}: {e}",
                         details={"job_id": job_id}
                     )
-            elif job_status == "failed":
+            elif job_status in ("failed", "interrupted"):
                 result["failed"].append(job_id)
                 try:
                     if self.state_db.update_build_job_status(job_id, "failed"):
                         result["newly_synced"].append(job_id)
+                        # Backfill project_dir even for failed/interrupted builds
+                        project_dir = job_data.get("project_dir")
+                        if project_dir:
+                            self.state_db.update_build_job_project_dir(job_id, project_dir)
                 except Exception as e:
                     self.audit_logger.log_error(
                         gate="build",
@@ -621,6 +632,17 @@ class BuildOrchestrator:
             if item is None:
                 break
 
+            # Skip if a completed build already exists or retries are exhausted
+            existing_job_id = f"metroplex-{item.source}-{item.source_id}"
+            if state_db.has_completed_build(existing_job_id):
+                state_db.update_item_status(item.id, "completed")
+                logger.info("Skipping %s — completed build already exists", existing_job_id)
+                continue
+            if state_db.has_exhausted_retries(existing_job_id):
+                state_db.update_item_status(item.id, "failed")
+                logger.info("Skipping %s — retries exhausted", existing_job_id)
+                continue
+
             # Parse idea data
             try:
                 idea = json.loads(item.idea_data)
@@ -635,9 +657,84 @@ class BuildOrchestrator:
                 }
             idea["_source"] = item.source
 
+            # Refresh fields that may be stale in the priority queue snapshot.
+            # The triage gate snapshots idea_data at enqueue time, but fields
+            # like artifact_type may be populated by a later classification step.
+            if idea.get("artifact_type") is None and self.ideaforge_reader and item.source == "ideaforge":
+                try:
+                    fresh = self.ideaforge_reader.get_idea_by_id(int(item.source_id))
+                    if fresh:
+                        for field in ("artifact_type", "problem_statement", "target_audience"):
+                            if fresh.get(field) and not idea.get(field):
+                                idea[field] = fresh[field]
+                        logger.info(
+                            "Refreshed stale snapshot for idea %s: artifact_type=%s",
+                            item.source_id, idea.get("artifact_type"),
+                        )
+                except Exception as e:
+                    logger.warning("Failed to refresh idea %s from IdeaForge: %s", item.source_id, e)
+
             source = idea.get("_source", "ideaforge")
             job_id = f"metroplex-{source}-{idea['id']}"
             queued_at = datetime.now()
+
+            # Pre-build feasibility check (L5 B2)
+            try:
+                from feasibility_scorer import (
+                    score_feasibility,
+                    record_prediction,
+                    get_reject_threshold,
+                )
+                feasibility = score_feasibility(idea, state_db)
+                feas_score = feasibility["score"]
+                reject_thresh = get_reject_threshold(state_db)
+
+                logger.info(
+                    "Feasibility score for %s: %.1f (threshold=%d, learned=%s)",
+                    idea.get("title", "?"), feas_score, reject_thresh, feasibility["learned_active"],
+                )
+
+                # Store feasibility score on the build job (set after job creation below)
+                idea["_feasibility_score"] = feas_score
+
+                if feas_score < reject_thresh:
+                    logger.info(
+                        "Feasibility REJECT for %s: score %.1f < threshold %d",
+                        idea.get("title", "?"), feas_score, reject_thresh,
+                    )
+                    self.audit_logger.log_decision(
+                        gate="build",
+                        action="feasibility_rejected",
+                        details={
+                            "idea_id": idea["id"],
+                            "title": idea.get("title"),
+                            "feasibility_score": feas_score,
+                            "threshold": reject_thresh,
+                            "breakdown": feasibility["breakdown"],
+                        },
+                    )
+                    record_prediction(
+                        state_db, job_id, feas_score,
+                        feasibility["predicted_outcome"],
+                        feasibility["feature_weights"],
+                    )
+                    if not dry_run and item.id:
+                        state_db.update_item_status(item.id, "failed", "completed_at")
+                    continue
+                elif feas_score < 40:
+                    logger.warning(
+                        "Feasibility WARNING for %s: score %.1f is low (25-40 range)",
+                        idea.get("title", "?"), feas_score,
+                    )
+
+                # Record prediction for later accuracy tracking
+                record_prediction(
+                    state_db, job_id, feas_score,
+                    feasibility["predicted_outcome"],
+                    feasibility["feature_weights"],
+                )
+            except Exception as e:
+                logger.warning("Feasibility scoring failed for %s, proceeding: %s", idea.get("title", "?"), e)
 
             # Route to Oz cloud if configured and local slot busy
             build_target = self.config.build_target
@@ -657,7 +754,7 @@ class BuildOrchestrator:
 
             if oz_run_id:
                 # Cloud build — no local spec needed
-                job_id = f"oz-{oz_run_id[:12]}"
+                job_id = f"oz-{oz_run_id}"
                 job = BuildJob(
                     idea_id=idea["id"],
                     title=idea["title"],
@@ -722,6 +819,18 @@ class BuildOrchestrator:
                     # Queue build via YCE queue_runner
                     job = self.queue_build(idea, spec_path, dry_run=dry_run)
                     if job:
+                        # Store feasibility score on the build job (L5 B2)
+                        feas = idea.get("_feasibility_score")
+                        if feas is not None and not dry_run:
+                            try:
+                                state_db.connect()
+                                state_db.conn.execute(
+                                    "UPDATE build_jobs SET feasibility_score = ? WHERE queue_job_id = ?",
+                                    (feas, job.queue_job_id),
+                                )
+                                state_db.conn.commit()
+                            except Exception as e:
+                                logger.warning("Failed to store feasibility score: %s", e)
                         jobs.append(job)
                         if job.status == "queued":
                             queued_jobs.append(job)

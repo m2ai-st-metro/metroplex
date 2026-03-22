@@ -81,8 +81,9 @@ class IdeaForgeReader:
                 signal_count,
                 status
             FROM ideas
-            WHERE status IN ('scored', 'classified')
+            WHERE status = 'classified'
                 AND weighted_score IS NOT NULL
+                AND artifact_type IS NOT NULL
                 AND (claimed_by IS NULL OR claimed_by = '')
             ORDER BY weighted_score DESC
         """)

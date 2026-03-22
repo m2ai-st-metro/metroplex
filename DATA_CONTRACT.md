@@ -65,6 +65,8 @@ One row per build job queued by Gate 2.
 | `review_status` | TEXT | nullable | `reviewed` (passed Gate 4.5) or `review_failed` |
 | `retry_count` | INTEGER | DEFAULT 0 | Number of automatic retries attempted |
 | `next_retry_at` | TEXT | nullable | ISO 8601 datetime for next retry (exponential backoff) |
+| `quality_score` | REAL | nullable | Structural quality score (0-100) from Phase 14b scorer |
+| `estimated_cost` | REAL | nullable | Estimated API cost in USD |
 
 **Index**: `idx_build_jobs_status` on `status`
 

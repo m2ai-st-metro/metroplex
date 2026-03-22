@@ -65,20 +65,22 @@ def output_dir():
         shutil.rmtree(temp_dir)
 
 
-def _mock_claude_response(text: str) -> Mock:
-    """Create a mock Anthropic message response."""
-    block = Mock()
-    block.type = "text"
-    block.text = text
+def _mock_openai_response(text: str) -> Mock:
+    """Create a mock OpenAI chat completion response."""
+    message = Mock()
+    message.content = text
+
+    choice = Mock()
+    choice.message = message
 
     usage = Mock()
-    usage.input_tokens = 500
-    usage.output_tokens = 2000
+    usage.prompt_tokens = 500
+    usage.completion_tokens = 2000
 
-    message = Mock()
-    message.content = [block]
-    message.usage = usage
-    return message
+    response = Mock()
+    response.choices = [choice]
+    response.usage = usage
+    return response
 
 
 class TestLLMSpecExpander:
@@ -86,55 +88,55 @@ class TestLLMSpecExpander:
 
     def test_init_with_api_key(self):
         """Test initialization with explicit API key."""
-        with patch("gates.llm_expander.anthropic.Anthropic"):
+        with patch("gates.llm_expander.OpenAI"):
             expander = LLMSpecExpander(api_key="test-key-123")
-            assert expander.model == "claude-sonnet-4-20250514"
+            assert expander.model == "anthropic/claude-4-sonnet"
             assert expander.max_tokens == 8192
 
     def test_init_with_env_key(self):
-        """Test initialization falls back to ANTHROPIC_API_KEY env var."""
-        with patch.dict(os.environ, {"ANTHROPIC_API_KEY": "env-key-456"}):
-            with patch("gates.llm_expander.anthropic.Anthropic"):
+        """Test initialization falls back to DEEPINFRA_API_KEY env var."""
+        with patch.dict(os.environ, {"DEEPINFRA_API_KEY": "env-key-456"}):
+            with patch("gates.llm_expander.OpenAI"):
                 expander = LLMSpecExpander()
                 assert expander.client is not None
 
     def test_init_no_key_raises(self):
         """Test initialization raises ValueError when no API key available."""
         with patch.dict(os.environ, {}, clear=True):
-            # Remove ANTHROPIC_API_KEY if set
+            # Remove DEEPINFRA_API_KEY if set
             env = os.environ.copy()
-            env.pop("ANTHROPIC_API_KEY", None)
+            env.pop("DEEPINFRA_API_KEY", None)
             with patch.dict(os.environ, env, clear=True):
-                with pytest.raises(ValueError, match="ANTHROPIC_API_KEY"):
+                with pytest.raises(ValueError, match="DEEPINFRA_API_KEY"):
                     LLMSpecExpander()
 
     def test_init_custom_model(self):
         """Test initialization with custom model."""
-        with patch("gates.llm_expander.anthropic.Anthropic"):
+        with patch("gates.llm_expander.OpenAI"):
             expander = LLMSpecExpander(
-                model="claude-3-5-haiku-20241022",
+                model="meta-llama/Llama-3.3-70B-Instruct",
                 max_tokens=4096,
                 api_key="test-key",
             )
-            assert expander.model == "claude-3-5-haiku-20241022"
+            assert expander.model == "meta-llama/Llama-3.3-70B-Instruct"
             assert expander.max_tokens == 4096
 
-    def test_expand_calls_claude(self, tool_idea):
-        """Test expand() calls Claude API with correct parameters."""
-        mock_response = _mock_claude_response("# Agent Supply Chain Scanner\n\n## Overview\n...")
+    def test_expand_calls_api(self, tool_idea):
+        """Test expand() calls OpenAI-compatible API with correct parameters."""
+        mock_response = _mock_openai_response("# Agent Supply Chain Scanner\n\n## Overview\n...")
 
-        with patch("gates.llm_expander.anthropic.Anthropic") as MockClient:
+        with patch("gates.llm_expander.OpenAI") as MockClient:
             mock_client = MockClient.return_value
-            mock_client.messages.create.return_value = mock_response
+            mock_client.chat.completions.create.return_value = mock_response
 
             expander = LLMSpecExpander(api_key="test-key")
             result = expander.expand(tool_idea)
 
             # Verify API was called
-            mock_client.messages.create.assert_called_once()
-            call_kwargs = mock_client.messages.create.call_args[1]
+            mock_client.chat.completions.create.assert_called_once()
+            call_kwargs = mock_client.chat.completions.create.call_args[1]
 
-            assert call_kwargs["model"] == "claude-sonnet-4-20250514"
+            assert call_kwargs["model"] == "anthropic/claude-4-sonnet"
             assert call_kwargs["max_tokens"] == 8192
             assert len(call_kwargs["messages"]) == 1
             assert call_kwargs["messages"][0]["role"] == "user"
@@ -146,13 +148,13 @@ class TestLLMSpecExpander:
             assert "AI/ML engineers" in prompt
 
     def test_expand_returns_text(self, tool_idea):
-        """Test expand() returns the text content from Claude's response."""
+        """Test expand() returns the text content from the response."""
         spec_text = "# Agent Supply Chain Scanner - App Specification\n\n## Overview\nA CLI tool..."
-        mock_response = _mock_claude_response(spec_text)
+        mock_response = _mock_openai_response(spec_text)
 
-        with patch("gates.llm_expander.anthropic.Anthropic") as MockClient:
+        with patch("gates.llm_expander.OpenAI") as MockClient:
             mock_client = MockClient.return_value
-            mock_client.messages.create.return_value = mock_response
+            mock_client.chat.completions.create.return_value = mock_response
 
             expander = LLMSpecExpander(api_key="test-key")
             result = expander.expand(tool_idea)
@@ -167,11 +169,11 @@ class TestLLMSpecExpander:
             "description": "A basic tool",
             "artifact_type": "tool",
         }
-        mock_response = _mock_claude_response("# Minimal Tool\n## Overview\n...")
+        mock_response = _mock_openai_response("# Minimal Tool\n## Overview\n...")
 
-        with patch("gates.llm_expander.anthropic.Anthropic") as MockClient:
+        with patch("gates.llm_expander.OpenAI") as MockClient:
             mock_client = MockClient.return_value
-            mock_client.messages.create.return_value = mock_response
+            mock_client.chat.completions.create.return_value = mock_response
 
             expander = LLMSpecExpander(api_key="test-key")
             result = expander.expand(minimal_idea)
@@ -181,11 +183,9 @@ class TestLLMSpecExpander:
 
     def test_expand_propagates_api_error(self, tool_idea):
         """Test expand() propagates API errors for caller to handle."""
-        import anthropic as anthropic_mod
-
-        with patch("gates.llm_expander.anthropic.Anthropic") as MockClient:
+        with patch("gates.llm_expander.OpenAI") as MockClient:
             mock_client = MockClient.return_value
-            mock_client.messages.create.side_effect = Exception("API rate limit exceeded")
+            mock_client.chat.completions.create.side_effect = Exception("API rate limit exceeded")
 
             expander = LLMSpecExpander(api_key="test-key")
 

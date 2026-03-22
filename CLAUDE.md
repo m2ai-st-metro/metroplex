@@ -20,7 +20,7 @@ All API keys sourced from `~/.env.shared` — no separate `.env` needed.
 ```bash
 source venv/bin/activate
 python metroplex.py triage [--dry-run]                          # Gate 1: score & threshold
-python metroplex.py build [--dry-run] [--idea-id N]             # Gate 2: spec + UM dispatch
+python metroplex.py build [--dry-run] [--idea-id N]             # Gate 2: spec + YCE dispatch
 python metroplex.py patch [--dry-run]                           # Gate 3: persona YAML patches
 python metroplex.py publish [--dry-run]                         # Gate 4: GitHub repo push
 ```
@@ -77,7 +77,7 @@ Service unit: `deploy/metroplex.service` — runs `run-all --cycles 0` with `Res
 | Gate | Class | Purpose |
 |------|-------|---------|
 | 1 Triage | `gates/triage.py` | Score IdeaForge ideas against thresholds, approve/reject/defer |
-| 2 Build | `gates/build.py` | Generate spec via LLM, dispatch to UM pipeline via subprocess |
+| 2 Build | `gates/build.py` | Generate spec via LLM, dispatch to YCE Harness |
 | 3 Patch | `gates/patcher.py` | Apply ST Factory persona YAML patches via git clone/commit/push |
 | 4 Publish | `gates/publish.py` | Create GitHub repo in m2ai-portfolio org, push completed builds |
 | 4.5 Review | `gates/review.py` | Automated quality checks before publish (source code, README, no secrets, no large files) |
@@ -88,7 +88,6 @@ Service unit: `deploy/metroplex.service` — runs `run-all --cycles 0` with `Res
 |--------|----|--------|
 | `readers/ideaforge_reader.py` | ideaforge.db | Read + claim (status='classified') |
 | `readers/stfactory_reader.py` | persona_metrics.db | Read + patch status updates |
-| `readers/um_reader.py` | idea-factory.db | Read-only (?mode=ro) |
 | `readers/skylynx_reader.py` | persona_metrics.db | Read-only (recommendations) |
 | `readers/linear_reader.py` | Linear API (Arcade) | Read-only |
 | `readers/academy_reader.py` | File system | Read-only (promotions) |
@@ -101,9 +100,9 @@ All approved/recommended items compete via weighted scores:
 - Linear: weight 2.0
 - Academy: weight 2.0
 
-### UM Bridge (Fire-and-Forget)
+### YCE Dispatch
 
-Build gate spawns detached subprocess (`um_bridge_worker.py`) which runs full UM pipeline and writes results back to IdeaForge. Timeout watchdog kills builds after 90 min (configurable: `METROPLEX_BUILD_TIMEOUT_SECONDS`).
+Build gate generates an app spec via LLM, then dispatches to YCE Harness for autonomous build. Timeout watchdog kills builds after 90 min (configurable: `METROPLEX_BUILD_TIMEOUT_SECONDS`).
 
 ### Auto-Retry (Phase 13f)
 
@@ -128,7 +127,6 @@ Non-buildable items routed to EA-Claude workers via `WORKER_ROUTES` dict. Writes
 | Variable | Default Path |
 |----------|-------------|
 | `METROPLEX_IDEAFORGE_DB` | `~/projects/ideaforge/data/ideaforge.db` |
-| `METROPLEX_UM_DB` | `~/projects/ultra-magnus/idea-factory/data/idea-factory.db` |
 | `METROPLEX_STFACTORY_DB` | `~/projects/st-factory/data/persona_metrics.db` |
 | `METROPLEX_DISPATCH_DB` | `~/projects/claudeclaw/store/claudeclaw.db` |
 
@@ -139,7 +137,7 @@ Non-buildable items routed to EA-Claude workers via `WORKER_ROUTES` dict. Writes
 | `data/decisions.log` | JSON Lines audit trail (every gate action) |
 | `data/metroplex.log` | Python logging output |
 | `data/runner.log` | YCE queue_runner subprocess output |
-| `data/um_bridge_logs/` | Per-build UM bridge logs (timestamped) |
+| `data/build_logs/` | Per-build YCE dispatch logs (timestamped) |
 | `data/specs/` | Generated app spec files |
 
 ## Key Environment Variables
@@ -177,10 +175,10 @@ Non-buildable items routed to EA-Claude workers via `WORKER_ROUTES` dict. Writes
 
 ## Design Decisions
 
-1. **No cross-project imports** — reads upstream SQLite directly, no UM/IdeaForge code imports
-2. **Subprocess isolation** — UM builds and git ops run as subprocesses, never in-process
+1. **No cross-project imports** — reads upstream SQLite directly, no IdeaForge/ST Factory code imports
+2. **Subprocess isolation** — YCE builds and git ops run as subprocesses, never in-process
 3. **Score scaling** — IdeaForge 0-10 scaled to 0-100 for threshold intuition (guard validates range)
-4. **Fire-and-forget builds** — UM bridge subprocess; results polled on next cycle
+4. **Fire-and-forget builds** — YCE dispatch subprocess; results polled on next cycle
 5. **Per-cycle caps** — hard limits prevent runaway autonomy
 6. **Circuit breaker per-gate** — one gate failure doesn't halt others
 

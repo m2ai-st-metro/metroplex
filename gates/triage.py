@@ -91,9 +91,10 @@ class TriageGate:
 
         ideas = self.ideaforge_reader.get_unprocessed_ideas()
 
-        # Filter out ideas that already have ANY triage decision (approve/reject/defer).
-        # This prevents re-triaging the same idea every cycle (loop bug).
-        already_triaged = self.state_db.get_triaged_idea_ids()
+        # Filter out ideas that have a final triage decision (approve/reject).
+        # Deferred ideas are allowed back for re-triage — their score may have
+        # changed since the original deferral (e.g. re-scoring by IdeaForge).
+        already_triaged = self.state_db.get_triaged_idea_ids(decisions=("approve", "reject"))
         ideas = [i for i in ideas if i["id"] not in already_triaged]
 
         if not ideas:

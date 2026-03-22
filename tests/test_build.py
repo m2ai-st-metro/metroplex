@@ -879,6 +879,8 @@ class TestBuildOrchestrator:
         ]
         mock_state_db.get_next_pending = Mock(side_effect=mock_items + [None])
         mock_state_db.update_item_status = Mock()
+        mock_state_db.has_completed_build = Mock(return_value=False)
+        mock_state_db.has_exhausted_retries = Mock(return_value=False)
 
         # Mock spec generation and queue_build
         mock_spec_path = Mock()

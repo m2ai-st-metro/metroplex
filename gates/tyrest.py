@@ -1,9 +1,10 @@
 """
-Tyrest Gate — Independent QA validation using GPT.
+Tyrest Gate — Independent QA validation using a non-Claude model.
 
 Named after Chief Justice Tyrest from IDW Transformers.
-Uses a different model (GPT) than the builder (Claude) to enforce
+Uses a different model than the builder (Claude) to enforce
 true model independence in quality validation.
+Default: Qwen3-235B via DeepInfra. Configurable via TYREST_MODEL and TYREST_BASE_URL.
 
 Two modes:
 1. Pre-build spec review (Gate 2.5): Buildability assessment + risk flags
@@ -21,7 +22,8 @@ from openai import APIError, APITimeoutError, OpenAI, RateLimitError
 logger = logging.getLogger(__name__)
 
 # Default configuration
-DEFAULT_MODEL = "gpt-4o"
+DEFAULT_MODEL = "deepseek-ai/DeepSeek-V3"
+DEFAULT_BASE_URL = "https://api.deepinfra.com/v1/openai"
 DEFAULT_APPROVE_MIN_CONFIDENCE = 0.75
 DEFAULT_REJECT_MIN_CONFIDENCE = 0.75
 DEFAULT_FORCE_REVIEW_CONFIDENCE = 0.50
@@ -307,7 +309,7 @@ def apply_confidence_gating(
 # --- Main Gate Class ---
 
 class TyrestGate:
-    """Independent QA gate using GPT for model-independent review."""
+    """Independent QA gate using a non-Claude model for model-independent review."""
 
     def __init__(
         self,
@@ -325,10 +327,11 @@ class TyrestGate:
     @property
     def client(self) -> OpenAI:
         if self._client is None:
-            api_key = os.getenv("OPENAI_API_KEY")
+            api_key = os.getenv("DEEPINFRA_API_KEY") or os.getenv("OPENAI_API_KEY")
             if not api_key:
-                raise ValueError("OPENAI_API_KEY not set")
-            self._client = OpenAI(api_key=api_key)
+                raise ValueError("DEEPINFRA_API_KEY or OPENAI_API_KEY not set")
+            base_url = os.getenv("TYREST_BASE_URL", DEFAULT_BASE_URL)
+            self._client = OpenAI(api_key=api_key, base_url=base_url)
         return self._client
 
     def review_spec(self, spec_text: str, idea_title: str = "") -> TyrestSpecResult:
@@ -361,7 +364,7 @@ class TyrestGate:
             response = self.client.chat.completions.create(
                 model=self.model,
                 temperature=0.0,
-                max_completion_tokens=1024,
+                max_tokens=1024,
                 messages=[
                     {"role": "system", "content": SPEC_REVIEW_SYSTEM_PROMPT},
                     {"role": "user", "content": user_prompt},
@@ -494,7 +497,7 @@ class TyrestGate:
             response = self.client.chat.completions.create(
                 model=self.model,
                 temperature=0.0,
-                max_completion_tokens=1024,
+                max_tokens=1024,
                 messages=[
                     {"role": "system", "content": BUILD_REVIEW_SYSTEM_PROMPT},
                     {"role": "user", "content": user_prompt},

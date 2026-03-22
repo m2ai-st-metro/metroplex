@@ -86,7 +86,7 @@ class Config:
 
     # Spec generation (LLM expansion)
     spec_use_llm: bool = field(default=True)
-    spec_llm_model: str = field(default="claude-sonnet-4-20250514")
+    spec_llm_model: str = field(default="anthropic/claude-4-sonnet")
     spec_llm_max_tokens: int = field(default=8192)
 
     # Dispatch (EA-Claude worker queue)

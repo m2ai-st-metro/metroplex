@@ -3,7 +3,10 @@ Quality Ratchet - Phase 14e
 Auto-tunes the minimum quality threshold for build publishing.
 Ratchet constraint: thresholds only tighten (increase), never loosen.
 
-Requires 30+ scored outcome records before activating.
+Two activation tiers:
+- Advisory (15+ scored builds): produces correlation report but does NOT auto-adjust
+- Auto-tune (30+ scored builds): proposes and applies threshold changes with ratchet constraint
+
 Stores threshold state in metroplex.db via a simple key-value table.
 """
 import logging
@@ -13,6 +16,7 @@ from db import StateDB
 
 logger = logging.getLogger(__name__)
 
+ADVISORY_THRESHOLD = 15
 MIN_RECORDS_TO_ACTIVATE = 30
 # Minimum gap between published avg and threshold to justify tightening
 MIN_HEADROOM = 5.0
@@ -93,12 +97,14 @@ def evaluate_ratchet(state_db: StateDB) -> dict:
     """)
     scored_count = cursor.fetchone()["cnt"]
 
-    if scored_count < MIN_RECORDS_TO_ACTIVATE:
+    if scored_count < ADVISORY_THRESHOLD:
         result["reason"] = (
-            f"Insufficient data: {scored_count}/{MIN_RECORDS_TO_ACTIVATE} scored builds"
+            f"Insufficient data: {scored_count}/{ADVISORY_THRESHOLD} scored builds for advisory mode"
         )
         result["stats"]["scored_count"] = scored_count
         return result
+
+    advisory_only = scored_count < MIN_RECORDS_TO_ACTIVATE
 
     result["activated"] = True
 
@@ -162,6 +168,15 @@ def evaluate_ratchet(state_db: StateDB) -> dict:
         proposed = round(pub_avg - MIN_HEADROOM, 1)
 
     result["proposed_threshold"] = proposed
+
+    # Advisory mode: report but don't auto-adjust
+    if advisory_only:
+        result["reason"] = (
+            f"Advisory mode ({scored_count}/{MIN_RECORDS_TO_ACTIVATE} for auto-tune): "
+            f"suggested threshold {proposed} "
+            f"(published avg {pub_avg:.1f}, failed avg {fail_avg:.1f})"
+        )
+        return result
 
     # Ratchet constraint: only tighten
     if current is not None and proposed <= current:

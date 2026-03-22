@@ -29,6 +29,9 @@ from readers.linear_reader import LinearReader
 from outcome_emitter import OutcomeEmitter
 from gates.quality_scorer import score_project
 from quality_ratchet import evaluate_ratchet
+from postmortem import capture_postmortem, get_failure_patterns
+from feasibility_scorer import resolve_prediction, adjust_feature_weights
+from readers.ideaforge_writer import IdeaForgeWriter
 
 
 class CycleOrchestrator:
@@ -99,9 +102,29 @@ class CycleOrchestrator:
         self.academy_reader = academy_reader
         self.dispatcher = dispatcher or LogDispatcher()
         self.outcome_emitter = outcome_emitter
+        # IdeaForge writer for build outcome feedback (L5 B3)
+        try:
+            self.ideaforge_writer = IdeaForgeWriter(config.ideaforge_db)
+        except Exception:
+            self.ideaforge_writer = None
         # Track which gates have already sent a halted notification.
         # Prevents spamming Telegram every cycle while a breaker is tripped.
         self._halted_notified: set[str] = set()
+
+    def _write_ideaforge_outcome(self, idea_id: int, outcome: str) -> None:
+        """Write a build outcome back to IdeaForge for scoring weight feedback (L5 B3).
+
+        Best-effort: never raises exceptions that would block the cycle.
+        """
+        if self.ideaforge_writer is None:
+            return
+        try:
+            self.ideaforge_writer.write_build_outcome(idea_id, outcome)
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).warning(
+                "Failed to write IdeaForge outcome for idea %d: %s", idea_id, e,
+            )
 
     def check_budget(self) -> tuple[bool, str]:
         """Check if spending is within daily and monthly budget limits.
@@ -332,6 +355,33 @@ class CycleOrchestrator:
                     count += 1
 
         return count
+
+    def _reset_priority_queue_for_retry(self, queue_job_id: str):
+        """Reset the priority_queue item to 'pending' for a retried build.
+
+        Called by the orchestrator after mark_build_for_retry succeeds and
+        the backoff timer has expired. This is the ONLY place where
+        priority_queue is reset for retries — mark_build_for_retry no longer
+        does this directly, preventing the dual-path infinite loop bug.
+        """
+        parts = queue_job_id.split("-", 2)
+        source = None
+        source_id = None
+        if len(parts) >= 3 and parts[0] == "metroplex" and parts[1] in ("ideaforge", "skylynx", "linear", "academy"):
+            source = parts[1]
+            source_id = parts[2]
+        elif len(parts) == 2 and parts[0] == "metroplex" and parts[1].isdigit():
+            source = "ideaforge"
+            source_id = parts[1]
+
+        if source and source_id:
+            self.state_db.connect()
+            self.state_db.conn.execute(
+                "UPDATE priority_queue SET status = 'pending', completed_at = NULL "
+                "WHERE source = ? AND source_id = ? AND status IN ('failed', 'dispatched')",
+                (source, source_id),
+            )
+            self.state_db.conn.commit()
 
     def dispatch_queue_items(self, dry_run: bool = False) -> int:
         """
@@ -649,6 +699,49 @@ class CycleOrchestrator:
                 if failed:
                     self.notifier.notify(f"Build failed: {', '.join(failed)}", "error")
 
+                # Capture structured postmortems for failed builds (L5 B1)
+                if failed:
+                    for job_id in failed:
+                        build = self.state_db.get_build_by_queue_job_id(job_id)
+                        if build:
+                            # Find log file for this build
+                            log_path = None
+                            build_log_dir = Path("data/build_logs")
+                            if build_log_dir.exists():
+                                # Look for log files matching the job ID
+                                for log_file in build_log_dir.glob(f"*{job_id}*"):
+                                    log_path = str(log_file)
+                                    break
+
+                            capture_postmortem(
+                                state_db=self.state_db,
+                                queue_job_id=job_id,
+                                idea_id=int(build["idea_id"]) if str(build["idea_id"]).isdigit() else 0,
+                                title=build["title"],
+                                log_path=log_path,
+                                spec_path=build.get("spec_path"),
+                                idea_score=build.get("quality_score"),
+                                artifact_type=None,
+                            )
+
+                # Resolve feasibility predictions for terminal builds (L5 B2)
+                for job_id in completed:
+                    resolve_prediction(self.state_db, job_id, "completed")
+                for job_id in failed:
+                    resolve_prediction(self.state_db, job_id, "failed")
+
+                # Write build outcomes back to IdeaForge (L5 B3)
+                for job_id in failed:
+                    build = self.state_db.get_build_by_queue_job_id(job_id)
+                    if build and str(build["idea_id"]).isdigit():
+                        self._write_ideaforge_outcome(int(build["idea_id"]), "build_failed")
+
+                # Adjust feasibility feature weights if enough data (L5 B2)
+                try:
+                    adjust_feature_weights(self.state_db)
+                except Exception as e:
+                    self.audit_logger.log_error("build", f"Feasibility weight adjustment failed: {e}")
+
                 # Emit outcomes for newly failed builds (Phase 14a)
                 if self.outcome_emitter and failed:
                     for job_id in failed:
@@ -677,20 +770,61 @@ class CycleOrchestrator:
             except Exception as e:
                 self.audit_logger.log_error("build", f"Oz build poll failed: {e}")
 
-        # Auto-retry failed builds (Phase 13f)
+        # Auto-retry failed builds (Phase 13f, hardened against infinite loops)
         try:
+            # 1. Abandon builds that have exhausted all retries
+            exhausted = self.state_db.get_exhausted_builds()
+            for build in exhausted:
+                queue_job_id = build["queue_job_id"]
+                if self.state_db.mark_build_abandoned(queue_job_id):
+                    print(f"  ABANDONED (max {self.state_db.MAX_RETRIES} retries): {build['title']} ({queue_job_id})")
+                    self.audit_logger.log_decision(
+                        "build", "max_retries_exceeded",
+                        {
+                            "queue_job_id": queue_job_id,
+                            "title": build["title"],
+                            "max_retries": self.state_db.MAX_RETRIES,
+                        },
+                    )
+                    self.notifier.notify(
+                        f"Build ABANDONED after {self.state_db.MAX_RETRIES} retries: {build['title']}",
+                        "error",
+                    )
+                    if self.outcome_emitter:
+                        self.outcome_emitter.emit(
+                            idea_id=int(build["idea_id"]) if str(build["idea_id"]).isdigit() else 0,
+                            idea_title=build["title"],
+                            outcome="build_failed",
+                            build_outcome=f"max_retries_exceeded: {queue_job_id}",
+                            tags=["build", "abandoned"],
+                        )
+                    # Close feedback loops for abandoned builds (L5 B2+B3)
+                    try:
+                        resolve_prediction(self.state_db, queue_job_id, "failure")
+                        idea_id = int(build["idea_id"]) if str(build["idea_id"]).isdigit() else None
+                        if idea_id and self._ideaforge_writer:
+                            self._write_ideaforge_outcome(idea_id, "build_failed")
+                    except Exception:
+                        pass  # Best-effort — don't block abandonment flow
+
+            # 2. Retry builds that haven't exhausted retries and whose backoff has expired
             retryable = self.state_db.get_retryable_builds()
             for build in retryable:
-                if self.state_db.mark_build_for_retry(build["queue_job_id"]):
+                queue_job_id = build["queue_job_id"]
+                if self.state_db.mark_build_for_retry(queue_job_id):
                     retry_num = (build.get("retry_count") or 0) + 1
-                    print(f"  Auto-retry #{retry_num}: {build['title']} ({build['queue_job_id']})")
+                    print(f"  Auto-retry #{retry_num}: {build['title']} ({queue_job_id})")
                     self.audit_logger.log_decision(
                         "build", "auto_retry",
-                        {"queue_job_id": build["queue_job_id"], "retry_count": retry_num}
+                        {"queue_job_id": queue_job_id, "retry_count": retry_num}
                     )
                     self.notifier.notify(
                         f"Build auto-retry #{retry_num}: {build['title']}"
                     )
+                    # Reset priority_queue to 'pending' so run_from_queue
+                    # re-dispatches on the next cycle (backoff already enforced
+                    # by get_retryable_builds checking next_retry_at).
+                    self._reset_priority_queue_for_retry(queue_job_id)
         except Exception as e:
             self.audit_logger.log_error("build", f"Auto-retry check failed: {e}")
 
@@ -736,6 +870,14 @@ class CycleOrchestrator:
                             f"Review gate: {failed} builds failed checks: {', '.join(failed_titles)}",
                             "warning",
                         )
+                        # Resolve feasibility predictions for review failures (L5 B2)
+                        for r in review_results:
+                            if r.verdict == "fail":
+                                resolve_prediction(self.state_db, r.queue_job_id, "review_failed")
+                                # Write review_failed outcome to IdeaForge (L5 B3)
+                                build = self.state_db.get_build_by_queue_job_id(r.queue_job_id)
+                                if build and str(build["idea_id"]).isdigit():
+                                    self._write_ideaforge_outcome(int(build["idea_id"]), "review_failed")
                         # Emit outcomes for review failures (Phase 14a)
                         if self.outcome_emitter:
                             for r in review_results:
@@ -791,6 +933,12 @@ class CycleOrchestrator:
                             f"Tyrest REJECTED: {review.title} — {tyrest_result.reasoning}",
                             "warning",
                         )
+                        # Resolve feasibility prediction for Tyrest rejection (L5 B2)
+                        resolve_prediction(self.state_db, review.queue_job_id, "tyrest_rejected")
+                        # Write tyrest_rejected outcome to IdeaForge (L5 B3)
+                        build = self.state_db.get_build_by_queue_job_id(review.queue_job_id)
+                        if build and str(build["idea_id"]).isdigit():
+                            self._write_ideaforge_outcome(int(build["idea_id"]), "tyrest_rejected")
                         # Emit outcome for Tyrest rejection (Phase 14a)
                         if self.outcome_emitter:
                             build = self.state_db.get_build_by_queue_job_id(review.queue_job_id)
@@ -903,6 +1051,12 @@ class CycleOrchestrator:
 
                     for job in pub_jobs:
                         if job.status == "published":
+                            # Resolve feasibility prediction as success (L5 B2)
+                            resolve_prediction(self.state_db, job.build_job_id, "published")
+                            # Write published outcome to IdeaForge (L5 B3)
+                            build = self.state_db.get_build_by_queue_job_id(job.build_job_id)
+                            if build and str(build["idea_id"]).isdigit():
+                                self._write_ideaforge_outcome(int(build["idea_id"]), "published")
                             self.notifier.notify(
                                 f"Published: {self.config.github_org}/{job.repo_name} ({job.title})"
                             )

@@ -151,6 +151,7 @@ def initialize_components(config: Config):
         spec_generator=spec_generator,
         audit_logger=audit_logger,
         tyrest_gate=tyrest_gate,
+        ideaforge_reader=ideaforge_reader,
     )
 
     patch_gate = PatchGate(
@@ -697,6 +698,44 @@ def cmd_cost(args, config: Config):
         state_db.close()
 
 
+def cmd_postmortems(args, config: Config):
+    """Show failure category summary from build post-mortems."""
+    from postmortem import get_postmortem_summary, get_failure_patterns
+
+    state_db = StateDB()
+    state_db.init_db()
+
+    try:
+        summary = get_postmortem_summary(state_db)
+        if not summary:
+            print("No build post-mortems recorded yet.")
+            return 0
+
+        print(f"{'='*60}")
+        print("BUILD FAILURE POST-MORTEMS")
+        print(f"{'='*60}\n")
+        print(f"{'Category':<20} {'Count':>6} {'Avg Score':>10}")
+        print("-" * 40)
+        for row in summary:
+            avg = f"{row['avg_score']:.1f}" if row["avg_score"] is not None else "-"
+            print(f"{row['category']:<20} {row['count']:>6} {avg:>10}")
+
+        patterns = get_failure_patterns(state_db, min_count=2)
+        if patterns:
+            print(f"\n{'='*60}")
+            print("RECURRING PATTERNS (2+ occurrences)")
+            print(f"{'='*60}\n")
+            for p in patterns:
+                print(f"  {p['category']} / {p['stage']}: {p['count']} occurrences")
+                for sig in p["sample_signatures"][:2]:
+                    if sig:
+                        print(f"    -> {sig[:80]}...")
+
+        return 0
+    finally:
+        state_db.close()
+
+
 def cmd_reset(args, config: Config):
     """
     Reset circuit breaker for gate(s).
@@ -1223,6 +1262,9 @@ def main():
     # quality-digest command
     digest_parser = subparsers.add_parser("quality-digest", help="Print quality digest for daily reports (Phase 14d)")
 
+    # postmortems command
+    postmortems_parser = subparsers.add_parser("postmortems", help="Show build failure post-mortem summary")
+
     # reset command
     reset_parser = subparsers.add_parser("reset", help="Reset circuit breaker")
     reset_parser.add_argument("--gate", required=True, choices=["triage", "build", "publish", "patch", "all"], help="Gate to reset")
@@ -1265,6 +1307,8 @@ def main():
         sys.exit(cmd_retry(args, config))
     elif args.command == "cost":
         sys.exit(cmd_cost(args, config))
+    elif args.command == "postmortems":
+        sys.exit(cmd_postmortems(args, config))
     elif args.command == "reset":
         sys.exit(cmd_reset(args, config))
     elif args.command == "backfill-outcomes":

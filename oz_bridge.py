@@ -110,7 +110,7 @@ def poll_oz_run(run_id: str) -> Optional[dict]:
     """
     try:
         client = _get_client()
-        run = client.agent.runs.get(run_id)
+        run = client.agent.runs.retrieve(run_id)
         return {
             "run_id": run.run_id,
             "state": run.state,  # QUEUED, INPROGRESS, SUCCEEDED, FAILED
