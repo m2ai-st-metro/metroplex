@@ -4,13 +4,15 @@ Sequences all four gates into cycles with safety systems integration.
 Includes notifications, schedule windows, and priority queue dispatch.
 """
 import json
+import re
+import subprocess
 import time
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, Protocol
 
 from config import Config
-from models import CycleResult, PriorityItem
+from models import CycleResult, PriorityItem, TriageDecision
 from db import StateDB
 from audit import AuditLogger
 from safety import CircuitBreaker, CycleCaps, ShutdownHandler
@@ -18,6 +20,7 @@ from gates.triage import TriageGate
 from gates.build import BuildOrchestrator
 from gates.patcher import PatchGate
 from gates.publish import PublishGate
+from gates.readme import ReadmeGate
 from gates.review import ReviewGate
 from gates.tyrest import TyrestGate
 from notifier import Notifier, LogNotifier
@@ -58,6 +61,7 @@ class CycleOrchestrator:
         tyrest_gate: TyrestGate | None = None,
         dispatcher: Dispatcher | None = None,
         outcome_emitter: OutcomeEmitter | None = None,
+        readme_gate: ReadmeGate | None = None,
     ):
         """
         Initialize Cycle Orchestrator.
@@ -82,6 +86,7 @@ class CycleOrchestrator:
             tyrest_gate: TyrestGate instance (optional, enables Gate 4.25 LLM QA review)
             dispatcher: Dispatcher for routing non-buildable items to ClaudeClaw workers
             outcome_emitter: OutcomeEmitter for writing terminal-state outcomes to ST Factory
+            readme_gate: ReadmeGate instance (optional, enables Gate 4.7 README enhancement)
         """
         self.config = config
         self.triage_gate = triage_gate
@@ -102,6 +107,7 @@ class CycleOrchestrator:
         self.academy_reader = academy_reader
         self.dispatcher = dispatcher or LogDispatcher()
         self.outcome_emitter = outcome_emitter
+        self.readme_gate = readme_gate
         # IdeaForge writer for build outcome feedback (L5 B3)
         try:
             self.ideaforge_writer = IdeaForgeWriter(config.ideaforge_db)
@@ -364,7 +370,8 @@ class CycleOrchestrator:
         priority_queue is reset for retries — mark_build_for_retry no longer
         does this directly, preventing the dual-path infinite loop bug.
         """
-        parts = queue_job_id.split("-", 2)
+        base_id = re.sub(r'-r\d+$', '', queue_job_id)
+        parts = base_id.split("-", 2)
         source = None
         source_id = None
         if len(parts) >= 3 and parts[0] == "metroplex" and parts[1] in ("ideaforge", "skylynx", "linear", "academy"):
@@ -625,10 +632,22 @@ class CycleOrchestrator:
                         elif d.decision == "defer":
                             deferral_count = self.state_db.get_deferral_count(d.idea_id)
                             if deferral_count >= self.config.max_deferrals:
+                                # Record a reject decision so get_triaged_idea_ids
+                                # filters this idea out of future triage cycles
+                                reject_decision = TriageDecision(
+                                    idea_id=d.idea_id,
+                                    title=d.title,
+                                    weighted_score=d.weighted_score,
+                                    scaled_score=d.scaled_score,
+                                    decision="reject",
+                                    reason=f"exceeded_max_deferrals ({deferral_count})",
+                                    decided_at=d.decided_at,
+                                )
+                                self.state_db.record_triage_decision(reject_decision)
                                 self.outcome_emitter.emit(
                                     idea_id=d.idea_id,
                                     idea_title=d.title,
-                                    outcome="deferred",
+                                    outcome="rejected",
                                     overall_score=d.scaled_score,
                                     build_outcome=f"max_deferrals_reached ({deferral_count})",
                                     tags=["triage"],
@@ -722,6 +741,7 @@ class CycleOrchestrator:
                                 spec_path=build.get("spec_path"),
                                 idea_score=build.get("quality_score"),
                                 artifact_type=None,
+                                retry_count=build.get("retry_count"),
                             )
 
                 # Resolve feasibility predictions for terminal builds (L5 B2)
@@ -1099,6 +1119,59 @@ class CycleOrchestrator:
                     self.circuit_breaker.record_failure("publish", error_msg)
                     self.audit_logger.log_error("publish", error_msg)
                     self.notifier.notify(f"Gate 4 (publish) FAILED: {str(e)}", "error")
+
+        # Gate 4.7: README Enhancement
+        if self.readme_gate is not None and self.publish_gate is not None:
+            # Collect published jobs from this cycle (pub_jobs defined in Gate 4 block above)
+            try:
+                published_jobs = [j for j in pub_jobs if j.status == "published"] if pub_jobs else []
+            except NameError:
+                published_jobs = []
+
+            if published_jobs:
+                try:
+                    print(f"Running Gate 4.7 (readme)...")
+                    readme_results = self.readme_gate.run(published_jobs=published_jobs, dry_run=dry_run)
+                    readme_count = sum(1 for r in readme_results if r.get("status") == "completed")
+                    print(f"+ Gate 4.7 completed: {len(readme_results)} processed, {readme_count} enhanced")
+                except Exception as e:
+                    print(f"x Gate 4.7 (readme) failed: {e}")
+                    self.audit_logger.log_error("readme", str(e))
+
+        # Gate 4.8: Swindle (storefront listing)
+        swindle_script = Path.home() / "projects" / "swindle" / "swindle.py"
+        if swindle_script.is_file() and self.publish_gate is not None:
+            try:
+                published_for_swindle = [j for j in pub_jobs if j.status == "published"] if pub_jobs else []
+            except NameError:
+                published_for_swindle = []
+
+            for job in published_for_swindle:
+                # Skip if already staged in Swindle
+                build = self.state_db.get_build_by_queue_job_id(job.build_job_id)
+                spec_path = build.get("spec_path", "") if build else ""
+                try:
+                    print(f"Running Gate 4.8 (swindle): {job.title}...")
+                    cmd = [
+                        "python3", str(swindle_script), "prepare",
+                        job.repo_url or "",
+                        "--title", job.title,
+                        "--project-dir", job.project_dir,
+                    ]
+                    if spec_path:
+                        cmd.extend(["--spec-path", spec_path])
+                    if dry_run:
+                        cmd.append("--dry-run")
+                    result = subprocess.run(
+                        cmd, capture_output=True, text=True, timeout=300,
+                        cwd=str(swindle_script.parent),
+                    )
+                    if result.returncode == 0:
+                        print(f"+ Gate 4.8 (swindle): staged listing for {job.title}")
+                    else:
+                        print(f"x Gate 4.8 (swindle) failed: {result.stderr[:200]}")
+                except Exception as e:
+                    print(f"x Gate 4.8 (swindle) error: {e}")
 
         # Gate 3: Patch
         if self.circuit_breaker.is_halted("patch"):

@@ -2,6 +2,7 @@
 Metroplex State Database Manager
 Manages metroplex.db SQLite database for tracking all decisions, jobs, patches, and cycles.
 """
+import re
 import sqlite3
 import json
 from datetime import datetime, timedelta
@@ -169,6 +170,12 @@ class StateDB:
         if "quality_score" not in bj_columns:
             cursor.execute("ALTER TABLE build_jobs ADD COLUMN quality_score REAL DEFAULT NULL")
 
+        # Migrate: add base_job_id to build_jobs (attempt-grouping for retry dedup)
+        if "base_job_id" not in bj_columns:
+            cursor.execute("ALTER TABLE build_jobs ADD COLUMN base_job_id TEXT DEFAULT NULL")
+            # Backfill: no suffixed IDs exist yet, so base = queue_job_id
+            cursor.execute("UPDATE build_jobs SET base_job_id = queue_job_id WHERE base_job_id IS NULL")
+
         # Migrate: add publish_count to cycles if missing
         cursor.execute("PRAGMA table_info(cycles)")
         cy_columns = {row[1] for row in cursor.fetchall()}
@@ -259,6 +266,21 @@ class StateDB:
             except sqlite3.OperationalError:
                 pass  # Column already exists
 
+        # Readme jobs table (Gate 4.7 — enhanced README generation tracking)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS readme_jobs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                publish_job_id TEXT,
+                build_job_id TEXT,
+                repo_url TEXT,
+                status TEXT DEFAULT 'pending',
+                error TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                completed_at TIMESTAMP
+            )
+        """)
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_readme_jobs_build ON readme_jobs(build_job_id)")
+
         # Create indexes
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_triage_decisions_idea ON triage_decisions(idea_id)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_triage_decisions_decision ON triage_decisions(decision)")
@@ -269,6 +291,7 @@ class StateDB:
         cursor.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_priority_queue_source ON priority_queue(source, source_id)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_publish_jobs_status ON publish_jobs(status)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_cost_ledger_timestamp ON cost_ledger(timestamp)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_build_jobs_base_job_id ON build_jobs(base_job_id)")
 
         # Initialize gate status for all gates
         for gate in ["triage", "build", "patch", "publish"]:
@@ -308,17 +331,20 @@ class StateDB:
         self.connect()
         cursor = self.conn.cursor()
 
+        # Derive base_job_id by stripping any -rN retry suffix
+        base_job_id = re.sub(r'-r\d+$', '', job.queue_job_id)
+
         # Carry forward retry count from any previous attempt
         cursor.execute(
-            "SELECT MAX(retry_count) FROM build_jobs WHERE queue_job_id = ?",
-            (job.queue_job_id,),
+            "SELECT MAX(retry_count) FROM build_jobs WHERE base_job_id = ?",
+            (base_job_id,),
         )
         row = cursor.fetchone()
         inherited_retry = (row[0] or 0) if row and row[0] is not None else 0
 
         cursor.execute("""
-            INSERT INTO build_jobs (idea_id, title, spec_path, queue_job_id, status, queued_at, retry_count)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO build_jobs (idea_id, title, spec_path, queue_job_id, status, queued_at, retry_count, base_job_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             job.idea_id,
             job.title,
@@ -327,6 +353,7 @@ class StateDB:
             job.status,
             job.queued_at.isoformat(),
             inherited_retry,
+            base_job_id,
         ))
 
         self.conn.commit()
@@ -641,10 +668,12 @@ class StateDB:
             self._backfill_project_dir(cursor, queue_job_id)
 
         # Parse queue_job_id to extract source and source_id
+        # Strip -rN retry suffix before parsing
+        base_id = re.sub(r'-r\d+$', '', queue_job_id)
         source = None
         source_id = None
 
-        parts = queue_job_id.split("-", 2)  # Split into at most 3 parts
+        parts = base_id.split("-", 2)  # Split into at most 3 parts
 
         if len(parts) >= 3 and parts[0] == "metroplex" and parts[1] in ("ideaforge", "skylynx", "linear", "academy"):
             # New format: metroplex-source-source_id (source_id may contain hyphens)
@@ -656,7 +685,7 @@ class StateDB:
             source_id = parts[1]
         elif len(parts) >= 2 and parts[0] == "metroplex":
             # Fallback: try to find source_id in priority_queue by matching any source
-            candidate_id = queue_job_id[len("metroplex-"):]
+            candidate_id = base_id[len("metroplex-"):]
             cursor.execute(
                 "SELECT source FROM priority_queue WHERE source_id = ? LIMIT 1",
                 (candidate_id,)
@@ -714,7 +743,9 @@ class StateDB:
             return False
 
         # Parse queue_job_id to find the priority_queue entry
-        parts = queue_job_id.split("-", 2)
+        # Strip -rN retry suffix before parsing
+        base_id = re.sub(r'-r\d+$', '', queue_job_id)
+        parts = base_id.split("-", 2)
         source = None
         source_id = None
 
@@ -797,17 +828,18 @@ class StateDB:
         ]
 
     def has_completed_build(self, queue_job_id: str) -> bool:
-        """Check if a completed build exists for the given queue_job_id."""
+        """Check if a completed build exists for the given job ID (any attempt suffix)."""
         self.connect()
         cursor = self.conn.cursor()
+        base_job_id = re.sub(r'-r\d+$', '', queue_job_id)
         cursor.execute(
-            "SELECT COUNT(*) FROM build_jobs WHERE queue_job_id = ? AND status = 'completed'",
-            (queue_job_id,),
+            "SELECT COUNT(*) FROM build_jobs WHERE base_job_id = ? AND status = 'completed'",
+            (base_job_id,),
         )
         return cursor.fetchone()[0] > 0
 
     def has_exhausted_retries(self, queue_job_id: str) -> bool:
-        """Check if all retry attempts have been used for the given queue_job_id.
+        """Check if all retry attempts have been used for the given job ID (any attempt suffix).
 
         Uses COUNT of failed build rows as a hard cap. This is more reliable
         than MAX(retry_count) which can drift when multiple rows are created
@@ -815,9 +847,10 @@ class StateDB:
         """
         self.connect()
         cursor = self.conn.cursor()
+        base_job_id = re.sub(r'-r\d+$', '', queue_job_id)
         cursor.execute(
-            "SELECT COUNT(*) FROM build_jobs WHERE queue_job_id = ? AND status = 'failed'",
-            (queue_job_id,),
+            "SELECT COUNT(*) FROM build_jobs WHERE base_job_id = ? AND status = 'failed'",
+            (base_job_id,),
         )
         failed_count = cursor.fetchone()[0]
         return failed_count >= self.MAX_RETRIES
@@ -852,10 +885,74 @@ class StateDB:
         self.conn.commit()
         return cursor.rowcount > 0
 
+    # --- Stale Queued Build Detection ---
+
+    STALE_QUEUED_THRESHOLD_MINUTES = 30
+
+    def get_stale_queued_builds(self) -> list[dict]:
+        """Get builds stuck in 'queued' status past the staleness threshold.
+
+        A build is stale-queued when:
+        - build_jobs.status = 'queued'
+        - queued_at is older than STALE_QUEUED_THRESHOLD_MINUTES ago
+        - The corresponding priority_queue item has status = 'dispatched'
+          (meaning the dispatch loop won't re-pick it up)
+
+        Returns:
+            List of dicts with queue_job_id, idea_id, title, queued_at,
+            source, source_id, priority_queue_id.
+        """
+        self.connect()
+        cursor = self.conn.cursor()
+        cutoff = (
+            datetime.now() - timedelta(minutes=self.STALE_QUEUED_THRESHOLD_MINUTES)
+        ).isoformat()
+
+        cursor.execute("""
+            SELECT b.queue_job_id, b.idea_id, b.title, b.queued_at,
+                   pq.id AS priority_queue_id, pq.source, pq.source_id
+            FROM build_jobs b
+            JOIN priority_queue pq
+              ON pq.source_id = CAST(b.idea_id AS TEXT)
+              AND pq.status = 'dispatched'
+            WHERE b.status = 'queued'
+              AND b.queued_at < ?
+        """, (cutoff,))
+        return [dict(row) for row in cursor.fetchall()]
+
+    def reset_stale_queued_build(self, queue_job_id: str, priority_queue_id: int):
+        """Reset a stale queued build so it can be re-dispatched.
+
+        Deletes the stale build_jobs row and resets the priority_queue
+        item back to 'pending'.
+        """
+        self.connect()
+        self.conn.execute(
+            "DELETE FROM build_jobs WHERE queue_job_id = ? AND status = 'queued'",
+            (queue_job_id,),
+        )
+        self.conn.execute(
+            "UPDATE priority_queue SET status = 'pending', dispatched_at = NULL "
+            "WHERE id = ? AND status = 'dispatched'",
+            (priority_queue_id,),
+        )
+        self.conn.commit()
+
     # --- Build Retry (Phase 13f) ---
 
     MAX_RETRIES = 3
     RETRY_BACKOFF_MINUTES = [5, 20, 60]  # Exponential-ish backoff
+
+    def count_failed_builds(self, base_job_id: str) -> int:
+        """Count failed build attempts for a base job ID (any suffix)."""
+        self.connect()
+        cursor = self.conn.cursor()
+        cursor.execute(
+            "SELECT COUNT(*) FROM build_jobs "
+            "WHERE base_job_id = ? AND status = 'failed'",
+            (base_job_id,),
+        )
+        return cursor.fetchone()[0]
 
     def get_retryable_builds(self) -> list[dict]:
         """Get failed builds eligible for automatic retry.
@@ -873,18 +970,18 @@ class StateDB:
         now = datetime.now().isoformat()
 
         cursor.execute("""
-            SELECT b.queue_job_id, b.title, b.idea_id, b.retry_count
+            SELECT b.queue_job_id, b.base_job_id, b.title, b.idea_id, b.retry_count
             FROM build_jobs b
             INNER JOIN (
-                SELECT queue_job_id, MAX(id) AS max_id
+                SELECT base_job_id, MAX(id) AS max_id
                 FROM build_jobs
-                GROUP BY queue_job_id
+                GROUP BY base_job_id
             ) latest ON b.id = latest.max_id
             WHERE b.status = 'failed'
             AND (b.next_retry_at IS NULL OR b.next_retry_at <= ?)
             AND (
                 SELECT COUNT(*) FROM build_jobs b2
-                WHERE b2.queue_job_id = b.queue_job_id AND b2.status = 'failed'
+                WHERE b2.base_job_id = b.base_job_id AND b2.status = 'failed'
             ) < ?
         """, (now, self.MAX_RETRIES))
         return [dict(row) for row in cursor.fetchall()]
@@ -894,30 +991,30 @@ class StateDB:
 
         Returns builds where:
         - The latest row has status = 'failed'
-        - Total failed rows >= MAX_RETRIES
-        - No 'completed' build exists for this queue_job_id
+        - Total failed rows for this base_job_id >= MAX_RETRIES
+        - No 'completed' build exists for this base_job_id
         - The build hasn't already been flagged as abandoned (next_retry_at = 'abandoned')
         """
         self.connect()
         cursor = self.conn.cursor()
 
         cursor.execute("""
-            SELECT b.queue_job_id, b.title, b.idea_id, b.retry_count
+            SELECT b.queue_job_id, b.base_job_id, b.title, b.idea_id, b.retry_count
             FROM build_jobs b
             INNER JOIN (
-                SELECT queue_job_id, MAX(id) AS max_id
+                SELECT base_job_id, MAX(id) AS max_id
                 FROM build_jobs
-                GROUP BY queue_job_id
+                GROUP BY base_job_id
             ) latest ON b.id = latest.max_id
             WHERE b.status = 'failed'
             AND COALESCE(b.next_retry_at, '') != 'abandoned'
             AND (
                 SELECT COUNT(*) FROM build_jobs b2
-                WHERE b2.queue_job_id = b.queue_job_id AND b2.status = 'failed'
+                WHERE b2.base_job_id = b.base_job_id AND b2.status = 'failed'
             ) >= ?
             AND NOT EXISTS (
                 SELECT 1 FROM build_jobs b3
-                WHERE b3.queue_job_id = b.queue_job_id AND b3.status = 'completed'
+                WHERE b3.base_job_id = b.base_job_id AND b3.status = 'completed'
             )
         """, (self.MAX_RETRIES,))
         return [dict(row) for row in cursor.fetchall()]
@@ -936,24 +1033,27 @@ class StateDB:
         self.connect()
         cursor = self.conn.cursor()
 
+        # Derive base_job_id for grouping across attempt suffixes
+        base_job_id = re.sub(r'-r\d+$', '', queue_job_id)
+
         # Skip retry if a successful build already exists for this idea
         cursor.execute(
-            "SELECT COUNT(*) FROM build_jobs WHERE queue_job_id = ? AND status = 'completed'",
-            (queue_job_id,),
+            "SELECT COUNT(*) FROM build_jobs WHERE base_job_id = ? AND status = 'completed'",
+            (base_job_id,),
         )
         if cursor.fetchone()[0] > 0:
             return False
 
         # Use COUNT of failed rows as hard cap (immune to retry_count drift)
         cursor.execute(
-            "SELECT COUNT(*) FROM build_jobs WHERE queue_job_id = ? AND status = 'failed'",
-            (queue_job_id,),
+            "SELECT COUNT(*) FROM build_jobs WHERE base_job_id = ? AND status = 'failed'",
+            (base_job_id,),
         )
         failed_count = cursor.fetchone()[0]
         if failed_count >= self.MAX_RETRIES:
             return False
 
-        # Get the latest failed row
+        # Get the latest failed row (use queue_job_id for the specific row)
         cursor.execute(
             "SELECT id, retry_count FROM build_jobs "
             "WHERE queue_job_id = ? AND status = 'failed' ORDER BY id DESC LIMIT 1",
@@ -993,16 +1093,19 @@ class StateDB:
         self.connect()
         cursor = self.conn.cursor()
 
-        # Mark latest build_jobs row with 'abandoned' sentinel
+        # Derive base_job_id for grouping across attempt suffixes
+        base_job_id = re.sub(r'-r\d+$', '', queue_job_id)
+
+        # Mark latest build_jobs row with 'abandoned' sentinel (group by base_job_id)
         cursor.execute(
             "UPDATE build_jobs SET next_retry_at = 'abandoned' "
-            "WHERE id = (SELECT MAX(id) FROM build_jobs WHERE queue_job_id = ?)",
-            (queue_job_id,),
+            "WHERE id = (SELECT MAX(id) FROM build_jobs WHERE base_job_id = ?)",
+            (base_job_id,),
         )
         build_updated = cursor.rowcount > 0
 
-        # Parse source/source_id from queue_job_id
-        parts = queue_job_id.split("-", 2)
+        # Parse source/source_id from base_job_id (strip -rN already done)
+        parts = base_job_id.split("-", 2)
         source = None
         source_id = None
         if len(parts) >= 3 and parts[0] == "metroplex" and parts[1] in ("ideaforge", "skylynx", "linear", "academy"):
@@ -1247,3 +1350,64 @@ class StateDB:
             AND b.id IN (SELECT MAX(id) FROM build_jobs GROUP BY queue_job_id)
         """)
         return [row[0] for row in cursor.fetchall()]
+
+    # --- Readme Jobs (Gate 4.7) ---
+
+    def has_readme(self, build_job_id: str) -> bool:
+        """Check if a build already has a completed readme job."""
+        self.connect()
+        cursor = self.conn.cursor()
+        cursor.execute(
+            "SELECT 1 FROM readme_jobs WHERE build_job_id = ? AND status = 'completed' LIMIT 1",
+            (build_job_id,),
+        )
+        return cursor.fetchone() is not None
+
+    def get_readme_pending(self) -> list[dict]:
+        """Get published builds that haven't had README enhancement yet.
+
+        Returns publish_jobs with status='published' that have no completed
+        readme_jobs entry.
+        """
+        self.connect()
+        cursor = self.conn.cursor()
+        cursor.execute("""
+            SELECT p.build_job_id, p.title, p.project_dir, p.repo_url
+            FROM publish_jobs p
+            WHERE p.status = 'published'
+            AND p.build_job_id NOT IN (
+                SELECT build_job_id FROM readme_jobs WHERE status = 'completed'
+            )
+        """)
+        return [dict(row) for row in cursor.fetchall()]
+
+    def record_readme_job(
+        self,
+        build_job_id: str,
+        repo_url: str,
+        status: str,
+        error: str | None = None,
+    ):
+        """Record a readme job result.
+
+        Uses INSERT OR REPLACE keyed on build_job_id to handle retries.
+        """
+        self.connect()
+        cursor = self.conn.cursor()
+
+        completed_at = datetime.now().isoformat() if status == "completed" else None
+
+        cursor.execute("""
+            INSERT OR REPLACE INTO readme_jobs
+                (build_job_id, repo_url, status, error, created_at, completed_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, (
+            build_job_id,
+            repo_url,
+            status,
+            error,
+            datetime.now().isoformat(),
+            completed_at,
+        ))
+
+        self.conn.commit()

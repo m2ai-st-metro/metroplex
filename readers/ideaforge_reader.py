@@ -84,7 +84,7 @@ class IdeaForgeReader:
             WHERE status = 'classified'
                 AND weighted_score IS NOT NULL
                 AND artifact_type IS NOT NULL
-                AND (claimed_by IS NULL OR claimed_by = '')
+                AND (claimed_by IS NULL OR claimed_by = '' OR claimed_by = 'metroplex')
             ORDER BY weighted_score DESC
         """)
 

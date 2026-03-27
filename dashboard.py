@@ -187,6 +187,28 @@ def compute_funnel_metrics(
                 (cutoff,),
             ).fetchone()[0]
 
+            # Unique idea counts (de-duplicated across retries with different queue_job_ids)
+            result["funnel"]["builds_succeeded_unique"] = mx_conn.execute(
+                "SELECT COUNT(DISTINCT b.idea_id) FROM build_jobs b "
+                "WHERE b.id IN ("
+                "  SELECT MAX(id) FROM build_jobs WHERE queued_at >= ? GROUP BY queue_job_id"
+                ") AND b.status = 'completed'",
+                (cutoff,),
+            ).fetchone()[0]
+
+            result["funnel"]["builds_failed_unique"] = mx_conn.execute(
+                "SELECT COUNT(DISTINCT b.idea_id) FROM build_jobs b "
+                "WHERE b.id IN ("
+                "  SELECT MAX(id) FROM build_jobs WHERE queued_at >= ? GROUP BY queue_job_id"
+                ") AND b.status IN ('failed', 'abandoned')",
+                (cutoff,),
+            ).fetchone()[0]
+
+            result["funnel"]["builds_dispatched_unique"] = mx_conn.execute(
+                "SELECT COUNT(DISTINCT idea_id) FROM build_jobs WHERE queued_at >= ?",
+                (cutoff,),
+            ).fetchone()[0]
+
         # Builds published
         if _table_exists(mx_conn, "publish_jobs"):
             result["funnel"]["builds_published"] = mx_conn.execute(
@@ -280,6 +302,7 @@ def compute_funnel_metrics(
         "classified_to_approved": _safe_rate(f.get("ideas_approved"), f.get("ideas_classified")),
         "approved_to_dispatched": _safe_rate(f.get("builds_dispatched"), f.get("ideas_approved")),
         "dispatched_to_succeeded": _safe_rate(f.get("builds_succeeded"), f.get("builds_dispatched")),
+        "dispatched_to_succeeded_unique": _safe_rate(f.get("builds_succeeded_unique"), f.get("builds_dispatched_unique")),
         "succeeded_to_published": _safe_rate(f.get("builds_published"), f.get("builds_succeeded")),
     }
 
@@ -384,9 +407,16 @@ def format_funnel_output(metrics: dict, as_json: bool = False) -> str:
         ("Builds succeeded", f.get("builds_succeeded", 0)),
         ("Builds failed", f.get("builds_failed", 0)),
         ("Builds published", f.get("builds_published", 0)),
+        ("", None),  # blank separator
+        ("Builds dispatched (unique)", f.get("builds_dispatched_unique", 0)),
+        ("Builds succeeded (unique)", f.get("builds_succeeded_unique", 0)),
+        ("Builds failed (unique)", f.get("builds_failed_unique", 0)),
     ]
     for name, count in stages:
-        lines.append(f"  {name:<22} {count:>6}")
+        if count is None:
+            lines.append("")
+        else:
+            lines.append(f"  {name:<28} {count:>6}")
 
     # Conversion rates
     lines.append("")

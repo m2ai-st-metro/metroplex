@@ -19,9 +19,12 @@ class TestConfigDefaults:
         assert config.stfactory_db == "/home/apexaipc/projects/st-factory/data/persona_metrics.db"
 
     def test_default_thresholds(self):
-        config = Config()
-        assert config.approve_threshold == 68
-        assert config.reject_threshold == 40
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("METROPLEX_APPROVE_THRESHOLD", None)
+            os.environ.pop("METROPLEX_REJECT_THRESHOLD", None)
+            config = Config()
+            assert config.approve_threshold == 55
+            assert config.reject_threshold == 40
 
     def test_default_caps(self):
         config = Config()
@@ -127,7 +130,7 @@ class TestConfigEnvOverrides:
     def test_invalid_int_env_keeps_default(self):
         with patch.dict(os.environ, {"METROPLEX_APPROVE_THRESHOLD": "not_a_number"}):
             config = Config()
-            assert config.approve_threshold == 68  # default preserved
+            assert config.approve_threshold == 55  # default preserved
 
     def test_override_max_concurrent_builds(self):
         with patch.dict(os.environ, {"METROPLEX_MAX_CONCURRENT_BUILDS": "4"}):

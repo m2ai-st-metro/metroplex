@@ -33,6 +33,8 @@ class OutcomeEmitter:
 
         self.store = ContractStore(data_dir=stfactory_data_dir)
         self._emit_count = 0
+        self._emitted: dict[tuple[int, str], int] = {}  # (idea_id, outcome) -> count
+        self.max_emissions_per_idea = 3
 
     def emit(
         self,
@@ -69,6 +71,16 @@ class OutcomeEmitter:
         """
         from contracts.outcome_record import OutcomeRecord, TerminalOutcome, PipelineTrace
 
+        # Dedup guard: prevent cascading duplicate emissions per session
+        key = (idea_id, outcome)
+        prior = self._emitted.get(key, 0)
+        if prior >= self.max_emissions_per_idea:
+            logger.debug(
+                "Suppressed duplicate outcome: idea=%s outcome=%s (already emitted %d times)",
+                idea_id, outcome, prior,
+            )
+            return True
+
         try:
             # Build pipeline trace objects
             trace_objects = []
@@ -98,6 +110,7 @@ class OutcomeEmitter:
 
             self.store.write_outcome(record)
             self._emit_count += 1
+            self._emitted[key] = prior + 1
             logger.info(
                 "Outcome emitted: idea=%s outcome=%s title=%s",
                 idea_id, outcome, idea_title,

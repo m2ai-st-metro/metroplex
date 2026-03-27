@@ -201,7 +201,7 @@ class BuildOrchestrator:
         self.queue_runner_path = Path(config.yce_dir) / "queue_runner.py"
         self.yce_python = Path(config.yce_dir) / "venv" / "bin" / "python"
 
-    def queue_build(self, idea: dict, spec_path: Path, dry_run: bool = False) -> BuildJob | None:
+    def queue_build(self, idea: dict, spec_path: Path, dry_run: bool = False, attempt: int = 0) -> BuildJob | None:
         """
         Queue a build job via queue_runner.py add.
 
@@ -209,12 +209,14 @@ class BuildOrchestrator:
             idea: Idea dictionary with id and title
             spec_path: Path to generated spec file
             dry_run: If True, print command without executing
+            attempt: Retry attempt number (0 = first try, 1+ = retries)
 
         Returns:
             BuildJob if executed, None if dry_run
         """
         source = idea.get("_source", "ideaforge")
-        job_id = f"metroplex-{source}-{idea['id']}"
+        base_job_id = f"metroplex-{source}-{idea['id']}"
+        job_id = f"{base_job_id}-r{attempt}" if attempt > 0 else base_job_id
         command = [
             str(self.yce_python),
             str(self.queue_runner_path),
@@ -526,6 +528,8 @@ class BuildOrchestrator:
                         project_dir = job_data.get("project_dir")
                         if project_dir:
                             self.state_db.update_build_job_project_dir(job_id, project_dir)
+                        # Extract per-build log for postmortem analysis
+                        self._extract_build_log(job_id)
                 except Exception as e:
                     self.audit_logger.log_error(
                         gate="build",
@@ -541,6 +545,8 @@ class BuildOrchestrator:
                         project_dir = job_data.get("project_dir")
                         if project_dir:
                             self.state_db.update_build_job_project_dir(job_id, project_dir)
+                        # Extract per-build log for postmortem analysis
+                        self._extract_build_log(job_id)
                 except Exception as e:
                     self.audit_logger.log_error(
                         gate="build",
@@ -550,11 +556,129 @@ class BuildOrchestrator:
 
         result["running_count"] = len(result["running"])
 
+        # Filesystem fallback: detect orphaned builds where the queue_runner
+        # shows "pending" but a completed generation directory already exists.
+        # This covers the case where the runner process was killed before it
+        # could persist completion status back to queue.json.
+        yce_generations = Path(self.config.yce_dir) / "generations"
+        for job_data in status["jobs"]:
+            job_status = job_data.get("status", "")
+            job_id = job_data.get("id", "")
+            if job_status == "pending" and job_id and not job_data.get("project_dir"):
+                candidate_dir = yce_generations / job_id
+                if candidate_dir.is_dir() and self._has_source_code(candidate_dir):
+                    try:
+                        changed = self.state_db.update_build_job_status(job_id, "completed")
+                        if changed:
+                            logger.info(
+                                "Filesystem fallback: detected orphaned completed build for %s at %s",
+                                job_id, candidate_dir,
+                            )
+                            result["newly_synced"].append(job_id)
+                            self.state_db.update_build_job_project_dir(job_id, str(candidate_dir))
+                            result["completed"].append(job_id)
+                            self.audit_logger.log_decision(
+                                gate="build",
+                                action="filesystem_fallback_sync",
+                                details={
+                                    "job_id": job_id,
+                                    "project_dir": str(candidate_dir),
+                                },
+                            )
+                    except Exception as e:
+                        self.audit_logger.log_error(
+                            gate="build",
+                            error=f"Failed filesystem fallback sync for {job_id}: {e}",
+                            details={"job_id": job_id},
+                        )
+
+        # Stale queued build recovery: detect builds stuck in 'queued' status
+        # where priority_queue says 'dispatched' but the YCE runner never picked
+        # them up.  Reset to 'pending' so the next cycle re-dispatches.
+        try:
+            stale_builds = self.state_db.get_stale_queued_builds()
+            for sb in stale_builds:
+                job_id = sb["queue_job_id"]
+                logger.warning(
+                    "Stale queued build detected: %s (queued at %s) — resetting to pending",
+                    job_id, sb["queued_at"],
+                )
+                self.state_db.reset_stale_queued_build(job_id, sb["priority_queue_id"])
+                self.audit_logger.log_decision(
+                    gate="build",
+                    action="stale_queued_reset",
+                    details={
+                        "queue_job_id": job_id,
+                        "idea_id": sb["idea_id"],
+                        "title": sb["title"],
+                        "queued_at": sb["queued_at"],
+                        "threshold_minutes": self.state_db.STALE_QUEUED_THRESHOLD_MINUTES,
+                    },
+                )
+                result.setdefault("stale_reset", []).append(job_id)
+        except Exception as e:
+            self.audit_logger.log_error(
+                gate="build",
+                error=f"Stale queued build check failed: {e}",
+                details={},
+            )
+
         # Clean up PID file if runner is no longer active
         if result["running_count"] == 0 and not self.is_runner_active():
             RUNNER_PID_FILE.unlink(missing_ok=True)
 
         return result
+
+    def _extract_build_log(self, job_id: str) -> None:
+        """Extract per-build log from runner.log into data/build_logs/{job_id}.log.
+
+        Scans runner.log for lines prefixed with [{job_id}] and writes them
+        to a dedicated log file so postmortem analysis can read build output.
+        Best-effort: silently returns on any error.
+        """
+        runner_log = Path(__file__).parent.parent / "data" / "runner.log"
+        if not runner_log.exists():
+            return
+
+        build_log_dir = Path(__file__).parent.parent / "data" / "build_logs"
+        build_log_dir.mkdir(parents=True, exist_ok=True)
+        build_log_path = build_log_dir / f"{job_id}.log"
+
+        # Skip if already extracted
+        if build_log_path.exists() and build_log_path.stat().st_size > 0:
+            return
+
+        try:
+            prefix = f"[{job_id}]"
+            matched_lines = []
+            with open(runner_log, "r", encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    if line.lstrip().startswith(prefix):
+                        matched_lines.append(line)
+
+            if matched_lines:
+                build_log_path.write_text("".join(matched_lines), encoding="utf-8")
+                logger.info(
+                    "Extracted %d lines of build log for %s -> %s",
+                    len(matched_lines), job_id, build_log_path,
+                )
+        except Exception as e:
+            logger.warning("Failed to extract build log for %s: %s", job_id, e)
+
+    @staticmethod
+    def _has_source_code(project_dir: Path) -> bool:
+        """Check if a generation directory contains actual source code (not just scaffolding).
+
+        Requires at least one .py or .js/.ts file and a README to consider
+        the build complete.
+        """
+        has_readme = (project_dir / "README.md").exists()
+        has_code = False
+        for ext in ("*.py", "*.js", "*.ts"):
+            if list(project_dir.glob(f"**/{ext}"))[:1]:
+                has_code = True
+                break
+        return has_readme and has_code
 
     def run(self, approved_ideas: list[dict], dry_run: bool = False) -> list[BuildJob]:
         """
@@ -593,7 +717,7 @@ class BuildOrchestrator:
                     idea_id=idea.get("id", 0),
                     title=idea.get("title", "Unknown"),
                     spec_path="",
-                    queue_job_id=f"metroplex-{idea.get('id', 0)}",
+                    queue_job_id=f"metroplex-ideaforge-{idea.get('id', 0)}",
                     status="failed",
                     queued_at=datetime.now()
                 )
@@ -633,14 +757,14 @@ class BuildOrchestrator:
                 break
 
             # Skip if a completed build already exists or retries are exhausted
-            existing_job_id = f"metroplex-{item.source}-{item.source_id}"
-            if state_db.has_completed_build(existing_job_id):
+            base_job_id = f"metroplex-{item.source}-{item.source_id}"
+            if state_db.has_completed_build(base_job_id):
                 state_db.update_item_status(item.id, "completed")
-                logger.info("Skipping %s — completed build already exists", existing_job_id)
+                logger.info("Skipping %s — completed build already exists", base_job_id)
                 continue
-            if state_db.has_exhausted_retries(existing_job_id):
+            if state_db.has_exhausted_retries(base_job_id):
                 state_db.update_item_status(item.id, "failed")
-                logger.info("Skipping %s — retries exhausted", existing_job_id)
+                logger.info("Skipping %s — retries exhausted", base_job_id)
                 continue
 
             # Parse idea data
@@ -675,7 +799,9 @@ class BuildOrchestrator:
                     logger.warning("Failed to refresh idea %s from IdeaForge: %s", item.source_id, e)
 
             source = idea.get("_source", "ideaforge")
-            job_id = f"metroplex-{source}-{idea['id']}"
+            base_job_id = f"metroplex-{source}-{idea['id']}"
+            attempt = state_db.count_failed_builds(base_job_id)
+            job_id = f"{base_job_id}-r{attempt}" if attempt > 0 else base_job_id
             queued_at = datetime.now()
 
             # Pre-build feasibility check (L5 B2)
@@ -776,9 +902,61 @@ class BuildOrchestrator:
                         spec_text = spec_path.read_text(encoding="utf-8")
                         tyrest_result = self.tyrest_gate.review_spec(spec_text, idea_title=idea["title"])
 
+                        # Feedback loop: if rejected, try simplification once
+                        if tyrest_result.rejected and self.spec_generator.llm_expander is not None:
+                            logger.info(
+                                "Tyrest REJECTED spec for %s, attempting simplification feedback loop",
+                                idea["title"],
+                            )
+                            self.audit_logger.log_decision(
+                                gate="build",
+                                action="tyrest_rejected_attempting_simplify",
+                                details={
+                                    "idea_id": idea["id"],
+                                    "title": idea["title"],
+                                    "reasoning": tyrest_result.reasoning,
+                                    "overall": tyrest_result.overall,
+                                    "risk_flags": tyrest_result.risk_flags,
+                                },
+                            )
+
+                            try:
+                                simplified_spec = self.spec_generator.llm_expander.expand_simplified(
+                                    idea,
+                                    rejection_reasoning=tyrest_result.reasoning,
+                                    risk_flags=tyrest_result.risk_flags,
+                                    suggestions=tyrest_result.suggestions,
+                                )
+                                # Overwrite spec file with simplified version
+                                spec_path.write_text(simplified_spec, encoding="utf-8")
+                                logger.info(
+                                    "Simplified spec for %s: %d chars (was %d)",
+                                    idea["title"], len(simplified_spec), len(spec_text),
+                                )
+
+                                # Re-review the simplified spec
+                                tyrest_result = self.tyrest_gate.review_spec(
+                                    simplified_spec, idea_title=idea["title"]
+                                )
+                                self.audit_logger.log_decision(
+                                    gate="build",
+                                    action="tyrest_simplified_review",
+                                    details={
+                                        "idea_id": idea["id"],
+                                        "title": idea["title"],
+                                        "verdict": tyrest_result.verdict,
+                                        "overall": tyrest_result.overall,
+                                        "simplified": True,
+                                    },
+                                )
+                            except Exception as e:
+                                logger.warning(
+                                    "Simplification failed for %s: %s", idea["title"], e
+                                )
+
                         if tyrest_result.rejected:
                             logger.info(
-                                "Tyrest REJECTED spec for %s: %s",
+                                "Tyrest REJECTED spec for %s (final): %s",
                                 idea["title"], tyrest_result.reasoning,
                             )
                             job = BuildJob(
@@ -817,7 +995,7 @@ class BuildOrchestrator:
                         )
 
                     # Queue build via YCE queue_runner
-                    job = self.queue_build(idea, spec_path, dry_run=dry_run)
+                    job = self.queue_build(idea, spec_path, dry_run=dry_run, attempt=attempt)
                     if job:
                         # Store feasibility score on the build job (L5 B2)
                         feas = idea.get("_feasibility_score")

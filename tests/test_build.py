@@ -853,6 +853,60 @@ class TestBuildOrchestrator:
             assert result["running_count"] == 0
             assert result["newly_synced"] == []
 
+    # --- Stale Queued Build Detection ---
+
+    def test_poll_and_sync_resets_stale_queued_builds(self, orchestrator, mock_state_db, mock_audit_logger):
+        """Stale queued builds are detected and reset to pending."""
+        stale_builds = [
+            {
+                "queue_job_id": "metroplex-ideaforge-133",
+                "idea_id": 133,
+                "title": "AgentFlow Orchestrator",
+                "queued_at": "2026-03-23T06:19:36.965141",
+                "priority_queue_id": 31,
+                "source": "ideaforge",
+                "source_id": "133",
+            }
+        ]
+        mock_state_db.get_stale_queued_builds = Mock(return_value=stale_builds)
+        mock_state_db.reset_stale_queued_build = Mock()
+
+        with patch.object(orchestrator, 'check_status', return_value={"jobs": []}), \
+             patch.object(orchestrator, 'is_runner_active', return_value=False):
+            result = orchestrator.poll_and_sync_status()
+
+        mock_state_db.reset_stale_queued_build.assert_called_once_with(
+            "metroplex-ideaforge-133", 31
+        )
+        assert result.get("stale_reset") == ["metroplex-ideaforge-133"]
+        mock_audit_logger.log_decision.assert_called()
+        logged = mock_audit_logger.log_decision.call_args
+        assert logged[1]["action"] == "stale_queued_reset" or logged[0][1] == "stale_queued_reset"
+
+    def test_poll_and_sync_no_stale_builds(self, orchestrator, mock_state_db, mock_audit_logger):
+        """No stale builds means no resets."""
+        mock_state_db.get_stale_queued_builds = Mock(return_value=[])
+        mock_state_db.reset_stale_queued_build = Mock()
+
+        with patch.object(orchestrator, 'check_status', return_value={"jobs": []}), \
+             patch.object(orchestrator, 'is_runner_active', return_value=False):
+            result = orchestrator.poll_and_sync_status()
+
+        mock_state_db.reset_stale_queued_build.assert_not_called()
+        assert "stale_reset" not in result
+
+    def test_poll_and_sync_stale_check_error_does_not_crash(self, orchestrator, mock_state_db, mock_audit_logger):
+        """Stale build check failure is logged but doesn't break the poll."""
+        mock_state_db.get_stale_queued_builds = Mock(side_effect=Exception("DB locked"))
+
+        with patch.object(orchestrator, 'check_status', return_value={"jobs": []}), \
+             patch.object(orchestrator, 'is_runner_active', return_value=False):
+            result = orchestrator.poll_and_sync_status()
+
+        # Should still return a valid result
+        assert result["running"] == []
+        mock_audit_logger.log_error.assert_called()
+
     def test_run_from_queue_capacity_dispatch(self, mock_state_db, mock_spec_generator, mock_audit_logger):
         """Test run_from_queue dispatches up to max_approve_per_cycle items."""
         config = Config()
@@ -881,6 +935,7 @@ class TestBuildOrchestrator:
         mock_state_db.update_item_status = Mock()
         mock_state_db.has_completed_build = Mock(return_value=False)
         mock_state_db.has_exhausted_retries = Mock(return_value=False)
+        mock_state_db.count_failed_builds = Mock(return_value=0)
 
         # Mock spec generation and queue_build
         mock_spec_path = Mock()

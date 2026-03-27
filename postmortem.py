@@ -139,6 +139,7 @@ def capture_postmortem(
     spec_path: str | None = None,
     idea_score: float | None = None,
     artifact_type: str | None = None,
+    retry_count: int | None = None,
 ) -> bool:
     """Capture a structured post-mortem for a failed build.
 
@@ -153,6 +154,7 @@ def capture_postmortem(
         spec_path: Path to spec file (optional)
         idea_score: IdeaForge weighted score (optional)
         artifact_type: Artifact type from classification (optional)
+        retry_count: Retry attempt number (0 or None = first attempt)
 
     Returns:
         True if postmortem was captured, False if skipped or errored
@@ -160,13 +162,17 @@ def capture_postmortem(
     try:
         state_db.connect()
 
+        # Include retry count in dedup key so retried builds get their own postmortems
+        effective_retry = retry_count or 0
+        dedup_key = f"{queue_job_id}_retry{effective_retry}" if effective_retry > 0 else queue_job_id
+
         # Dedup check
         row = state_db.conn.execute(
             "SELECT 1 FROM build_postmortems WHERE queue_job_id = ?",
-            (queue_job_id,),
+            (dedup_key,),
         ).fetchone()
         if row is not None:
-            logger.debug("Postmortem already exists for %s, skipping", queue_job_id)
+            logger.debug("Postmortem already exists for %s, skipping", dedup_key)
             return False
 
         # Read and classify
@@ -181,7 +187,7 @@ def capture_postmortem(
              error_signature, spec_path, idea_weighted_score, idea_artifact_type, created_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
-                queue_job_id,
+                dedup_key,
                 idea_id,
                 title,
                 failure_category,
@@ -196,7 +202,7 @@ def capture_postmortem(
         state_db.conn.commit()
         logger.info(
             "Captured postmortem for %s: category=%s stage=%s",
-            queue_job_id, failure_category, failure_stage,
+            dedup_key, failure_category, failure_stage,
         )
         return True
 

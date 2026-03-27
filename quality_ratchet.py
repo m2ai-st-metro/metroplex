@@ -1,7 +1,9 @@
 """
 Quality Ratchet - Phase 14e
 Auto-tunes the minimum quality threshold for build publishing.
-Ratchet constraint: thresholds only tighten (increase), never loosen.
+Ratchet constraint: thresholds only tighten (increase), never loosen — unless
+the ratchet has been unchanged for N consecutive cycles, in which case a small
+decay (loosening) is applied to prevent permanent deadlock.
 
 Two activation tiers:
 - Advisory (15+ scored builds): produces correlation report but does NOT auto-adjust
@@ -10,6 +12,7 @@ Two activation tiers:
 Stores threshold state in metroplex.db via a simple key-value table.
 """
 import logging
+import os
 from datetime import datetime
 from statistics import median
 
@@ -71,7 +74,74 @@ def set_quality_threshold(state_db: StateDB, threshold: float) -> None:
     state_db.conn.commit()
 
 
-def evaluate_ratchet(state_db: StateDB) -> dict:
+def get_unchanged_count(state_db: StateDB) -> int:
+    """Read the consecutive unchanged cycle count from the DB."""
+    state_db.connect()
+    cursor = state_db.conn.cursor()
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS ratchet_state (
+            key TEXT PRIMARY KEY,
+            value REAL NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+    """)
+    state_db.conn.commit()
+
+    cursor.execute("SELECT value FROM ratchet_state WHERE key = 'quality_unchanged_count'")
+    row = cursor.fetchone()
+    return int(row["value"]) if row else 0
+
+
+def set_unchanged_count(state_db: StateDB, count: int) -> None:
+    """Write the consecutive unchanged cycle count to the DB."""
+    state_db.connect()
+    cursor = state_db.conn.cursor()
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS ratchet_state (
+            key TEXT PRIMARY KEY,
+            value REAL NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+    """)
+
+    cursor.execute("""
+        INSERT OR REPLACE INTO ratchet_state (key, value, updated_at)
+        VALUES ('quality_unchanged_count', ?, ?)
+    """, (float(count), datetime.now().isoformat()))
+    state_db.conn.commit()
+
+
+def recalibrate_threshold(state_db: StateDB) -> dict:
+    """Force-reset the quality threshold to the current proposed value.
+
+    Used by the CLI `recalibrate` command for manual deadlock resolution.
+
+    Returns a dict with old_threshold, new_threshold, and stats.
+    """
+    result = evaluate_ratchet(state_db, allow_recalibrate=True)
+    proposed = result.get("proposed_threshold")
+
+    if proposed is None:
+        return {
+            "success": False,
+            "reason": result.get("reason", "Cannot compute proposed threshold"),
+        }
+
+    old = get_quality_threshold(state_db)
+    set_quality_threshold(state_db, proposed)
+    set_unchanged_count(state_db, 0)
+
+    return {
+        "success": True,
+        "old_threshold": old,
+        "new_threshold": proposed,
+        "stats": result.get("stats", {}),
+    }
+
+
+def evaluate_ratchet(state_db: StateDB, allow_recalibrate: bool = False) -> dict:
     """Evaluate whether the quality threshold should be tightened.
 
     Returns a dict with:
@@ -132,12 +202,15 @@ def evaluate_ratchet(state_db: StateDB) -> dict:
 
     for r in rows:
         score = r["quality_score"]
-        if r["review_status"] in ("review_failed", "tyrest_rejected"):
+        # Published takes precedence — a build that shipped is a success
+        # regardless of review_status (fixes misclassification where
+        # published-but-review-failed builds were counted as failures)
+        if r["pub_status"] == "published":
+            published_scores.append(score)
+        elif r["review_status"] in ("review_failed", "tyrest_rejected"):
             failed_scores.append(score)
         elif r["status"] == "failed":
             failed_scores.append(score)
-        elif r["pub_status"] == "published":
-            published_scores.append(score)
 
     all_scores = [r["quality_score"] for r in rows]
 
@@ -183,14 +256,52 @@ def evaluate_ratchet(state_db: StateDB) -> dict:
         )
         return result
 
-    # Ratchet constraint: only tighten
+    # Ratchet constraint: only tighten (with decay escape valve)
     if current is not None and proposed <= current:
+        if allow_recalibrate:
+            # Called from recalibrate — just return stats, don't apply
+            result["reason"] = (
+                f"Proposed {proposed} <= current {current} — recalibrate mode"
+            )
+            return result
+
+        unchanged_count = get_unchanged_count(state_db) + 1
+        set_unchanged_count(state_db, unchanged_count)
+
+        # Load decay config
+        stale_cycles = int(os.environ.get("METROPLEX_RATCHET_STALE_CYCLES", "10"))
+        decay_amount = float(os.environ.get("METROPLEX_RATCHET_DECAY_AMOUNT", "0.5"))
+
+        if unchanged_count >= stale_cycles:
+            # Decay: loosen by a small amount to break deadlock
+            decayed = round(current - decay_amount, 1)
+            # Never decay below the proposed value
+            if decayed < proposed:
+                decayed = proposed
+            set_quality_threshold(state_db, decayed)
+            set_unchanged_count(state_db, 0)
+            result["tightened"] = False
+            result["decayed"] = True
+            result["current_threshold"] = decayed
+            result["unchanged_cycles"] = unchanged_count
+            result["reason"] = (
+                f"DECAY: Ratchet unchanged for {unchanged_count} cycles. "
+                f"Loosened from {current} to {decayed} "
+                f"(proposed {proposed}, decay amount {decay_amount})"
+            )
+            logger.warning("Quality ratchet DECAY: %s", result["reason"])
+            return result
+
+        result["unchanged_cycles"] = unchanged_count
         result["reason"] = (
-            f"Proposed {proposed} <= current {current} — ratchet prevents loosening"
+            f"Proposed {proposed} <= current {current} — ratchet prevents loosening "
+            f"({unchanged_count}/{stale_cycles} cycles until decay)"
         )
         return result
 
-    # Apply the tightening
+    # Apply the tightening — reset unchanged counter
+    set_unchanged_count(state_db, 0)
+
     if current is None:
         result["reason"] = f"Initial threshold set to {proposed}"
     else:

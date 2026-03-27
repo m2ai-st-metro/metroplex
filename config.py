@@ -50,7 +50,7 @@ class Config:
     max_concurrent_builds: int = field(default=1)
 
     # Scoring thresholds
-    approve_threshold: int = field(default=68)
+    approve_threshold: int = field(default=55)
     reject_threshold: int = field(default=40)
     max_deferrals: int = field(default=3)
 
@@ -107,7 +107,7 @@ class Config:
 
     # Tyrest QA gate (GPT-based independent review)
     tyrest_enabled: bool = field(default=True)
-    tyrest_model: str = field(default="gpt-4o")
+    tyrest_model: str = field(default="gpt-4.1")
     tyrest_approve_confidence: float = field(default=0.75)
     tyrest_reject_confidence: float = field(default=0.75)
 
@@ -266,6 +266,16 @@ class Config:
             pass
         self.active_days = os.environ.get("METROPLEX_ACTIVE_DAYS", self.active_days)
 
+        # Quality ratchet decay
+        try:
+            self.ratchet_stale_cycles = int(os.environ.get("METROPLEX_RATCHET_STALE_CYCLES", self.ratchet_stale_cycles))
+        except ValueError:
+            pass
+        try:
+            self.ratchet_decay_amount = float(os.environ.get("METROPLEX_RATCHET_DECAY_AMOUNT", self.ratchet_decay_amount))
+        except ValueError:
+            pass
+
         # Oz Cloud Agent settings
         self.build_target = os.environ.get("METROPLEX_BUILD_TARGET", self.build_target)
         if self.build_target not in ("local", "cloud", "auto"):
@@ -312,6 +322,10 @@ class Config:
             warnings.append(f"notify_mode '{self.notify_mode}' invalid — must be all/anomaly/summary")
 
         return warnings
+
+    # Quality ratchet decay
+    ratchet_stale_cycles: int = field(default=100)  # Unchanged cycles before decay triggers
+    ratchet_decay_amount: float = field(default=0.5)  # How much to loosen per decay step
 
     # Oz Cloud Agent settings
     build_target: str = field(default="local")  # local|cloud|auto
