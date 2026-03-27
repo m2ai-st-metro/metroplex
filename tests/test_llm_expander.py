@@ -90,7 +90,7 @@ class TestLLMSpecExpander:
         """Test initialization with explicit API key."""
         with patch("gates.llm_expander.OpenAI"):
             expander = LLMSpecExpander(api_key="test-key-123")
-            assert expander.model == "anthropic/claude-4-sonnet"
+            assert expander.model == "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B"
             assert expander.max_tokens == 8192
 
     def test_init_with_env_key(self):
@@ -136,7 +136,7 @@ class TestLLMSpecExpander:
             mock_client.chat.completions.create.assert_called_once()
             call_kwargs = mock_client.chat.completions.create.call_args[1]
 
-            assert call_kwargs["model"] == "anthropic/claude-4-sonnet"
+            assert call_kwargs["model"] == "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B"
             assert call_kwargs["max_tokens"] == 8192
             assert len(call_kwargs["messages"]) == 1
             assert call_kwargs["messages"][0]["role"] == "user"
@@ -335,9 +335,9 @@ class TestConfigSpecSettings:
             assert config.spec_use_llm is False
 
     def test_spec_llm_model_default(self):
-        """Test default model is Sonnet."""
+        """Test default model is Nemotron-3."""
         config = Config()
-        assert "sonnet" in config.spec_llm_model.lower() or "claude" in config.spec_llm_model.lower()
+        assert "nemotron" in config.spec_llm_model.lower() or "nvidia" in config.spec_llm_model.lower()
 
     def test_spec_llm_model_env_override(self):
         """Test model can be overridden via env var."""

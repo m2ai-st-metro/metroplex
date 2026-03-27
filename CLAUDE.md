@@ -192,3 +192,122 @@ pytest
 arcadepy
 anthropic>=0.40.0
 ```
+
+## Operations Runbook
+
+### Diagnosing Stuck Builds
+
+```sql
+-- Find builds stuck in 'started' for over 2 hours
+sqlite3 data/metroplex.db "
+  SELECT queue_job_id, title, queued_at, status, retry_count
+  FROM build_jobs
+  WHERE status = 'started'
+    AND queued_at < datetime('now', '-2 hours')
+  ORDER BY queued_at DESC;"
+
+-- Find all failed builds with retry info
+sqlite3 data/metroplex.db "
+  SELECT queue_job_id, base_job_id, retry_count, next_retry_at, quality_score
+  FROM build_jobs
+  WHERE status = 'failed'
+  ORDER BY queued_at DESC LIMIT 20;"
+```
+
+### Cleaning YCE queue.json
+
+The YCE queue runner reads `data/yce_queue/queue.json`. Stale entries accumulate when builds are killed or time out.
+
+```bash
+# Inspect current queue
+cat data/yce_queue/queue.json | python3 -m json.tool
+
+# Remove a specific stale entry (replace JOB_ID)
+python3 -c "
+import json
+with open('data/yce_queue/queue.json') as f: q = json.load(f)
+q = [j for j in q if j.get('job_id') != 'JOB_ID']
+with open('data/yce_queue/queue.json', 'w') as f: json.dump(q, f, indent=2)
+"
+
+# Nuclear option: empty the queue (builds in progress will orphan)
+echo '[]' > data/yce_queue/queue.json
+```
+
+### Recovering Abandoned Builds
+
+Builds with `next_retry_at = 'abandoned'` are permanently skipped. To allow re-evaluation:
+
+```sql
+-- List abandoned builds
+sqlite3 data/metroplex.db "
+  SELECT queue_job_id, title, retry_count
+  FROM build_jobs
+  WHERE next_retry_at = 'abandoned';"
+
+-- Reset a specific build for retry (sets retry_count back, clears sentinel)
+sqlite3 data/metroplex.db "
+  UPDATE build_jobs
+  SET next_retry_at = NULL, retry_count = 0, status = 'failed'
+  WHERE queue_job_id = 'JOB_ID' AND next_retry_at = 'abandoned';"
+```
+
+### Resetting Circuit Breakers
+
+Gates halt after 3 consecutive failures. Check and reset:
+
+```bash
+# Check gate health
+python metroplex.py status
+
+# Reset a single gate
+python metroplex.py reset --gate build
+
+# Reset all gates
+python metroplex.py reset --gate all
+```
+
+Use `reset` when the root cause of failures has been fixed (e.g., API key rotated, upstream DB restored). Resetting without fixing the cause just burns through the breaker again.
+
+### Manual Retry
+
+```bash
+# Retry a specific failed build
+python metroplex.py retry --build-id metroplex-ideaforge-42
+
+# Check the retry was queued
+python metroplex.py builds
+```
+
+This creates a new build_jobs row with the `-r{N}` suffix and resets status to `queued`.
+
+### Quality Ratchet Recalibration
+
+The quality ratchet auto-advances the minimum quality threshold as builds improve. If the threshold drifts too high (starving the pipeline), force-recalibrate:
+
+```bash
+# Preview what recalibration would do
+python metroplex.py recalibrate
+
+# Apply without confirmation prompt
+python metroplex.py recalibrate --yes
+```
+
+### Checking Service Health
+
+```bash
+# Service status
+systemctl --user status metroplex
+
+# Follow live logs
+journalctl --user -u metroplex -f
+
+# Last 100 log lines
+journalctl --user -u metroplex -n 100 --no-pager
+
+# Check decision audit log
+tail -20 data/decisions.log | python3 -m json.tool
+
+# Check for orphan build processes
+ps aux | grep queue_runner
+```

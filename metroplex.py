@@ -16,6 +16,7 @@ from gates.triage import TriageGate
 from gates.build import SpecGenerator, BuildOrchestrator
 from gates.patcher import PatchGate
 from gates.publish import PublishGate
+from gates.readme import ReadmeGate
 from gates.review import ReviewGate
 from gates.tyrest import TyrestGate
 from orchestrator import CycleOrchestrator
@@ -28,6 +29,11 @@ from readers.stfactory_reader import STFactoryReader
 from dispatcher import create_dispatcher, route_to_worker, build_dispatch_prompt
 from outcome_emitter import create_outcome_emitter
 from dashboard import compute_funnel_metrics, format_funnel_output
+from quality_ratchet import (
+    get_quality_threshold,
+    get_unchanged_count,
+    recalibrate_threshold,
+)
 
 
 def setup_logging(verbose: bool):
@@ -174,6 +180,12 @@ def initialize_components(config: Config):
         audit_logger=audit_logger,
     )
 
+    readme_gate = ReadmeGate(
+        config=config,
+        state_db=state_db,
+        audit_logger=audit_logger,
+    )
+
     # Initialize notifier (wrapped with FilteredNotifier for anomaly/summary modes)
     raw_notifier = create_notifier(config.telegram_bot_token, config.telegram_chat_id)
     notifier = FilteredNotifier(raw_notifier, config.notify_mode)
@@ -205,6 +217,7 @@ def initialize_components(config: Config):
         tyrest_gate=tyrest_gate,
         dispatcher=dispatcher,
         outcome_emitter=outcome_emitter,
+        readme_gate=readme_gate,
     )
 
     return orchestrator, state_db, circuit_breaker
@@ -1220,6 +1233,90 @@ def cmd_funnel(args, config: Config):
         return 1
 
 
+def cmd_recalibrate(args, config: Config):
+    """
+    Force-recalibrate the quality ratchet threshold to the current proposed value.
+
+    Args:
+        args: Parsed command-line arguments
+        config: Metroplex configuration
+
+    Returns:
+        Exit code (0=success, 1=error)
+    """
+    state_db = StateDB()
+    state_db.init_db()
+
+    try:
+        current = get_quality_threshold(state_db)
+        unchanged = get_unchanged_count(state_db)
+
+        if current is None:
+            print("No quality threshold has been set yet. Nothing to recalibrate.")
+            return 1
+
+        # Compute proposed without applying
+        from quality_ratchet import evaluate_ratchet
+        eval_result = evaluate_ratchet(state_db, allow_recalibrate=True)
+        proposed = eval_result.get("proposed_threshold")
+
+        if proposed is None:
+            print(f"Cannot compute proposed threshold: {eval_result.get('reason', 'unknown')}")
+            return 1
+
+        print("Quality Ratchet Recalibration")
+        print("=" * 40)
+        print(f"  Current threshold:    {current}")
+        print(f"  Proposed threshold:   {proposed}")
+        print(f"  Unchanged cycles:     {unchanged}")
+        print(f"  Direction:            {'tighten' if proposed > current else 'loosen'}")
+        print()
+
+        if proposed == current:
+            print("Proposed equals current. No change needed.")
+            return 0
+
+        if args.yes:
+            confirmed = True
+        else:
+            answer = input(f"Reset threshold from {current} to {proposed}? [y/N] ")
+            confirmed = answer.strip().lower() in ("y", "yes")
+
+        if not confirmed:
+            print("Aborted.")
+            return 0
+
+        # Apply the recalibration
+        result = recalibrate_threshold(state_db)
+
+        if not result["success"]:
+            print(f"Failed: {result['reason']}")
+            return 1
+
+        # Log to audit
+        from audit import AuditLogger
+        audit = AuditLogger()
+        audit.log(
+            gate="quality_ratchet",
+            action="recalibrated",
+            details={
+                "old_threshold": result["old_threshold"],
+                "new_threshold": result["new_threshold"],
+                "triggered_by": "manual_cli",
+                "stats": result["stats"],
+            },
+        )
+
+        print(f"Recalibrated: {result['old_threshold']} -> {result['new_threshold']}")
+        print("Unchanged cycle counter reset to 0.")
+        return 0
+    except Exception as e:
+        print(f"ERROR: {e}")
+        return 1
+    finally:
+        state_db.close()
+
+
 def main():
     """Main CLI entry point."""
     parser = argparse.ArgumentParser(
@@ -1303,6 +1400,10 @@ def main():
     reset_parser = subparsers.add_parser("reset", help="Reset circuit breaker")
     reset_parser.add_argument("--gate", required=True, choices=["triage", "build", "publish", "patch", "all"], help="Gate to reset")
 
+    # recalibrate command
+    recalibrate_parser = subparsers.add_parser("recalibrate", help="Force-reset quality ratchet threshold to current proposed value")
+    recalibrate_parser.add_argument("--yes", "-y", action="store_true", help="Skip confirmation prompt")
+
     # Parse arguments
     args = parser.parse_args()
 
@@ -1345,6 +1446,8 @@ def main():
         sys.exit(cmd_postmortems(args, config))
     elif args.command == "reset":
         sys.exit(cmd_reset(args, config))
+    elif args.command == "recalibrate":
+        sys.exit(cmd_recalibrate(args, config))
     elif args.command == "backfill-outcomes":
         sys.exit(cmd_backfill_outcomes(args, config))
     elif args.command == "score-builds":
