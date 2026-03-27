@@ -27,17 +27,22 @@ class TestConfigDefaults:
             assert config.reject_threshold == 40
 
     def test_default_caps(self):
-        config = Config()
-        assert config.max_approve_per_cycle == 3
-        assert config.max_patches_per_cycle == 5
+        with patch.dict("os.environ", {}, clear=False):
+            os.environ.pop("METROPLEX_MAX_APPROVE_PER_CYCLE", None)
+            os.environ.pop("METROPLEX_MAX_PATCHES_PER_CYCLE", None)
+            config = Config()
+            assert config.max_approve_per_cycle == 3
+            assert config.max_patches_per_cycle == 5
 
     def test_default_circuit_breaker(self):
         config = Config()
         assert config.circuit_breaker_threshold == 3
 
     def test_default_cycle_sleep_seconds(self):
-        config = Config()
-        assert config.cycle_sleep_seconds == 60
+        with patch.dict("os.environ", {}, clear=False):
+            os.environ.pop("METROPLEX_CYCLE_SLEEP_SECONDS", None)
+            config = Config()
+            assert config.cycle_sleep_seconds == 60
 
     def test_default_build_model(self):
         config = Config()

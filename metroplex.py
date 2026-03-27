@@ -34,6 +34,7 @@ from quality_ratchet import (
     get_unchanged_count,
     recalibrate_threshold,
 )
+from health import run_health_checks, format_report, HealthStatus
 
 
 def setup_logging(verbose: bool):
@@ -1317,6 +1318,26 @@ def cmd_recalibrate(args, config: Config):
         state_db.close()
 
 
+def cmd_health(args, config: Config):
+    """
+    Run pipeline health checks and print a report.
+
+    Args:
+        args: Parsed command-line arguments
+        config: Metroplex configuration
+
+    Returns:
+        Exit code: 0=OK, 1=WARN, 2=CRIT
+    """
+    db_path = "data/metroplex.db"
+    report = run_health_checks(
+        db_path=db_path,
+        daily_cost_limit=config.daily_cost_limit,
+    )
+    print(format_report(report))
+    return int(report.overall_status)
+
+
 def main():
     """Main CLI entry point."""
     parser = argparse.ArgumentParser(
@@ -1404,6 +1425,9 @@ def main():
     recalibrate_parser = subparsers.add_parser("recalibrate", help="Force-reset quality ratchet threshold to current proposed value")
     recalibrate_parser.add_argument("--yes", "-y", action="store_true", help="Skip confirmation prompt")
 
+    # health command
+    health_parser = subparsers.add_parser("health", help="Run pipeline health checks (Phase D)")
+
     # Parse arguments
     args = parser.parse_args()
 
@@ -1456,6 +1480,8 @@ def main():
         sys.exit(cmd_quality_digest(args, config))
     elif args.command == "funnel":
         sys.exit(cmd_funnel(args, config))
+    elif args.command == "health":
+        sys.exit(cmd_health(args, config))
     else:
         parser.print_help()
         sys.exit(1)

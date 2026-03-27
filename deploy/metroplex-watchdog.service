@@ -1,0 +1,9 @@
+[Unit]
+Description=Metroplex Pipeline Watchdog
+After=metroplex.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/apexaipc/projects/metroplex
+ExecStart=/home/apexaipc/projects/metroplex/venv/bin/python watchdog.py
+Environment=HOME=/home/apexaipc

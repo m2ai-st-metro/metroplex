@@ -1,6 +1,9 @@
 """
 Pytest configuration and shared fixtures for Metroplex tests.
 """
+import os
+from unittest.mock import patch
+
 import pytest
 from pathlib import Path
 import tempfile
@@ -8,11 +11,22 @@ import tempfile
 from config import Config
 from db import StateDB
 
+# Env vars that may be set in ~/.env.shared but should not affect test defaults
+_OVERRIDE_VARS = [
+    "METROPLEX_MAX_APPROVE_PER_CYCLE",
+    "METROPLEX_CYCLE_SLEEP_SECONDS",
+    "METROPLEX_MAX_CONCURRENT_BUILDS",
+    "METROPLEX_APPROVE_THRESHOLD",
+    "METROPLEX_MAX_DEFERRALS",
+]
+
 
 @pytest.fixture
 def test_config():
-    """Provide a test configuration with safe defaults."""
-    return Config()
+    """Provide a test configuration with safe defaults (env vars stripped)."""
+    clean_env = {k: v for k, v in os.environ.items() if k not in _OVERRIDE_VARS}
+    with patch.dict(os.environ, clean_env, clear=True):
+        return Config()
 
 
 @pytest.fixture

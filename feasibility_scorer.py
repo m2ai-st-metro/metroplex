@@ -148,6 +148,63 @@ def _compute_keyword_overlap(idea: dict, postmortems_rows: list[dict]) -> float:
     return max(0.5, min(1.0, multiplier))
 
 
+def _get_prediction_threshold(state_db) -> float:
+    """Compute the optimal prediction threshold from resolved predictions.
+
+    Uses the actual success rate from feasibility_predictions to set the
+    threshold at a point that maximizes classification accuracy, rather than
+    using a fixed 50 which always predicts "success" when base rate is low.
+
+    Falls back to 50.0 if insufficient data (< 10 resolved predictions).
+    """
+    try:
+        state_db.connect()
+        rows = state_db.conn.execute(
+            """SELECT feasibility_score, actual_outcome
+            FROM feasibility_predictions
+            WHERE actual_outcome IS NOT NULL"""
+        ).fetchall()
+
+        if len(rows) < 10:
+            return 50.0
+
+        # Map outcomes to binary
+        success_outcomes = {"completed", "published", "reviewed", "success"}
+        scores_and_labels = [
+            (r[0], 1 if r[1] in success_outcomes else 0)
+            for r in rows
+        ]
+
+        # Find threshold that maximizes accuracy by testing percentile-based
+        # candidates from the actual score distribution
+        all_scores = sorted(set(s for s, _ in scores_and_labels))
+        if len(all_scores) < 2:
+            return 50.0
+
+        best_threshold = 50.0
+        best_accuracy = 0.0
+
+        for candidate in all_scores:
+            correct = sum(
+                1 for score, label in scores_and_labels
+                if (score >= candidate and label == 1) or (score < candidate and label == 0)
+            )
+            accuracy = correct / len(scores_and_labels)
+            if accuracy > best_accuracy:
+                best_accuracy = accuracy
+                best_threshold = candidate
+
+        logger.info(
+            "Prediction threshold computed: %.1f (accuracy %.1f%% over %d predictions)",
+            best_threshold, best_accuracy * 100, len(rows),
+        )
+        return best_threshold
+
+    except Exception as e:
+        logger.warning("Failed to compute prediction threshold, using default 50: %s", e)
+        return 50.0
+
+
 def score_feasibility(idea: dict, state_db) -> dict:
     """Score an idea's build feasibility.
 
@@ -179,11 +236,24 @@ def score_feasibility(idea: dict, state_db) -> dict:
 
     try:
         state_db.connect()
+
+        # Check if learned component has been disabled due to poor accuracy
+        learned_disabled = False
+        try:
+            disabled_row = state_db.conn.execute(
+                "SELECT value FROM ratchet_state WHERE key = 'feasibility_learned_disabled'"
+            ).fetchone()
+            if disabled_row and disabled_row[0] > 0:
+                learned_disabled = True
+                logger.info("Feasibility learned component disabled (accuracy too low)")
+        except Exception:
+            pass  # ratchet_state table may not exist yet
+
         pm_count = state_db.conn.execute(
             "SELECT COUNT(*) FROM build_postmortems"
         ).fetchone()[0]
 
-        if pm_count >= ACTIVATION_THRESHOLD:
+        if pm_count >= ACTIVATION_THRESHOLD and not learned_disabled:
             learned_active = True
             # Get all postmortem titles for keyword overlap
             rows = state_db.conn.execute(
@@ -197,7 +267,10 @@ def score_feasibility(idea: dict, state_db) -> dict:
     final_score = static_score * penalty_multiplier
     final_score = max(0, min(100, round(final_score, 1)))
 
-    predicted_outcome = "failure" if final_score < 50 else "success"
+    # Compute prediction threshold from actual base success rate
+    # instead of fixed 50 (which always predicts "success" when base rate ~20%)
+    prediction_threshold = _get_prediction_threshold(state_db)
+    predicted_outcome = "failure" if final_score < prediction_threshold else "success"
 
     return {
         "score": final_score,
@@ -206,6 +279,7 @@ def score_feasibility(idea: dict, state_db) -> dict:
         "feature_weights": weights,
         "learned_active": learned_active,
         "penalty_multiplier": penalty_multiplier,
+        "prediction_threshold": prediction_threshold,
     }
 
 

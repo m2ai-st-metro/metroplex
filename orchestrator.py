@@ -36,6 +36,10 @@ from postmortem import capture_postmortem, get_failure_patterns
 from feasibility_scorer import resolve_prediction, adjust_feature_weights
 from readers.ideaforge_writer import IdeaForgeWriter
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 
 class CycleOrchestrator:
     """Orchestrates full Metroplex cycles (triage -> build -> publish -> patch)."""
@@ -123,6 +127,11 @@ class CycleOrchestrator:
         Best-effort: never raises exceptions that would block the cycle.
         """
         if self.ideaforge_writer is None:
+            import logging
+            logging.getLogger(__name__).warning(
+                "IdeaForge writer not initialized, cannot write outcome for idea %d",
+                idea_id,
+            )
             return
         try:
             self.ideaforge_writer.write_build_outcome(idea_id, outcome)
@@ -131,6 +140,87 @@ class CycleOrchestrator:
             logging.getLogger(__name__).warning(
                 "Failed to write IdeaForge outcome for idea %d: %s", idea_id, e,
             )
+
+    def _backfill_ideaforge_outcomes(self) -> int:
+        """Sweep for builds with terminal outcomes that were never written to IdeaForge.
+
+        Maps build terminal states to IdeaForge outcome values:
+          - status='failed' + next_retry_at='abandoned' -> 'build_failed'
+          - status='failed' (non-retryable) -> 'build_failed'
+          - review_status='review_failed' -> 'review_failed'
+          - review_status='tyrest_rejected' -> 'tyrest_rejected'
+          - status='published' or publish confirmed -> 'published'
+
+        Returns the number of outcomes backfilled.
+        """
+        if self.ideaforge_writer is None:
+            return 0
+
+        import logging
+        log = logging.getLogger(__name__)
+
+        try:
+            self.state_db.connect()
+            # Get all idea_ids that already have outcomes in IdeaForge
+            ifw_conn = self.ideaforge_writer.conn
+            if ifw_conn is None:
+                self.ideaforge_writer._connect()
+                ifw_conn = self.ideaforge_writer.conn
+            existing = set(
+                r[0] for r in ifw_conn.execute(
+                    "SELECT id FROM ideas WHERE build_outcome IS NOT NULL"
+                ).fetchall()
+            )
+
+            # Terminal state mapping: query builds that should have outcomes
+            # Priority order matters — later outcomes override earlier ones
+            terminal_builds = self.state_db.conn.execute("""
+                SELECT DISTINCT idea_id, status, review_status, next_retry_at
+                FROM build_jobs
+                WHERE status IN ('completed', 'failed')
+                  AND idea_id IS NOT NULL
+                  AND typeof(idea_id) != 'text' OR (typeof(idea_id) = 'text' AND idea_id GLOB '[0-9]*')
+            """).fetchall()
+
+            backfilled = 0
+            # Track best outcome per idea_id (published > review_failed > build_failed)
+            outcome_map: dict[int, str] = {}
+            for row in terminal_builds:
+                try:
+                    idea_id = int(row[0])
+                except (ValueError, TypeError):
+                    continue
+
+                if idea_id in existing:
+                    continue
+
+                status = row[1]
+                review_status = row[2]
+                next_retry_at = row[3]
+
+                if review_status == "tyrest_rejected":
+                    outcome_map[idea_id] = "tyrest_rejected"
+                elif review_status == "review_failed":
+                    # Don't override tyrest_rejected
+                    if outcome_map.get(idea_id) != "tyrest_rejected":
+                        outcome_map[idea_id] = "review_failed"
+                elif status == "failed":
+                    # Only set build_failed if no better outcome exists
+                    if idea_id not in outcome_map:
+                        outcome_map[idea_id] = "build_failed"
+
+            for idea_id, outcome in outcome_map.items():
+                try:
+                    self.ideaforge_writer.write_build_outcome(idea_id, outcome)
+                    backfilled += 1
+                except Exception as e:
+                    log.warning("Backfill failed for idea %d: %s", idea_id, e)
+
+            return backfilled
+
+        except Exception as e:
+            log.warning("Backfill sweep error: %s", e)
+            return 0
 
     def check_budget(self) -> tuple[bool, str]:
         """Check if spending is within daily and monthly budget limits.
@@ -822,10 +912,14 @@ class CycleOrchestrator:
                     try:
                         resolve_prediction(self.state_db, queue_job_id, "failure")
                         idea_id = int(build["idea_id"]) if str(build["idea_id"]).isdigit() else None
-                        if idea_id and self._ideaforge_writer:
+                        if idea_id:
                             self._write_ideaforge_outcome(idea_id, "build_failed")
-                    except Exception:
-                        pass  # Best-effort — don't block abandonment flow
+                    except Exception as e:
+                        import logging
+                        logging.getLogger(__name__).warning(
+                            "Failed to close feedback loop for abandoned build %s: %s",
+                            queue_job_id, e,
+                        )
 
             # 2. Retry builds that haven't exhausted retries and whose backoff has expired
             retryable = self.state_db.get_retryable_builds()
@@ -1203,6 +1297,23 @@ class CycleOrchestrator:
             if cycle_outcomes > 0:
                 print(f"+ Outcomes emitted: {cycle_outcomes}")
 
+        # IdeaForge outcome backfill sweep (L5 B3)
+        # Catches builds that reached terminal state but whose write-back was
+        # missed due to crashes, writer init failures, or code-path gaps.
+        try:
+            backfilled = self._backfill_ideaforge_outcomes()
+            if backfilled > 0:
+                import logging
+                logging.getLogger(__name__).info(
+                    "Backfilled %d IdeaForge outcomes", backfilled,
+                )
+                print(f"+ IdeaForge outcome backfill: {backfilled} written")
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).warning(
+                "IdeaForge outcome backfill failed: %s", e,
+            )
+
         # End cycle
         self.state_db.end_cycle(cycle_id, triage_count, build_count, patch_count, errors, publish_count)
         self.audit_logger.log_cycle_end(cycle_id, triage_count, build_count, patch_count, errors)
@@ -1223,6 +1334,16 @@ class CycleOrchestrator:
                 f"Metroplex: {triage_count} triaged, {build_count} built{pub_text}{disp_text}, {patch_count} patched{error_text}",
                 summary_level,
             )
+
+        # Anomaly detection (Phase D) — runs after all gates, before return
+        try:
+            from anomaly_detector import AnomalyDetector
+            detector = AnomalyDetector(self.config.state_db_path, self.notifier)
+            anomalies = detector.run_all()
+            if anomalies:
+                logger.warning("Anomalies detected: %s", anomalies)
+        except Exception as e:
+            logger.debug("Anomaly detection skipped: %s", e)
 
         # Update cycle result
         cycle_result.completed_at = datetime.now()

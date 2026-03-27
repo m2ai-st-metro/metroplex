@@ -218,8 +218,10 @@ class TestCycleSleepSecondsConfig:
 
     def test_default_is_60(self):
         """Default cycle_sleep_seconds should be 60."""
-        config = Config()
-        assert config.cycle_sleep_seconds == 60
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("METROPLEX_CYCLE_SLEEP_SECONDS", None)
+            config = Config()
+            assert config.cycle_sleep_seconds == 60
 
     def test_env_var_override(self):
         """METROPLEX_CYCLE_SLEEP_SECONDS env var overrides default."""
