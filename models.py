@@ -40,6 +40,18 @@ class PatchApplication(BaseModel):
     applied_at: datetime
 
 
+class AgentPatchApplication(BaseModel):
+    """Agent patch application record (CLAUDE.md / agent.yaml section patches)."""
+    patch_id: str
+    agent_id: str
+    target: str  # "claude_md" | "agent_yaml"
+    section: str
+    operation: str  # "add" | "replace" | "remove"
+    status: Literal["applied", "failed", "skipped"]
+    reason: str
+    applied_at: datetime
+
+
 class CycleResult(BaseModel):
     """Result of a full Metroplex cycle."""
     cycle_id: str

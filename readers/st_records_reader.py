@@ -143,6 +143,84 @@ class STRecordsReader:
         finally:
             write_conn.close()
 
+    def get_approved_agent_patches(self) -> list[dict]:
+        """
+        Get all approved agent patches.
+
+        Returns patches from agent_patches where status = 'approved'.
+        Merges raw_json fields (value, source_recommendation_ids) into result.
+
+        Returns:
+            List of patch dictionaries with fields:
+            - patch_id, agent_id, target, section, operation, value,
+              rationale, source_recommendation_ids, status
+        """
+        self._connect()
+        cursor = self.conn.cursor()
+
+        try:
+            cursor.execute("""
+                SELECT
+                    patch_id,
+                    agent_id,
+                    target,
+                    section,
+                    operation,
+                    rationale,
+                    status,
+                    raw_json
+                FROM agent_patches
+                WHERE status = 'approved'
+            """)
+        except Exception:
+            # Table may not exist in older ST Records DBs
+            return []
+
+        rows = cursor.fetchall()
+        results = []
+        for row in rows:
+            row_dict = dict(row)
+            # Parse raw_json to extract value and source_recommendation_ids
+            raw = row_dict.pop("raw_json", None)
+            if raw:
+                try:
+                    parsed = json.loads(raw)
+                    row_dict["value"] = parsed.get("value")
+                    row_dict["source_recommendation_ids"] = parsed.get(
+                        "source_recommendation_ids", []
+                    )
+                except (json.JSONDecodeError, TypeError):
+                    row_dict["value"] = None
+                    row_dict["source_recommendation_ids"] = []
+            else:
+                row_dict["value"] = None
+                row_dict["source_recommendation_ids"] = []
+            results.append(row_dict)
+
+        return results
+
+    def update_agent_patch_status(self, patch_id: str, new_status: str) -> None:
+        """
+        Update the status of an agent patch.
+
+        Opens a separate writable connection.
+
+        Args:
+            patch_id: The patch ID to update
+            new_status: The new status value
+        """
+        write_conn = sqlite3.connect(self.db_path)
+        try:
+            cursor = write_conn.cursor()
+            cursor.execute("""
+                UPDATE agent_patches
+                SET status = ?
+                WHERE patch_id = ?
+            """, (new_status, patch_id))
+            write_conn.commit()
+        finally:
+            write_conn.close()
+
     def get_outcome_records(self, limit: int = 50) -> list[dict]:
         """
         Get recent outcome records.

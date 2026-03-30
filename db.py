@@ -9,7 +9,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
-from models import TriageDecision, BuildJob, PatchApplication, CycleResult, GateStatus, PriorityItem, PublishJob
+from models import TriageDecision, BuildJob, PatchApplication, AgentPatchApplication, CycleResult, GateStatus, PriorityItem, PublishJob
 
 
 class StateDB:
@@ -90,6 +90,21 @@ class StateDB:
                 persona_id TEXT NOT NULL,
                 from_version TEXT,
                 to_version TEXT,
+                status TEXT NOT NULL CHECK(status IN ('applied', 'failed', 'skipped')),
+                reason TEXT NOT NULL DEFAULT '',
+                applied_at TEXT NOT NULL
+            )
+        """)
+
+        # Agent patch applications table
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS agent_patch_applications (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                patch_id TEXT NOT NULL,
+                agent_id TEXT NOT NULL,
+                target TEXT NOT NULL,
+                section TEXT NOT NULL,
+                operation TEXT NOT NULL,
                 status TEXT NOT NULL CHECK(status IN ('applied', 'failed', 'skipped')),
                 reason TEXT NOT NULL DEFAULT '',
                 applied_at TEXT NOT NULL
@@ -475,6 +490,28 @@ class StateDB:
             patch.persona_id,
             patch.from_version,
             patch.to_version,
+            patch.status,
+            patch.reason,
+            patch.applied_at.isoformat()
+        ))
+
+        self.conn.commit()
+
+    def record_agent_patch_application(self, patch: AgentPatchApplication):
+        """Record an agent patch application."""
+        self.connect()
+        cursor = self.conn.cursor()
+
+        cursor.execute("""
+            INSERT INTO agent_patch_applications
+            (patch_id, agent_id, target, section, operation, status, reason, applied_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            patch.patch_id,
+            patch.agent_id,
+            patch.target,
+            patch.section,
+            patch.operation,
             patch.status,
             patch.reason,
             patch.applied_at.isoformat()
