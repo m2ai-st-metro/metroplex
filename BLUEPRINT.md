@@ -20,7 +20,7 @@ L5 autonomy layer for the ST Metro ecosystem. Closes all three human gates in th
 
 ## Phase 3: Integration Testing
 
-- [x] Bootstrap upstream DBs: UM (restored .bak, 13 ideas/3 builds/7 evals), IdeaForge (init, empty), ST Factory (rebuilt from JSONL, 2 outcomes/6 recs/2 patches)
+- [x] Bootstrap upstream DBs: UM (restored .bak, 13 ideas/3 builds/7 evals), IdeaForge (init, empty), ST Records (rebuilt from JSONL, 2 outcomes/6 recs/2 patches)
 - [x] `triage --dry-run` — 0 decisions (IdeaForge has no scored ideas yet, correct)
 - [x] `build --dry-run` — "No approved ideas to build" (correct, no approvals in state DB)
 - [x] `patch --dry-run` — 2 patches found, both skipped (0 operations in raw_json, correct)
@@ -113,7 +113,7 @@ IdeaForge (signals+scores) ──→ Gate 1: Triage ──→ approve/reject/def
                                           Jinja2 template → app spec
                                           queue_runner.py subprocess
                                                         │
-ST Factory (persona_patches) ──→ Gate 3: Patcher ──→ git clone/commit/push
+ST Records (persona_patches) ──→ Gate 3: Patcher ──→ git clone/commit/push
                                           YAML ops on Academy repo
                                           Updates patch status → "applied"
 ```
@@ -127,7 +127,7 @@ ST Factory (persona_patches) ──→ Gate 3: Patcher ──→ git clone/commi
 | Score scaling 0-10 → 0-100 | IdeaForge uses 0-10, thresholds are more intuitive at 0-100 |
 | Per-cycle caps (3/5) | Prevent runaway autonomous behavior |
 | Circuit breaker (3 failures) | Gate-level halt, other gates continue |
-| Single external write | Only `persona_patches.status` in ST Factory |
+| Single external write | Only `persona_patches.status` in ST Records |
 
 ## File Manifest
 
@@ -145,6 +145,6 @@ ST Factory (persona_patches) ──→ Gate 3: Patcher ──→ git clone/commi
 | `gates/patcher.py` | Gate 3: YAML patches via git |
 | `notifier.py` | Telegram + log notification backends |
 | `readers/ideaforge_reader.py` | IdeaForge SQLite (read-only) |
-| `readers/stfactory_reader.py` | ST Factory SQLite (read + patch status write) |
+| `readers/st_records_reader.py` | ST Records SQLite (read + patch status write) |
 | `readers/um_reader.py` | Ultra-Magnus SQLite (read-only) |
 | `spec_templates/app_spec_template.md` | Jinja2 template for generated specs |

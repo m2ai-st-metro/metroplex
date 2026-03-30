@@ -150,7 +150,7 @@ class TestPatchGateCapEnforcement:
         db.init_db()
         audit = AuditLogger(os.devnull)
 
-        # Mock ST Factory reader returning 8 patches
+        # Mock ST Records reader returning 8 patches
         mock_reader = Mock()
         mock_reader.get_proposed_patches.return_value = [
             {
@@ -166,7 +166,7 @@ class TestPatchGateCapEnforcement:
         gate = PatchGate(
             config=config,
             state_db=db,
-            stfactory_reader=mock_reader,
+            st_records_reader=mock_reader,
             audit_logger=audit
         )
 

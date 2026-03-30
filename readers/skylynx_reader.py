@@ -1,9 +1,9 @@
 """
 Sky-Lynx Recommendation Reader
 Read-only SQLite interface for Sky-Lynx improvement recommendations
-stored in the ST Factory persona_metrics.db.
+stored in the ST Records persona_metrics.db.
 
-Separate from STFactoryReader because Sky-Lynx recommendations are a
+Separate from STRecordsReader because Sky-Lynx recommendations are a
 distinct intake stream: they bypass triage and enqueue directly into
 the Metroplex priority queue.
 """
@@ -24,14 +24,14 @@ PRIORITY_SCORE_MAP = {
 
 
 class SkyLynxReader:
-    """Reader for Sky-Lynx improvement recommendations from ST Factory DB."""
+    """Reader for Sky-Lynx improvement recommendations from ST Records DB."""
 
     def __init__(self, db_path: str):
         """
         Initialize Sky-Lynx reader.
 
         Args:
-            db_path: Path to ST Factory persona_metrics.db
+            db_path: Path to ST Records persona_metrics.db
 
         Raises:
             FileNotFoundError: If db_path does not exist
@@ -40,7 +40,7 @@ class SkyLynxReader:
         self.conn: Optional[sqlite3.Connection] = None
 
         if not Path(db_path).exists():
-            raise FileNotFoundError(f"ST Factory database not found at {db_path}")
+            raise FileNotFoundError(f"ST Records database not found at {db_path}")
 
         self._connect()
 
@@ -190,7 +190,7 @@ class SkyLynxReader:
         Mark a recommendation as dispatched to the priority queue.
 
         Opens a separate writable connection (same pattern as
-        STFactoryReader.update_patch_status).
+        STRecordsReader.update_patch_status).
 
         Args:
             recommendation_id: The recommendation_id to update

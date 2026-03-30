@@ -24,24 +24,24 @@ from notifier import LogNotifier
 # ---- OutcomeEmitter unit tests ----
 
 @pytest.fixture
-def stfactory_data(tmp_path):
-    """Create a temporary st-factory data directory."""
-    data_dir = tmp_path / "stfactory_data"
+def st_records_data(tmp_path):
+    """Create a temporary st-records data directory."""
+    data_dir = tmp_path / "st_records_data"
     data_dir.mkdir()
     return data_dir
 
 
 @pytest.fixture
-def emitter(stfactory_data):
+def emitter(st_records_data):
     """Create an OutcomeEmitter with a temp data dir."""
     from outcome_emitter import OutcomeEmitter
-    return OutcomeEmitter(stfactory_data_dir=stfactory_data)
+    return OutcomeEmitter(st_records_data_dir=st_records_data)
 
 
 class TestOutcomeEmitter:
     """Tests for the OutcomeEmitter class."""
 
-    def test_emit_rejected(self, emitter, stfactory_data):
+    def test_emit_rejected(self, emitter, st_records_data):
         """Emitting a rejected outcome writes to JSONL and SQLite."""
         result = emitter.emit(
             idea_id=42,
@@ -55,7 +55,7 @@ class TestOutcomeEmitter:
         assert emitter.emit_count == 1
 
         # Verify JSONL
-        jsonl_path = stfactory_data / "outcome_records.jsonl"
+        jsonl_path = st_records_data / "outcome_records.jsonl"
         assert jsonl_path.exists()
         line = jsonl_path.read_text().strip()
         record = json.loads(line)
@@ -63,7 +63,7 @@ class TestOutcomeEmitter:
         assert record["outcome"] == "rejected"
         assert record["overall_score"] == 35.0
 
-    def test_emit_published(self, emitter, stfactory_data):
+    def test_emit_published(self, emitter, st_records_data):
         """Emitting a published outcome includes github_url."""
         result = emitter.emit(
             idea_id=99,
@@ -74,12 +74,12 @@ class TestOutcomeEmitter:
         )
         assert result is True
 
-        jsonl_path = stfactory_data / "outcome_records.jsonl"
+        jsonl_path = st_records_data / "outcome_records.jsonl"
         record = json.loads(jsonl_path.read_text().strip())
         assert record["outcome"] == "published"
         assert "github.com" in record["github_url"]
 
-    def test_emit_build_failed(self, emitter, stfactory_data):
+    def test_emit_build_failed(self, emitter, st_records_data):
         """Emitting a build_failed outcome."""
         result = emitter.emit(
             idea_id=55,
@@ -90,7 +90,7 @@ class TestOutcomeEmitter:
         )
         assert result is True
 
-        jsonl_path = stfactory_data / "outcome_records.jsonl"
+        jsonl_path = st_records_data / "outcome_records.jsonl"
         record = json.loads(jsonl_path.read_text().strip())
         assert record["outcome"] == "build_failed"
 
@@ -124,7 +124,7 @@ class TestOutcomeEmitter:
         emitter.emit(idea_id=3, idea_title="C", outcome="invalid")  # fails
         assert emitter.emit_count == 2
 
-    def test_dual_write_sqlite(self, emitter, stfactory_data):
+    def test_dual_write_sqlite(self, emitter, st_records_data):
         """Outcome is written to both JSONL and SQLite."""
         emitter.emit(
             idea_id=10,
@@ -139,7 +139,7 @@ class TestOutcomeEmitter:
         assert records[0].idea_title == "Dual Write Test"
         assert records[0].outcome.value == "published"
 
-    def test_pipeline_trace(self, emitter, stfactory_data):
+    def test_pipeline_trace(self, emitter, st_records_data):
         """Pipeline trace is correctly serialized."""
         now = datetime.now()
         emitter.emit(
@@ -152,7 +152,7 @@ class TestOutcomeEmitter:
             ],
         )
 
-        jsonl_path = stfactory_data / "outcome_records.jsonl"
+        jsonl_path = st_records_data / "outcome_records.jsonl"
         record = json.loads(jsonl_path.read_text().strip())
         assert len(record["pipeline_trace"]) == 2
         assert record["pipeline_trace"][0]["stage"] == "triage"
@@ -161,9 +161,9 @@ class TestOutcomeEmitter:
 class TestCreateOutcomeEmitter:
     """Tests for the factory function."""
 
-    def test_returns_emitter_when_available(self, stfactory_data):
+    def test_returns_emitter_when_available(self, st_records_data):
         from outcome_emitter import create_outcome_emitter
-        emitter = create_outcome_emitter(stfactory_data_dir=stfactory_data)
+        emitter = create_outcome_emitter(st_records_data_dir=st_records_data)
         assert emitter is not None
 
     def test_returns_none_when_unavailable(self, tmp_path):
@@ -378,7 +378,7 @@ class TestOrchestratorEmission:
 class TestBackfillOutcomes:
     """Tests for the backfill-outcomes CLI command."""
 
-    def test_backfill_emits_for_rejected_ideas(self, state_db, stfactory_data):
+    def test_backfill_emits_for_rejected_ideas(self, state_db, st_records_data):
         """Backfill emits outcomes for triage rejects."""
         from outcome_emitter import OutcomeEmitter
 
@@ -389,7 +389,7 @@ class TestBackfillOutcomes:
             reason="below threshold", decided_at=datetime.now(),
         ))
 
-        emitter = OutcomeEmitter(stfactory_data_dir=stfactory_data)
+        emitter = OutcomeEmitter(st_records_data_dir=st_records_data)
 
         # Simulate backfill logic (extracted from cmd_backfill_outcomes)
         state_db.connect()
@@ -413,11 +413,11 @@ class TestBackfillOutcomes:
         assert records[0].idea_id == 5
         assert "backfill" in records[0].tags
 
-    def test_backfill_skips_existing(self, state_db, stfactory_data):
+    def test_backfill_skips_existing(self, state_db, st_records_data):
         """Backfill doesn't duplicate existing outcome records."""
         from outcome_emitter import OutcomeEmitter
 
-        emitter = OutcomeEmitter(stfactory_data_dir=stfactory_data)
+        emitter = OutcomeEmitter(st_records_data_dir=st_records_data)
 
         # Pre-emit an outcome
         emitter.emit(idea_id=5, idea_title="Already Tracked", outcome="rejected")

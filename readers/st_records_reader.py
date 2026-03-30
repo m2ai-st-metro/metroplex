@@ -1,6 +1,6 @@
 """
-ST Factory Database Reader
-Read-only SQLite interface for ST Factory persona metrics database.
+ST Records Database Reader
+Read-only SQLite interface for ST Records persona metrics database.
 Includes one write operation: updating patch status.
 """
 import sqlite3
@@ -9,15 +9,15 @@ from pathlib import Path
 from typing import Optional
 
 
-class STFactoryReader:
-    """Read-only reader for ST Factory database (with one write operation)."""
+class STRecordsReader:
+    """Read-only reader for ST Records database (with one write operation)."""
 
     def __init__(self, db_path: str):
         """
-        Initialize ST Factory reader.
+        Initialize ST Records reader.
 
         Args:
-            db_path: Path to ST Factory SQLite database
+            db_path: Path to ST Records SQLite database
 
         Raises:
             FileNotFoundError: If db_path does not exist
@@ -26,7 +26,7 @@ class STFactoryReader:
         self.conn: Optional[sqlite3.Connection] = None
 
         if not Path(db_path).exists():
-            raise FileNotFoundError(f"ST Factory database not found at {db_path}")
+            raise FileNotFoundError(f"ST Records database not found at {db_path}")
 
         self._connect()
 

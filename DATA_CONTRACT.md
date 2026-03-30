@@ -85,7 +85,7 @@ One row per persona patch processed by Gate 3.
 | Column | Type | Constraints | Description |
 |--------|------|-------------|-------------|
 | `id` | INTEGER | PRIMARY KEY AUTOINCREMENT | Internal row ID |
-| `patch_id` | TEXT | NOT NULL | ST Factory patch identifier |
+| `patch_id` | TEXT | NOT NULL | ST Records patch identifier |
 | `persona_id` | TEXT | NOT NULL | Target persona (e.g. `sky-lynx`) |
 | `from_version` | TEXT | nullable | Previous persona version |
 | `to_version` | TEXT | nullable | New persona version |

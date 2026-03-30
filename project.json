@@ -35,7 +35,7 @@
       "description": "Reads scored ideas from IdeaForge DB for triage gate."
     },
     {
-      "project": "st-factory",
+      "project": "st-records",
       "relationship": "consumes",
       "description": "Reads persona metrics for patch gate."
     },

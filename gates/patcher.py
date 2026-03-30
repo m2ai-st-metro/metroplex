@@ -1,6 +1,6 @@
 """
 Patch Gate - Gate 3
-Reads proposed persona patches from ST Factory, applies YAML modifications to Academy repo.
+Reads proposed persona patches from ST Records, applies YAML modifications to Academy repo.
 """
 import re
 import subprocess
@@ -13,7 +13,7 @@ from config import Config
 from models import PatchApplication
 from db import StateDB
 from audit import AuditLogger
-from readers.stfactory_reader import STFactoryReader
+from readers.st_records_reader import STRecordsReader
 
 
 class PatchGate:
@@ -23,7 +23,7 @@ class PatchGate:
         self,
         config: Config,
         state_db: StateDB,
-        stfactory_reader: STFactoryReader,
+        st_records_reader: STRecordsReader,
         audit_logger: AuditLogger
     ):
         """
@@ -32,12 +32,12 @@ class PatchGate:
         Args:
             config: Metroplex configuration
             state_db: State database manager
-            stfactory_reader: ST Factory database reader
+            st_records_reader: ST Records database reader
             audit_logger: Audit logger
         """
         self.config = config
         self.state_db = state_db
-        self.stfactory_reader = stfactory_reader
+        self.st_records_reader = st_records_reader
         self.audit_logger = audit_logger
 
     def run(self, dry_run: bool = False) -> list[PatchApplication]:
@@ -45,7 +45,7 @@ class PatchGate:
         Run patch gate on proposed patches.
 
         Process flow:
-        1. Get proposed patches from ST Factory
+        1. Get proposed patches from ST Records
         2. Enforce per-cycle cap (max_patches_per_cycle)
         3. For each patch:
            a. Parse operations from raw_json
@@ -57,7 +57,7 @@ class PatchGate:
               - Apply patch operations
               - Write modified YAML back
               - Git add, commit, push
-              - Update patch status in ST Factory
+              - Update patch status in ST Records
         4. Record PatchApplication in state_db and audit_logger
         5. Continue to next patch on git failures
 
@@ -68,11 +68,11 @@ class PatchGate:
             List of PatchApplication objects
         """
         # Get proposed patches
-        if self.stfactory_reader is None:
-            print("Warning: ST Factory reader not initialized (DB not found)")
+        if self.st_records_reader is None:
+            print("Warning: ST Records reader not initialized (DB not found)")
             return []
 
-        patches = self.stfactory_reader.get_proposed_patches()
+        patches = self.st_records_reader.get_proposed_patches()
 
         # Enforce per-cycle cap
         max_patches = self.config.max_patches_per_cycle
@@ -141,7 +141,7 @@ class PatchGate:
                 continue
 
             # Parse operations from raw_json
-            # ST Factory patches use "patches" key with "operation" field per entry
+            # ST Records patches use "patches" key with "operation" field per entry
             raw_json = patch.get("raw_json", {})
             operations = raw_json.get("patches", []) or raw_json.get("operations", [])
 
@@ -169,13 +169,13 @@ class PatchGate:
                             "reason": "no operations in patch"
                         }
                     )
-                    # Sync status back to ST Factory so it stops re-proposing
+                    # Sync status back to ST Records so it stops re-proposing
                     try:
-                        self.stfactory_reader.update_patch_status(patch_id, "skipped")
+                        self.st_records_reader.update_patch_status(patch_id, "skipped")
                     except Exception as e:
                         self.audit_logger.log_error(
                             gate="patch",
-                            error=f"Failed to update skipped patch status in ST Factory: {str(e)}",
+                            error=f"Failed to update skipped patch status in ST Records: {str(e)}",
                             details={"patch_id": patch_id}
                         )
                 continue
@@ -231,15 +231,15 @@ class PatchGate:
                     }
                 )
 
-                # Update patch status in ST Factory (if applied)
+                # Update patch status in ST Records (if applied)
                 if status == "applied":
                     try:
-                        self.stfactory_reader.update_patch_status(patch_id, "applied")
+                        self.st_records_reader.update_patch_status(patch_id, "applied")
                     except Exception as e:
                         # Log error but don't fail the patch application
                         self.audit_logger.log_error(
                             gate="patch",
-                            error=f"Failed to update patch status in ST Factory: {str(e)}",
+                            error=f"Failed to update patch status in ST Records: {str(e)}",
                             details={"patch_id": patch_id}
                         )
 
@@ -344,7 +344,7 @@ class PatchGate:
         result = copy.deepcopy(yaml_data)
 
         for operation in operations:
-            # Support both ST Factory format ("operation") and JSON Patch format ("op")
+            # Support both ST Records format ("operation") and JSON Patch format ("op")
             op = operation.get("operation") or operation.get("op")
             path = operation.get("path", "")
             value = operation.get("value")

@@ -25,7 +25,7 @@ from readers.ideaforge_reader import IdeaForgeReader
 from readers.linear_reader import LinearReader
 from readers.academy_reader import AcademyReader
 from readers.skylynx_reader import SkyLynxReader
-from readers.stfactory_reader import STFactoryReader
+from readers.st_records_reader import STRecordsReader
 from dispatcher import create_dispatcher, route_to_worker, build_dispatch_prompt
 from outcome_emitter import create_outcome_emitter
 from dashboard import compute_funnel_metrics, format_funnel_output
@@ -85,15 +85,15 @@ def initialize_components(config: Config):
         ideaforge_reader = None
 
     try:
-        stfactory_reader = STFactoryReader(config.stfactory_db)
+        st_records_reader = STRecordsReader(config.st_records_db)
     except FileNotFoundError:
-        print(f"Warning: ST Factory DB not found at {config.stfactory_db}")
-        stfactory_reader = None
+        print(f"Warning: ST Records DB not found at {config.st_records_db}")
+        st_records_reader = None
 
     try:
-        skylynx_reader = SkyLynxReader(config.stfactory_db)
+        skylynx_reader = SkyLynxReader(config.st_records_db)
     except FileNotFoundError:
-        print(f"Warning: ST Factory DB not found at {config.stfactory_db} (Sky-Lynx reader)")
+        print(f"Warning: ST Records DB not found at {config.st_records_db} (Sky-Lynx reader)")
         skylynx_reader = None
 
     # Initialize Linear reader (requires ARCADE_API_KEY)
@@ -165,7 +165,7 @@ def initialize_components(config: Config):
     patch_gate = PatchGate(
         config=config,
         state_db=state_db,
-        stfactory_reader=stfactory_reader,
+        st_records_reader=st_records_reader,
         audit_logger=audit_logger
     )
 
@@ -191,7 +191,7 @@ def initialize_components(config: Config):
     raw_notifier = create_notifier(config.telegram_bot_token, config.telegram_chat_id)
     notifier = FilteredNotifier(raw_notifier, config.notify_mode)
 
-    # Initialize outcome emitter (Phase 14a — write OutcomeRecords to ST Factory)
+    # Initialize outcome emitter (Phase 14a — write OutcomeRecords to ST Records)
     outcome_emitter = create_outcome_emitter()
 
     # Initialize dispatcher for non-buildable queue items (Sky-Lynx -> ClaudeClaw)
@@ -884,7 +884,7 @@ def cmd_backfill_outcomes(args, config: Config):
 
     emitter = create_outcome_emitter()
     if emitter is None:
-        print("ERROR: OutcomeEmitter unavailable (st-factory not found)")
+        print("ERROR: OutcomeEmitter unavailable (st-records not found)")
         return 1
 
     state_db = StateDB()
@@ -1110,7 +1110,7 @@ def cmd_quality_digest(args, config: Config):
         lines = ["Build Quality Digest"]
         lines.append("=" * 30)
 
-        # Outcome summary (from st-factory)
+        # Outcome summary (from st-records)
         try:
             from outcome_emitter import create_outcome_emitter
             emitter = create_outcome_emitter()

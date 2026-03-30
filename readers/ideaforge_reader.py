@@ -79,7 +79,8 @@ class IdeaForgeReader:
                 competition_score,
                 artifact_type,
                 signal_count,
-                status
+                status,
+                strategic_theme
             FROM ideas
             WHERE status = 'classified'
                 AND weighted_score IS NOT NULL

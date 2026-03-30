@@ -78,7 +78,7 @@ Service unit: `deploy/metroplex.service` — runs `run-all --cycles 0` with `Res
 |------|-------|---------|
 | 1 Triage | `gates/triage.py` | Score IdeaForge ideas against thresholds, approve/reject/defer |
 | 2 Build | `gates/build.py` | Generate spec via LLM, dispatch to YCE Harness |
-| 3 Patch | `gates/patcher.py` | Apply ST Factory persona YAML patches via git clone/commit/push |
+| 3 Patch | `gates/patcher.py` | Apply ST Records persona YAML patches via git clone/commit/push |
 | 4 Publish | `gates/publish.py` | Create GitHub repo in m2ai-portfolio org, push completed builds |
 | 4.5 Review | `gates/review.py` | Automated quality checks before publish (source code, README, no secrets, no large files) |
 
@@ -87,7 +87,7 @@ Service unit: `deploy/metroplex.service` — runs `run-all --cycles 0` with `Res
 | Reader | DB | Access |
 |--------|----|--------|
 | `readers/ideaforge_reader.py` | ideaforge.db | Read + claim (status='classified') |
-| `readers/stfactory_reader.py` | persona_metrics.db | Read + patch status updates |
+| `readers/st_records_reader.py` | persona_metrics.db | Read + patch status updates |
 | `readers/skylynx_reader.py` | persona_metrics.db | Read-only (recommendations) |
 | `readers/linear_reader.py` | Linear API (Arcade) | Read-only |
 | `readers/academy_reader.py` | File system | Read-only (promotions) |
@@ -127,7 +127,7 @@ Non-buildable items routed to EA-Claude workers via `WORKER_ROUTES` dict. Writes
 | Variable | Default Path |
 |----------|-------------|
 | `METROPLEX_IDEAFORGE_DB` | `~/projects/ideaforge/data/ideaforge.db` |
-| `METROPLEX_STFACTORY_DB` | `~/projects/st-factory/data/persona_metrics.db` |
+| `METROPLEX_ST_RECORDS_DB` | `~/projects/st-records/data/persona_metrics.db` |
 | `METROPLEX_DISPATCH_DB` | `~/projects/claudeclaw/store/claudeclaw.db` |
 
 ## Log Files
@@ -175,7 +175,7 @@ Non-buildable items routed to EA-Claude workers via `WORKER_ROUTES` dict. Writes
 
 ## Design Decisions
 
-1. **No cross-project imports** — reads upstream SQLite directly, no IdeaForge/ST Factory code imports
+1. **No cross-project imports** — reads upstream SQLite directly, no IdeaForge/ST Records code imports
 2. **Subprocess isolation** — YCE builds and git ops run as subprocesses, never in-process
 3. **Score scaling** — IdeaForge 0-10 scaled to 0-100 for threshold intuition (guard validates range)
 4. **Fire-and-forget builds** — YCE dispatch subprocess; results polled on next cycle

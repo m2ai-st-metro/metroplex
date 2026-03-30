@@ -1,5 +1,5 @@
 """
-Tests for external database readers (IdeaForge, ST Factory, Ultra-Magnus).
+Tests for external database readers (IdeaForge, ST Records, Ultra-Magnus).
 """
 import pytest
 import sqlite3
@@ -7,7 +7,7 @@ import json
 import tempfile
 from pathlib import Path
 
-from readers import IdeaForgeReader, SkyLynxReader, STFactoryReader
+from readers import IdeaForgeReader, SkyLynxReader, STRecordsReader
 
 
 # --- IdeaForge Reader Tests ---
@@ -37,7 +37,8 @@ def ideaforge_test_db():
             signal_count INTEGER,
             status TEXT,
             claimed_by TEXT,
-            claimed_at TEXT
+            claimed_at TEXT,
+            strategic_theme TEXT
         )
     """)
 
@@ -146,12 +147,12 @@ def test_ideaforge_get_idea_by_id(ideaforge_test_db):
     reader.close()
 
 
-# --- ST Factory Reader Tests ---
+# --- ST Records Reader Tests ---
 
 
 @pytest.fixture
-def stfactory_test_db():
-    """Create an in-memory ST Factory database with test data."""
+def st_records_test_db():
+    """Create an in-memory ST Records database with test data."""
     conn = sqlite3.connect(":memory:")
     cursor = conn.cursor()
 
@@ -276,23 +277,23 @@ def stfactory_test_db():
     Path(temp_path).unlink(missing_ok=True)
 
 
-def test_stfactory_reader_initialization(stfactory_test_db):
-    """Test ST Factory reader initialization."""
-    reader = STFactoryReader(stfactory_test_db)
-    assert reader.db_path == stfactory_test_db
+def test_st_records_reader_initialization(st_records_test_db):
+    """Test ST Records reader initialization."""
+    reader = STRecordsReader(st_records_test_db)
+    assert reader.db_path == st_records_test_db
     assert reader.conn is not None
     reader.close()
 
 
-def test_stfactory_reader_missing_db():
-    """Test ST Factory reader raises FileNotFoundError for missing DB."""
-    with pytest.raises(FileNotFoundError, match="ST Factory database not found"):
-        STFactoryReader("/nonexistent/path/to/db.db")
+def test_st_records_reader_missing_db():
+    """Test ST Records reader raises FileNotFoundError for missing DB."""
+    with pytest.raises(FileNotFoundError, match="ST Records database not found"):
+        STRecordsReader("/nonexistent/path/to/db.db")
 
 
-def test_stfactory_get_proposed_patches(stfactory_test_db):
+def test_st_records_get_proposed_patches(st_records_test_db):
     """Test getting proposed patches."""
-    reader = STFactoryReader(stfactory_test_db)
+    reader = STRecordsReader(st_records_test_db)
 
     patches = reader.get_proposed_patches()
 
@@ -315,9 +316,9 @@ def test_stfactory_get_proposed_patches(stfactory_test_db):
     reader.close()
 
 
-def test_stfactory_get_pending_recommendations(stfactory_test_db):
+def test_st_records_get_pending_recommendations(st_records_test_db):
     """Test getting pending recommendations."""
-    reader = STFactoryReader(stfactory_test_db)
+    reader = STRecordsReader(st_records_test_db)
 
     recommendations = reader.get_pending_recommendations()
 
@@ -330,16 +331,16 @@ def test_stfactory_get_pending_recommendations(stfactory_test_db):
     reader.close()
 
 
-def test_stfactory_update_patch_status(stfactory_test_db):
+def test_st_records_update_patch_status(st_records_test_db):
     """Test updating patch status (write operation)."""
-    reader = STFactoryReader(stfactory_test_db)
+    reader = STRecordsReader(st_records_test_db)
 
     # Update patch status
     reader.update_patch_status("patch-001", "applied")
 
     # Verify the status was updated
     # Need to open a new read connection to check
-    verify_conn = sqlite3.connect(stfactory_test_db)
+    verify_conn = sqlite3.connect(st_records_test_db)
     verify_conn.row_factory = sqlite3.Row
     cursor = verify_conn.cursor()
 
@@ -351,9 +352,9 @@ def test_stfactory_update_patch_status(stfactory_test_db):
     reader.close()
 
 
-def test_stfactory_get_outcome_records(stfactory_test_db):
+def test_st_records_get_outcome_records(st_records_test_db):
     """Test getting outcome records."""
-    reader = STFactoryReader(stfactory_test_db)
+    reader = STRecordsReader(st_records_test_db)
 
     records = reader.get_outcome_records(limit=2)
 
@@ -396,7 +397,7 @@ def skylynx_test_db():
         )
     """)
 
-    # Also need persona_patches and outcome_records for STFactoryReader compat
+    # Also need persona_patches and outcome_records for STRecordsReader compat
     cursor.execute("""
         CREATE TABLE persona_patches (
             id INTEGER PRIMARY KEY, patch_id TEXT, persona_id TEXT,
@@ -496,7 +497,7 @@ def test_skylynx_reader_initialization(skylynx_test_db):
 
 def test_skylynx_reader_missing_db():
     """Test Sky-Lynx reader raises FileNotFoundError for missing DB."""
-    with pytest.raises(FileNotFoundError, match="ST Factory database not found"):
+    with pytest.raises(FileNotFoundError, match="ST Records database not found"):
         SkyLynxReader("/nonexistent/path/to/db.db")
 
 
@@ -624,9 +625,9 @@ def test_all_readers_raise_filenotfound():
         SkyLynxReader(nonexistent_path)
 
     with pytest.raises(FileNotFoundError):
-        STFactoryReader(nonexistent_path)
+        STRecordsReader(nonexistent_path)
 
-def test_all_readers_close_properly(ideaforge_test_db, stfactory_test_db, skylynx_test_db):
+def test_all_readers_close_properly(ideaforge_test_db, st_records_test_db, skylynx_test_db):
     """Test that all readers close connections properly."""
     # IdeaForge
     reader1 = IdeaForgeReader(ideaforge_test_db)
@@ -640,8 +641,8 @@ def test_all_readers_close_properly(ideaforge_test_db, stfactory_test_db, skylyn
     reader_sl.close()
     assert reader_sl.conn is None
 
-    # ST Factory
-    reader2 = STFactoryReader(stfactory_test_db)
+    # ST Records
+    reader2 = STRecordsReader(st_records_test_db)
     assert reader2.conn is not None
     reader2.close()
     assert reader2.conn is None

@@ -1,6 +1,6 @@
 """
 Outcome Emitter - Phase 14a
-Emits OutcomeRecords to ST Factory when ideas reach terminal states.
+Emits OutcomeRecords to ST Records when ideas reach terminal states.
 Uses ContractStore via sys.path injection for dual-write (JSONL + SQLite).
 """
 import logging
@@ -10,28 +10,28 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-# sys.path injection for st-factory contracts (not a pip package)
-_ST_FACTORY_ROOT = Path(__file__).parent.parent / "st-factory"
-if str(_ST_FACTORY_ROOT) not in sys.path:
-    sys.path.insert(0, str(_ST_FACTORY_ROOT))
+# sys.path injection for st-records contracts (not a pip package)
+_ST_RECORDS_ROOT = Path(__file__).parent.parent / "st-records"
+if str(_ST_RECORDS_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ST_RECORDS_ROOT))
 
 
 class OutcomeEmitter:
-    """Emits OutcomeRecords to ST Factory's dual-write store."""
+    """Emits OutcomeRecords to ST Records' dual-write store."""
 
-    def __init__(self, stfactory_data_dir: Path | None = None):
+    def __init__(self, st_records_data_dir: Path | None = None):
         """
         Initialize the emitter.
 
         Args:
-            stfactory_data_dir: Path to st-factory/data/. If None, uses default.
+            st_records_data_dir: Path to st-records/data/. If None, uses default.
 
         Raises:
-            ImportError: If st-factory contracts are not found.
+            ImportError: If st-records contracts are not found.
         """
         from contracts.store import ContractStore
 
-        self.store = ContractStore(data_dir=stfactory_data_dir)
+        self.store = ContractStore(data_dir=st_records_data_dir)
         self._emit_count = 0
         self._emitted: dict[tuple[int, str], int] = {}  # (idea_id, outcome) -> count
         self.max_emissions_per_idea = 3
@@ -134,10 +134,10 @@ class OutcomeEmitter:
         self.store.close()
 
 
-def create_outcome_emitter(stfactory_data_dir: Path | None = None) -> OutcomeEmitter | None:
-    """Factory function that returns None if st-factory is unavailable."""
+def create_outcome_emitter(st_records_data_dir: Path | None = None) -> OutcomeEmitter | None:
+    """Factory function that returns None if st-records is unavailable."""
     try:
-        return OutcomeEmitter(stfactory_data_dir=stfactory_data_dir)
+        return OutcomeEmitter(st_records_data_dir=st_records_data_dir)
     except (ImportError, FileNotFoundError) as e:
         logger.warning("OutcomeEmitter unavailable: %s", e)
         return None
