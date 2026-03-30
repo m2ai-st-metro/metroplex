@@ -46,7 +46,7 @@ Environment variables:
 | Variable | Required | Description |
 |----------|----------|-------------|
 | `ANTHROPIC_API_KEY` | Yes | Claude API key |
-| `ACADEMY_DIR` | No | Path to Academy personas directory (default: ../agent-persona-academy/personas) |
+| `ACADEMY_DIR` | No | Path to Academy personas directory (default: ../st-agent-registry/personas) |
 | `DEBUG` | No | Enable debug logging (default: false) |
 
 ---

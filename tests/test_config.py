@@ -16,7 +16,7 @@ class TestConfigDefaults:
         config = Config()
         assert config.ideaforge_db == "/home/apexaipc/projects/ideaforge/data/ideaforge.db"
         assert config.um_db == ""  # Deprecated
-        assert config.stfactory_db == "/home/apexaipc/projects/st-factory/data/persona_metrics.db"
+        assert config.st_records_db == "/home/apexaipc/projects/st-records/data/persona_metrics.db"
 
     def test_default_thresholds(self):
         with patch.dict(os.environ, {}, clear=False):
@@ -60,7 +60,7 @@ class TestConfigDefaults:
 
     def test_default_academy_repo(self):
         config = Config()
-        assert config.academy_repo == "m2ai-portfolio/agent-persona-academy"
+        assert config.academy_repo == "m2ai-ultra-magnus-IF/st-agent-registry"
 
 
 class TestConfigEnvOverrides:
@@ -70,12 +70,12 @@ class TestConfigEnvOverrides:
         env = {
             "METROPLEX_IDEAFORGE_DB": "/tmp/test_ideaforge.db",
             "METROPLEX_UM_DB": "/tmp/test_um.db",
-            "METROPLEX_STFACTORY_DB": "/tmp/test_stfactory.db",
+            "METROPLEX_ST_RECORDS_DB": "/tmp/test_st_records.db",
         }
         with patch.dict(os.environ, env):
             config = Config()
             assert config.ideaforge_db == "/tmp/test_ideaforge.db"
-            assert config.stfactory_db == "/tmp/test_stfactory.db"
+            assert config.st_records_db == "/tmp/test_st_records.db"
 
     def test_override_thresholds(self):
         env = {
@@ -163,13 +163,13 @@ class TestConfigValidation:
     def test_validate_missing_db_paths(self):
         config = Config()
         config.ideaforge_db = "/nonexistent/path.db"
-        config.stfactory_db = "/nonexistent/path3.db"
+        config.st_records_db = "/nonexistent/path3.db"
         config.yce_dir = "/nonexistent/dir"
 
         warnings = config.validate()
         assert len(warnings) >= 3
         assert any("IdeaForge DB" in w for w in warnings)
-        assert any("ST Factory DB" in w for w in warnings)
+        assert any("ST Records DB" in w for w in warnings)
         assert any("YCE directory" in w for w in warnings)
 
     def test_validate_approve_below_reject(self):
@@ -199,7 +199,7 @@ class TestConfigValidation:
 
         config = Config()
         config.ideaforge_db = str(db_file)
-        config.stfactory_db = str(db_file)
+        config.st_records_db = str(db_file)
         config.yce_dir = str(tmp_path)
 
         warnings = config.validate()

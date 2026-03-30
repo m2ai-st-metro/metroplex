@@ -33,13 +33,13 @@ class Config:
     # Database paths
     ideaforge_db: str = field(default="/home/apexaipc/projects/ideaforge/data/ideaforge.db")
     um_db: str = field(default="")  # Deprecated: UM removed from pipeline (2026-03-15)
-    stfactory_db: str = field(default="/home/apexaipc/projects/st-factory/data/persona_metrics.db")
+    st_records_db: str = field(default="/home/apexaipc/projects/st-records/data/persona_metrics.db")
 
     # Directory paths
     yce_dir: str = field(default="/home/apexaipc/projects/yce-harness")
 
     # GitHub repo
-    academy_repo: str = field(default="m2ai-portfolio/agent-persona-academy")
+    academy_repo: str = field(default="m2ai-ultra-magnus-IF/st-agent-registry")
 
     # Model settings
     build_model: str = field(default="opus")
@@ -71,8 +71,8 @@ class Config:
     academy_weight: float = field(default=2.0)
 
     # Academy integration (persona -> agent promotions)
-    academy_dir: str = field(default="/home/apexaipc/projects/agent-persona-academy")
-    academy_promotions_path: str = field(default="/home/apexaipc/projects/agent-persona-academy/data/promotions.jsonl")
+    academy_dir: str = field(default="/home/apexaipc/projects/st-agent-registry")
+    academy_promotions_path: str = field(default="/home/apexaipc/projects/st-agent-registry/data/promotions.jsonl")
 
     # Telegram notifications (optional)
     telegram_bot_token: str = field(default="")
@@ -104,6 +104,13 @@ class Config:
     monthly_cost_limit: float = field(default=500.0)
     cost_alert_threshold: float = field(default=0.8)
     build_cost_estimate: float = field(default=3.0)
+    budget_hard_stop: bool = field(default=True)
+    budget_grace_percent: float = field(default=1.1)  # Kill only when spend exceeds limit * grace
+
+    # Session compaction (Paperclip pattern: resume context between retries)
+    max_session_runs: int = field(default=3)  # Max retries using same session context
+    max_session_input_tokens: int = field(default=500000)  # Token budget per session chain
+    max_session_age_hours: int = field(default=24)  # Max wall-clock age before session reset
 
     # Tyrest QA gate (GPT-based independent review)
     tyrest_enabled: bool = field(default=True)
@@ -120,7 +127,7 @@ class Config:
         """Load values from environment variables."""
         self.ideaforge_db = os.environ.get("METROPLEX_IDEAFORGE_DB", self.ideaforge_db)
         self.um_db = os.environ.get("METROPLEX_UM_DB", self.um_db)
-        self.stfactory_db = os.environ.get("METROPLEX_STFACTORY_DB", self.stfactory_db)
+        self.st_records_db = os.environ.get("METROPLEX_ST_RECORDS_DB", self.st_records_db)
         self.yce_dir = os.environ.get("METROPLEX_YCE_DIR", self.yce_dir)
         self.academy_repo = os.environ.get("METROPLEX_ACADEMY_REPO", self.academy_repo)
         self.build_model = os.environ.get("METROPLEX_BUILD_MODEL", self.build_model)
@@ -254,6 +261,23 @@ class Config:
             self.build_cost_estimate = float(os.environ.get("METROPLEX_BUILD_COST_ESTIMATE", self.build_cost_estimate))
         except ValueError:
             pass
+        self.budget_hard_stop = os.environ.get("METROPLEX_BUDGET_HARD_STOP", "true").lower() in ("true", "1", "yes")
+        try:
+            self.budget_grace_percent = float(os.environ.get("METROPLEX_BUDGET_GRACE_PERCENT", self.budget_grace_percent))
+        except ValueError:
+            pass
+        try:
+            self.max_session_runs = int(os.environ.get("METROPLEX_MAX_SESSION_RUNS", self.max_session_runs))
+        except ValueError:
+            pass
+        try:
+            self.max_session_input_tokens = int(os.environ.get("METROPLEX_MAX_SESSION_INPUT_TOKENS", self.max_session_input_tokens))
+        except ValueError:
+            pass
+        try:
+            self.max_session_age_hours = int(os.environ.get("METROPLEX_MAX_SESSION_AGE_HOURS", self.max_session_age_hours))
+        except ValueError:
+            pass
 
         # Schedule
         try:
@@ -294,7 +318,7 @@ class Config:
         # Check database paths
         db_paths = [
             ("IdeaForge DB", self.ideaforge_db),
-            ("ST Factory DB", self.stfactory_db),
+            ("ST Records DB", self.st_records_db),
         ]
 
         for name, path in db_paths:

@@ -12,7 +12,7 @@ from unittest.mock import Mock, patch, MagicMock, call
 from config import Config
 from db import StateDB
 from audit import AuditLogger
-from readers.stfactory_reader import STFactoryReader
+from readers.st_records_reader import STRecordsReader
 from gates.patcher import PatchGate
 from models import PatchApplication
 
@@ -25,7 +25,7 @@ def patch_config():
     """Provide test configuration."""
     config = Config()
     config.max_patches_per_cycle = 5
-    config.academy_repo = "m2ai-portfolio/agent-persona-academy"
+    config.academy_repo = "m2ai-ultra-magnus-IF/st-agent-registry"
     config.yce_dir = "/home/apexaipc/projects/yce-harness"
     return config
 
@@ -52,11 +52,11 @@ def temp_audit_log():
 
 
 @pytest.fixture
-def create_stfactory_db():
-    """Factory fixture to create ST Factory test database with patches."""
+def create_st_records_db():
+    """Factory fixture to create ST Records test database with patches."""
     def _create_db(patches_data):
         """
-        Create ST Factory test database with specified patches.
+        Create ST Records test database with specified patches.
 
         Args:
             patches_data: List of tuples (patch_id, persona_id, from_version, to_version, rationale, raw_json, status)
@@ -102,8 +102,8 @@ def test_apply_yaml_patch_add_operation():
     state_db = StateDB(":memory:")
     state_db.init_db()
 
-    # Create mock ST Factory reader
-    mock_reader = Mock(spec=STFactoryReader)
+    # Create mock ST Records reader
+    mock_reader = Mock(spec=STRecordsReader)
 
     audit_logger = AuditLogger(":memory:")
 
@@ -135,7 +135,7 @@ def test_apply_yaml_patch_replace_operation():
     state_db = StateDB(":memory:")
     state_db.init_db()
 
-    mock_reader = Mock(spec=STFactoryReader)
+    mock_reader = Mock(spec=STRecordsReader)
     audit_logger = AuditLogger(":memory:")
 
     gate = PatchGate(config, state_db, mock_reader, audit_logger)
@@ -167,7 +167,7 @@ def test_apply_yaml_patch_remove_operation():
     state_db = StateDB(":memory:")
     state_db.init_db()
 
-    mock_reader = Mock(spec=STFactoryReader)
+    mock_reader = Mock(spec=STRecordsReader)
     audit_logger = AuditLogger(":memory:")
 
     gate = PatchGate(config, state_db, mock_reader, audit_logger)
@@ -201,7 +201,7 @@ def test_apply_yaml_patch_multiple_operations():
     state_db = StateDB(":memory:")
     state_db.init_db()
 
-    mock_reader = Mock(spec=STFactoryReader)
+    mock_reader = Mock(spec=STRecordsReader)
     audit_logger = AuditLogger(":memory:")
 
     gate = PatchGate(config, state_db, mock_reader, audit_logger)
@@ -233,7 +233,7 @@ def test_apply_yaml_patch_nested_path():
     state_db = StateDB(":memory:")
     state_db.init_db()
 
-    mock_reader = Mock(spec=STFactoryReader)
+    mock_reader = Mock(spec=STRecordsReader)
     audit_logger = AuditLogger(":memory:")
 
     gate = PatchGate(config, state_db, mock_reader, audit_logger)
@@ -259,7 +259,7 @@ def test_apply_yaml_patch_nested_path():
 # --- Per-Cycle Cap Tests ---
 
 
-def test_per_cycle_cap_enforcement(create_stfactory_db):
+def test_per_cycle_cap_enforcement(create_st_records_db):
     """Test that only max_patches_per_cycle patches are processed."""
     import json
 
@@ -272,7 +272,7 @@ def test_per_cycle_cap_enforcement(create_stfactory_db):
         raw_json = json.dumps({"operations": operations})
         patches_data.append((patch_id, persona_id, "1.0", "1.1", "test", raw_json, "proposed"))
 
-    stfactory_conn = create_stfactory_db(patches_data)
+    st_records_conn = create_st_records_db(patches_data)
 
     # Write temp DB to file for reader
     with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
@@ -280,12 +280,12 @@ def test_per_cycle_cap_enforcement(create_stfactory_db):
 
     # Copy in-memory to file
     file_conn = sqlite3.connect(db_path)
-    stfactory_conn.backup(file_conn)
+    st_records_conn.backup(file_conn)
     file_conn.close()
-    stfactory_conn.close()
+    st_records_conn.close()
 
     # Create reader
-    reader = STFactoryReader(db_path)
+    reader = STRecordsReader(db_path)
 
     # Create config with cap of 5
     config = Config()
@@ -316,8 +316,8 @@ def test_per_cycle_cap_enforcement(create_stfactory_db):
 # --- Dry Run Tests ---
 
 
-def test_dry_run_no_subprocess_calls(create_stfactory_db, capsys):
-    """Test that dry_run=True does not call subprocess or modify ST Factory DB."""
+def test_dry_run_no_subprocess_calls(create_st_records_db, capsys):
+    """Test that dry_run=True does not call subprocess or modify ST Records DB."""
     import json
 
     # Create 1 patch
@@ -327,18 +327,18 @@ def test_dry_run_no_subprocess_calls(create_stfactory_db, capsys):
         ("patch-1", "persona-1", "1.0", "1.1", "test", raw_json, "proposed")
     ]
 
-    stfactory_conn = create_stfactory_db(patches_data)
+    st_records_conn = create_st_records_db(patches_data)
 
     # Write temp DB to file
     with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
         db_path = f.name
 
     file_conn = sqlite3.connect(db_path)
-    stfactory_conn.backup(file_conn)
+    st_records_conn.backup(file_conn)
     file_conn.close()
-    stfactory_conn.close()
+    st_records_conn.close()
 
-    reader = STFactoryReader(db_path)
+    reader = STRecordsReader(db_path)
 
     config = Config()
     state_db = StateDB(":memory:")
@@ -376,7 +376,7 @@ def test_dry_run_no_subprocess_calls(create_stfactory_db, capsys):
 # --- Git Operations Tests ---
 
 
-def test_git_operations_commands(create_stfactory_db, tmp_path):
+def test_git_operations_commands(create_st_records_db, tmp_path):
     """Test that correct git commands are constructed."""
     import json
 
@@ -387,17 +387,17 @@ def test_git_operations_commands(create_stfactory_db, tmp_path):
         ("patch-1", "persona-1", "1.0", "1.1", "test", raw_json, "proposed")
     ]
 
-    stfactory_conn = create_stfactory_db(patches_data)
+    st_records_conn = create_st_records_db(patches_data)
 
     with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
         db_path = f.name
 
     file_conn = sqlite3.connect(db_path)
-    stfactory_conn.backup(file_conn)
+    st_records_conn.backup(file_conn)
     file_conn.close()
-    stfactory_conn.close()
+    st_records_conn.close()
 
-    reader = STFactoryReader(db_path)
+    reader = STRecordsReader(db_path)
 
     config = Config()
     config.yce_dir = str(tmp_path)
@@ -452,7 +452,7 @@ def test_git_operations_commands(create_stfactory_db, tmp_path):
     Path(db_path).unlink()
 
 
-def test_git_push_failure_continues_to_next_patch(create_stfactory_db, tmp_path):
+def test_git_push_failure_continues_to_next_patch(create_st_records_db, tmp_path):
     """Test that failed git push results in status='failed' but next patch is still attempted."""
     import json
 
@@ -464,17 +464,17 @@ def test_git_push_failure_continues_to_next_patch(create_stfactory_db, tmp_path)
         ("patch-2", "persona-2", "1.0", "1.1", "test", raw_json, "proposed")
     ]
 
-    stfactory_conn = create_stfactory_db(patches_data)
+    st_records_conn = create_st_records_db(patches_data)
 
     with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
         db_path = f.name
 
     file_conn = sqlite3.connect(db_path)
-    stfactory_conn.backup(file_conn)
+    st_records_conn.backup(file_conn)
     file_conn.close()
-    stfactory_conn.close()
+    st_records_conn.close()
 
-    reader = STFactoryReader(db_path)
+    reader = STRecordsReader(db_path)
 
     config = Config()
     config.yce_dir = str(tmp_path)
@@ -535,7 +535,7 @@ def test_git_push_failure_continues_to_next_patch(create_stfactory_db, tmp_path)
     Path(db_path).unlink()
 
 
-def test_no_operations_skips_patch(create_stfactory_db):
+def test_no_operations_skips_patch(create_st_records_db):
     """Test that patches with no operations are skipped."""
     import json
 
@@ -545,17 +545,17 @@ def test_no_operations_skips_patch(create_stfactory_db):
         ("patch-1", "persona-1", "1.0", "1.1", "test", raw_json, "proposed")
     ]
 
-    stfactory_conn = create_stfactory_db(patches_data)
+    st_records_conn = create_st_records_db(patches_data)
 
     with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
         db_path = f.name
 
     file_conn = sqlite3.connect(db_path)
-    stfactory_conn.backup(file_conn)
+    st_records_conn.backup(file_conn)
     file_conn.close()
-    stfactory_conn.close()
+    st_records_conn.close()
 
-    reader = STFactoryReader(db_path)
+    reader = STRecordsReader(db_path)
 
     config = Config()
     state_db = StateDB(":memory:")
@@ -577,7 +577,7 @@ def test_no_operations_skips_patch(create_stfactory_db):
     Path(db_path).unlink()
 
 
-def test_missing_target_file_fails(create_stfactory_db, tmp_path):
+def test_missing_target_file_fails(create_st_records_db, tmp_path):
     """Test that missing target file results in failure."""
     import json
 
@@ -588,17 +588,17 @@ def test_missing_target_file_fails(create_stfactory_db, tmp_path):
         ("patch-1", "persona-missing", "1.0", "1.1", "test", raw_json, "proposed")
     ]
 
-    stfactory_conn = create_stfactory_db(patches_data)
+    st_records_conn = create_st_records_db(patches_data)
 
     with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
         db_path = f.name
 
     file_conn = sqlite3.connect(db_path)
-    stfactory_conn.backup(file_conn)
+    st_records_conn.backup(file_conn)
     file_conn.close()
-    stfactory_conn.close()
+    st_records_conn.close()
 
-    reader = STFactoryReader(db_path)
+    reader = STRecordsReader(db_path)
 
     config = Config()
     config.yce_dir = str(tmp_path)
@@ -633,8 +633,8 @@ def test_missing_target_file_fails(create_stfactory_db, tmp_path):
     Path(db_path).unlink()
 
 
-def test_successful_patch_updates_stfactory_status(create_stfactory_db, tmp_path):
-    """Test that successful patch updates status in ST Factory DB."""
+def test_successful_patch_updates_st_records_status(create_st_records_db, tmp_path):
+    """Test that successful patch updates status in ST Records DB."""
     import json
 
     # Create patch
@@ -644,17 +644,17 @@ def test_successful_patch_updates_stfactory_status(create_stfactory_db, tmp_path
         ("patch-1", "persona-1", "1.0", "1.1", "test", raw_json, "proposed")
     ]
 
-    stfactory_conn = create_stfactory_db(patches_data)
+    st_records_conn = create_st_records_db(patches_data)
 
     with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
         db_path = f.name
 
     file_conn = sqlite3.connect(db_path)
-    stfactory_conn.backup(file_conn)
+    st_records_conn.backup(file_conn)
     file_conn.close()
-    stfactory_conn.close()
+    st_records_conn.close()
 
-    reader = STFactoryReader(db_path)
+    reader = STRecordsReader(db_path)
 
     config = Config()
     config.yce_dir = str(tmp_path)
@@ -687,7 +687,7 @@ def test_successful_patch_updates_stfactory_status(create_stfactory_db, tmp_path
     assert len(results) == 1
     assert results[0].status == "applied"
 
-    # Verify ST Factory DB was updated
+    # Verify ST Records DB was updated
     # Reopen reader with writable connection to check
     check_conn = sqlite3.connect(db_path)
     cursor = check_conn.cursor()

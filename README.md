@@ -18,7 +18,7 @@ Priority Queue ──> weighted intake from IdeaForge / Sky-Lynx / Linear
 Gate 2: Build ──> Jinja2 spec gen + queue_runner.py dispatch
     |                  (background subprocess -> YCE Harness)
     |
-ST Factory (persona_patches)
+ST Records (persona_patches)
     |
     v
 Gate 3: Patcher ──> git clone / commit / push
@@ -94,9 +94,9 @@ All settings via environment variables (prefix `METROPLEX_`). Set in `~/.env.sha
 |----------|---------|-------------|
 | `METROPLEX_IDEAFORGE_DB` | `.../ideaforge/data/ideaforge.db` | IdeaForge database path |
 | `METROPLEX_UM_DB` | `.../ultra-magnus/.../idea-factory.db` | Ultra-Magnus database path |
-| `METROPLEX_STFACTORY_DB` | `.../st-factory/data/persona_metrics.db` | ST Factory database path |
+| `METROPLEX_ST_RECORDS_DB` | `.../st-records/data/persona_metrics.db` | ST Records database path |
 | `METROPLEX_YCE_DIR` | `.../yce-harness` | YCE Harness directory |
-| `METROPLEX_ACADEMY_REPO` | `m2ai-portfolio/agent-persona-academy` | GitHub repo for persona YAMLs |
+| `METROPLEX_ACADEMY_REPO` | `m2ai-ultra-magnus-IF/st-agent-registry` | GitHub repo for persona YAMLs |
 | `METROPLEX_BUILD_MODEL` | `opus` | Claude model for spec generation |
 | `METROPLEX_APPROVE_THRESHOLD` | `70` | Score threshold for approval (0-100) |
 | `METROPLEX_REJECT_THRESHOLD` | `40` | Score threshold for rejection (0-100) |
@@ -131,7 +131,7 @@ metroplex/
 │   └── patcher.py              # Gate 3: YAML patches via git
 ├── readers/
 │   ├── ideaforge_reader.py     # IdeaForge SQLite (read-only)
-│   ├── stfactory_reader.py     # ST Factory SQLite (read + patch status write)
+│   ├── st_records_reader.py    # ST Records SQLite (read + patch status write)
 │   └── um_reader.py            # Ultra-Magnus SQLite (read-only)
 ├── spec_templates/
 │   └── app_spec_template.md    # Jinja2 template for generated specs
@@ -162,7 +162,7 @@ pytest tests/test_continuous.py -v   # Phase 5 continuous operation tests
 - **Circuit Breaker**: Per-gate halt after N consecutive failures (default 3). Other gates continue. Manual reset via `metroplex.py reset`.
 - **Cycle Caps**: Max 3 approvals and 5 patches per cycle to prevent runaway behavior.
 - **Shutdown Handler**: Catches SIGTERM/SIGINT, finishes current cycle, then exits cleanly.
-- **Read-Only Upstream**: All upstream DB access uses `?mode=ro` (except one status write in ST Factory).
+- **Read-Only Upstream**: All upstream DB access uses `?mode=ro` (except one status write in ST Records).
 - **Schedule Windows**: Restrict operation to specific hours and days (e.g., weekdays 9-17). Outside the window, cycles are skipped.
 
 ## Notifications
