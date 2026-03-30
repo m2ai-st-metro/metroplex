@@ -26,6 +26,7 @@ class BuildJob(BaseModel):
     queue_job_id: str
     status: Literal["queued", "started", "completed", "failed"]
     queued_at: datetime
+    strategic_theme: str | None = None
 
 
 class PatchApplication(BaseModel):
@@ -85,3 +86,6 @@ class PriorityItem(BaseModel):
     created_at: datetime = Field(default_factory=datetime.now)
     dispatched_at: datetime | None = None
     completed_at: datetime | None = None
+    claimed_by: str | None = None
+    claimed_at: str | None = None
+    strategic_theme: str | None = None

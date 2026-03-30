@@ -4,10 +4,13 @@ Unified OK/WARN/CRIT health assessment for the Metroplex pipeline.
 Standalone module with no imports from Metroplex internals — uses sqlite3 directly.
 """
 import logging
+import os
 import sqlite3
+import subprocess
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import IntEnum
+from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
@@ -249,6 +252,135 @@ def _check_budget_health(conn: sqlite3.Connection, daily_limit: float = 50.0) ->
     return CheckResult(name, HealthStatus.OK, f"${spent:.2f} / ${daily_limit:.2f} ({pct:.0%})")
 
 
+def _check_orphan_processes(metroplex_pid: int | None = None) -> CheckResult:
+    """WARN if 1-5 orphan build child processes, CRIT if >5.
+
+    Detects leftover processes from YCE builds: http.server, uvicorn, testproj,
+    serve_results.py, etc. These accumulate when builds complete or fail without
+    cleaning up their spawned servers.
+
+    Args:
+        metroplex_pid: PID of the Metroplex service. If None, attempts to detect
+            from systemd. Pass 0 to skip (e.g., when Metroplex isn't running).
+    """
+    name = "orphan_processes"
+
+    if metroplex_pid is None:
+        metroplex_pid = _detect_metroplex_pid()
+
+    if metroplex_pid == 0:
+        return CheckResult(name, HealthStatus.OK, "Metroplex not running — no orphans to check")
+
+    orphans = find_orphan_processes(metroplex_pid)
+
+    count = len(orphans)
+    if count > 5:
+        sample = ", ".join(f"PID {p[0]}" for p in orphans[:5])
+        return CheckResult(
+            name, HealthStatus.CRIT,
+            f"{count} orphan processes (>5): {sample}..."
+        )
+    if count >= 1:
+        sample = ", ".join(f"PID {p[0]}" for p in orphans)
+        return CheckResult(
+            name, HealthStatus.WARN,
+            f"{count} orphan process(es): {sample}"
+        )
+    return CheckResult(name, HealthStatus.OK, "No orphan processes")
+
+
+def _detect_metroplex_pid() -> int:
+    """Get the main Metroplex service PID from systemd. Returns 0 if not running."""
+    try:
+        result = subprocess.run(
+            ["systemctl", "--user", "show", "metroplex", "--property=MainPID", "--value"],
+            capture_output=True, text=True, timeout=5,
+        )
+        pid = int(result.stdout.strip())
+        return pid if pid > 0 else 0
+    except (subprocess.TimeoutExpired, ValueError, OSError):
+        return 0
+
+
+def find_orphan_processes(metroplex_pid: int) -> list[tuple[int, str]]:
+    """Find orphan processes in the Metroplex systemd cgroup.
+
+    Build processes (http.server, uvicorn, test servers) get reparented to
+    PID 1 when their parent YCE build exits, but they stay in the Metroplex
+    cgroup. We use the cgroup process list to find them reliably.
+
+    Returns list of (pid, cmdline) tuples for orphan processes.
+    """
+    # Patterns that indicate a build-spawned server (not Metroplex itself)
+    orphan_patterns = (
+        "http.server", "uvicorn", "testproj", "qatest", "verifytest",
+        "jwttest", "jwtfix", "quicktest", "serve_results", "tooltest",
+        "start_server.py", "src.main",
+        "--port 8", "--port 9", "--port 19",
+    )
+
+    # Patterns that are legitimate Metroplex processes (never kill)
+    safe_patterns = (
+        "metroplex.py", "queue_runner",
+    )
+
+    cgroup_procs = Path(
+        "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service"
+        "/app.slice/metroplex.service/cgroup.procs"
+    )
+
+    orphans: list[tuple[int, str]] = []
+    try:
+        if not cgroup_procs.exists():
+            logger.debug("Metroplex cgroup not found -- falling back to ppid scan")
+            return orphans
+
+        pids = [int(line.strip()) for line in cgroup_procs.read_text().splitlines() if line.strip()]
+
+        for pid in pids:
+            if pid == metroplex_pid:
+                continue
+            try:
+                result = subprocess.run(
+                    ["ps", "-o", "args=", "-p", str(pid)],
+                    capture_output=True, text=True, timeout=5,
+                )
+                cmdline = result.stdout.strip()
+                if not cmdline:
+                    continue
+            except (subprocess.TimeoutExpired, OSError):
+                continue
+
+            if any(s in cmdline for s in safe_patterns):
+                continue
+            if any(p in cmdline for p in orphan_patterns):
+                orphans.append((pid, cmdline))
+
+    except (OSError, ValueError) as e:
+        logger.warning("Failed to scan for orphan processes: %s", e)
+
+    return orphans
+
+
+def kill_orphan_processes(metroplex_pid: int) -> list[tuple[int, str]]:
+    """Kill orphan build processes under the Metroplex service tree.
+
+    Returns list of (pid, cmdline) for processes that were killed.
+    """
+    orphans = find_orphan_processes(metroplex_pid)
+    killed: list[tuple[int, str]] = []
+
+    for pid, cmdline in orphans:
+        try:
+            os.kill(pid, 15)  # SIGTERM
+            killed.append((pid, cmdline))
+            logger.info("Killed orphan process PID %d: %s", pid, cmdline[:80])
+        except OSError as e:
+            logger.warning("Failed to kill PID %d: %s", pid, e)
+
+    return killed
+
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
@@ -256,12 +388,14 @@ def _check_budget_health(conn: sqlite3.Connection, daily_limit: float = 50.0) ->
 def run_health_checks(
     db_path: str,
     daily_cost_limit: float = 50.0,
+    metroplex_pid: int | None = None,
 ) -> HealthReport:
     """Run all pipeline health checks and return an aggregated report.
 
     Args:
         db_path: Path to metroplex.db (opened read-only).
         daily_cost_limit: Daily spending cap for budget check.
+        metroplex_pid: PID of Metroplex service. None = auto-detect, 0 = skip orphan check.
 
     Returns:
         HealthReport with per-check results and an overall status equal to
@@ -286,6 +420,9 @@ def run_health_checks(
         ]
     finally:
         conn.close()
+
+    # Orphan process check (no DB needed)
+    checks.append(_check_orphan_processes(metroplex_pid))
 
     overall = HealthStatus(max(c.status for c in checks))
     return HealthReport(overall_status=overall, checks=checks)

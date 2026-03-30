@@ -5,7 +5,7 @@ Manages metroplex.db SQLite database for tracking all decisions, jobs, patches, 
 import re
 import sqlite3
 import json
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -26,10 +26,21 @@ class StateDB:
         self.conn: Optional[sqlite3.Connection] = None
 
     def connect(self):
-        """Connect to database."""
+        """Connect to database.
+
+        Forces a WAL checkpoint on each connect call to ensure the connection
+        sees writes committed by other processes (e.g., previous Metroplex runs).
+        Without this, WAL snapshot isolation can make completed builds invisible
+        to long-lived connections.
+        """
         if self.conn is None:
             self.conn = sqlite3.connect(self.db_path)
             self.conn.row_factory = sqlite3.Row
+        # Force WAL checkpoint so this connection sees all committed writes
+        try:
+            self.conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
+        except sqlite3.OperationalError:
+            pass  # Not in WAL mode or DB not yet initialized
 
     def close(self):
         """Close database connection."""
@@ -66,7 +77,8 @@ class StateDB:
                 spec_path TEXT NOT NULL,
                 queue_job_id TEXT NOT NULL,
                 status TEXT NOT NULL CHECK(status IN ('queued', 'started', 'completed', 'failed')),
-                queued_at TEXT NOT NULL
+                queued_at TEXT NOT NULL,
+                completed_at TEXT
             )
         """)
 
@@ -149,6 +161,15 @@ class StateDB:
         pq_columns = {row[1] for row in cursor.fetchall()}
         if "dispatch_task_id" not in pq_columns:
             cursor.execute("ALTER TABLE priority_queue ADD COLUMN dispatch_task_id TEXT")
+
+        # Migrate: add claimed_by/claimed_at for atomic checkout (Paperclip pattern)
+        if "claimed_by" not in pq_columns:
+            cursor.execute("ALTER TABLE priority_queue ADD COLUMN claimed_by TEXT DEFAULT NULL")
+        if "claimed_at" not in pq_columns:
+            cursor.execute("ALTER TABLE priority_queue ADD COLUMN claimed_at TEXT DEFAULT NULL")
+        # Migrate: add strategic_theme for goal traceability (Paperclip pattern)
+        if "strategic_theme" not in pq_columns:
+            cursor.execute("ALTER TABLE priority_queue ADD COLUMN strategic_theme TEXT DEFAULT NULL")
 
         # Migrate: add project_dir to build_jobs (UM bridge writes actual dir path)
         cursor.execute("PRAGMA table_info(build_jobs)")
@@ -266,6 +287,20 @@ class StateDB:
             except sqlite3.OperationalError:
                 pass  # Column already exists
 
+        # Migrate: add strategic_theme to build_jobs (Paperclip goal traceability)
+        if "strategic_theme" not in bj_columns_b2:
+            try:
+                cursor.execute("ALTER TABLE build_jobs ADD COLUMN strategic_theme TEXT DEFAULT NULL")
+            except sqlite3.OperationalError:
+                pass  # Column already exists
+
+        # Migrate: add completed_at to build_jobs (review grace period — race condition fix)
+        if "completed_at" not in bj_columns_b2:
+            try:
+                cursor.execute("ALTER TABLE build_jobs ADD COLUMN completed_at TEXT DEFAULT NULL")
+            except sqlite3.OperationalError:
+                pass  # Column already exists
+
         # Readme jobs table (Gate 4.7 — enhanced README generation tracking)
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS readme_jobs (
@@ -280,6 +315,35 @@ class StateDB:
             )
         """)
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_readme_jobs_build ON readme_jobs(build_job_id)")
+
+        # Build sessions table (Paperclip pattern: session compaction between retries)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS build_sessions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                base_job_id TEXT NOT NULL,
+                attempt INTEGER NOT NULL DEFAULT 0,
+                session_summary TEXT NOT NULL DEFAULT '',
+                input_tokens_total INTEGER DEFAULT 0,
+                output_tokens_total INTEGER DEFAULT 0,
+                session_age_seconds INTEGER DEFAULT 0,
+                created_at TEXT NOT NULL,
+                UNIQUE(base_job_id, attempt)
+            )
+        """)
+
+        # Budget events table (Paperclip pattern: hard-stop audit trail)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS budget_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_type TEXT NOT NULL CHECK(event_type IN ('hard_stop', 'warning', 'resume')),
+                trigger TEXT NOT NULL,
+                daily_spend REAL,
+                monthly_spend REAL,
+                builds_killed INTEGER DEFAULT 0,
+                details TEXT DEFAULT '{}',
+                created_at TEXT NOT NULL
+            )
+        """)
 
         # Create indexes
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_triage_decisions_idea ON triage_decisions(idea_id)")
@@ -510,8 +574,8 @@ class StateDB:
 
         try:
             cursor.execute("""
-                INSERT INTO priority_queue (source, source_id, title, description, priority_score, status, idea_data, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO priority_queue (source, source_id, title, description, priority_score, status, idea_data, created_at, strategic_theme)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 item.source,
                 item.source_id,
@@ -520,7 +584,8 @@ class StateDB:
                 item.priority_score,
                 item.status,
                 item.idea_data,
-                item.created_at.isoformat()
+                item.created_at.isoformat(),
+                item.strategic_theme,
             ))
             self.conn.commit()
             return cursor.lastrowid
@@ -530,6 +595,9 @@ class StateDB:
 
     def get_next_pending(self, sources: tuple[str, ...] | None = None) -> PriorityItem | None:
         """Get the highest-priority pending item, optionally filtered by source.
+
+        NOTE: This is a read-only query. For concurrent-safe dispatch, use
+        claim_next_pending() instead which atomically claims the item.
 
         Args:
             sources: If provided, only return items from these sources
@@ -568,8 +636,94 @@ class StateDB:
                 created_at=datetime.fromisoformat(row["created_at"]),
                 dispatched_at=datetime.fromisoformat(row["dispatched_at"]) if row["dispatched_at"] else None,
                 completed_at=datetime.fromisoformat(row["completed_at"]) if row["completed_at"] else None,
+                claimed_by=row["claimed_by"] if "claimed_by" in row.keys() else None,
+                claimed_at=row["claimed_at"] if "claimed_at" in row.keys() else None,
             )
         return None
+
+    def claim_next_pending(self, claimer_id: str, sources: tuple[str, ...] | None = None) -> PriorityItem | None:
+        """Atomically claim the highest-priority pending item.
+
+        Uses UPDATE...WHERE claimed_by IS NULL to prevent double-claiming.
+        Returns the claimed item, or None if nothing available or contention.
+
+        Args:
+            claimer_id: Identifier for the claiming process (e.g. "build-12345")
+            sources: If provided, only claim from these sources.
+        """
+        self.connect()
+        cursor = self.conn.cursor()
+
+        # Step 1: Find candidate
+        if sources:
+            placeholders = ",".join("?" for _ in sources)
+            cursor.execute(f"""
+                SELECT id FROM priority_queue
+                WHERE status = 'pending' AND (claimed_by IS NULL) AND source IN ({placeholders})
+                ORDER BY priority_score DESC
+                LIMIT 1
+            """, sources)
+        else:
+            cursor.execute("""
+                SELECT id FROM priority_queue
+                WHERE status = 'pending' AND (claimed_by IS NULL)
+                ORDER BY priority_score DESC
+                LIMIT 1
+            """)
+
+        row = cursor.fetchone()
+        if not row:
+            return None
+
+        candidate_id = row["id"]
+        now = datetime.now().isoformat()
+
+        # Step 2: Atomic claim — only succeeds if still unclaimed and pending
+        cursor.execute("""
+            UPDATE priority_queue
+            SET claimed_by = ?, claimed_at = ?, status = 'dispatched', dispatched_at = ?
+            WHERE id = ? AND status = 'pending' AND claimed_by IS NULL
+        """, (claimer_id, now, now, candidate_id))
+        self.conn.commit()
+
+        if cursor.rowcount == 0:
+            # Contention: another process claimed it between SELECT and UPDATE
+            return None
+
+        # Step 3: Re-read the full row to return
+        cursor.execute("SELECT * FROM priority_queue WHERE id = ?", (candidate_id,))
+        claimed_row = cursor.fetchone()
+        if not claimed_row:
+            return None
+
+        return PriorityItem(
+            id=claimed_row["id"],
+            source=claimed_row["source"],
+            source_id=claimed_row["source_id"],
+            title=claimed_row["title"],
+            description=claimed_row["description"],
+            priority_score=claimed_row["priority_score"],
+            status=claimed_row["status"],
+            idea_data=claimed_row["idea_data"],
+            created_at=datetime.fromisoformat(claimed_row["created_at"]),
+            dispatched_at=datetime.fromisoformat(claimed_row["dispatched_at"]) if claimed_row["dispatched_at"] else None,
+            completed_at=datetime.fromisoformat(claimed_row["completed_at"]) if claimed_row["completed_at"] else None,
+            claimed_by=claimed_row["claimed_by"],
+            claimed_at=claimed_row["claimed_at"],
+        )
+
+    def release_claim(self, item_id: int) -> None:
+        """Release a claimed item back to pending status.
+
+        Used for cleanup when processing fails after claiming.
+        """
+        self.connect()
+        self.conn.execute("""
+            UPDATE priority_queue
+            SET claimed_by = NULL, claimed_at = NULL, status = 'pending', dispatched_at = NULL
+            WHERE id = ?
+        """, (item_id,))
+        self.conn.commit()
 
     def update_item_status(self, item_id: int, status: str, timestamp_field: str | None = None):
         """Update a priority queue item's status and optional timestamp."""
@@ -657,10 +811,17 @@ class StateDB:
         cursor = self.conn.cursor()
 
         # Only update rows not already in the target status
-        cursor.execute(
-            "UPDATE build_jobs SET status = ? WHERE queue_job_id = ? AND status != ?",
-            (status, queue_job_id, status)
-        )
+        if status in ("completed", "failed"):
+            completed_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+            cursor.execute(
+                "UPDATE build_jobs SET status = ?, completed_at = ? WHERE queue_job_id = ? AND status != ?",
+                (status, completed_at, queue_job_id, status)
+            )
+        else:
+            cursor.execute(
+                "UPDATE build_jobs SET status = ? WHERE queue_job_id = ? AND status != ?",
+                (status, queue_job_id, status)
+            )
         changed = cursor.rowcount > 0
 
         # Discover and set project_dir if not already set
@@ -821,6 +982,7 @@ class StateDB:
             FROM build_jobs b
             WHERE b.status = 'completed'
             AND (b.review_status IS NULL OR b.review_status = '')
+            AND (b.completed_at IS NULL OR b.completed_at <= datetime('now', '-5 minutes'))
         """)
         return [
             {"queue_job_id": row["queue_job_id"], "title": row["title"], "project_dir": row["project_dir"]}
@@ -1152,6 +1314,11 @@ class StateDB:
                 AND b.queue_job_id NOT IN (
                     SELECT build_job_id FROM publish_jobs WHERE status = 'published'
                 )
+                AND b.base_job_id NOT IN (
+                    SELECT bj2.base_job_id FROM build_jobs bj2
+                    INNER JOIN publish_jobs pj ON pj.build_job_id = bj2.queue_job_id
+                    WHERE pj.status = 'published'
+                )
             """)
         else:
             cursor.execute("""
@@ -1161,6 +1328,11 @@ class StateDB:
                 AND (b.review_status = 'reviewed' OR b.review_status IS NULL)
                 AND b.queue_job_id NOT IN (
                     SELECT build_job_id FROM publish_jobs WHERE status = 'published'
+                )
+                AND b.base_job_id NOT IN (
+                    SELECT bj2.base_job_id FROM build_jobs bj2
+                    INNER JOIN publish_jobs pj ON pj.build_job_id = bj2.queue_job_id
+                    WHERE pj.status = 'published'
                 )
             """)
         return [{"queue_job_id": row["queue_job_id"], "title": row["title"], "project_dir": row["project_dir"]} for row in cursor.fetchall()]
@@ -1300,6 +1472,68 @@ class StateDB:
             ORDER BY date DESC
         """, (start_date,))
         return [dict(row) for row in cursor.fetchall()]
+
+    # --- Build Sessions (Paperclip session compaction) ---
+
+    def record_session(
+        self,
+        base_job_id: str,
+        attempt: int,
+        session_summary: str,
+        input_tokens_total: int = 0,
+        output_tokens_total: int = 0,
+        session_age_seconds: int = 0,
+    ) -> int:
+        """Record a session snapshot for retry context."""
+        self.connect()
+        cursor = self.conn.cursor()
+        cursor.execute("""
+            INSERT OR REPLACE INTO build_sessions
+            (base_job_id, attempt, session_summary, input_tokens_total, output_tokens_total, session_age_seconds, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, (
+            base_job_id, attempt, session_summary,
+            input_tokens_total, output_tokens_total, session_age_seconds,
+            datetime.now().isoformat(),
+        ))
+        self.conn.commit()
+        return cursor.lastrowid
+
+    def get_latest_session(self, base_job_id: str) -> dict | None:
+        """Get the most recent session snapshot for a base job.
+
+        Returns dict with session_summary, input_tokens_total, output_tokens_total,
+        session_age_seconds, attempt, created_at. Or None if no session exists.
+        """
+        self.connect()
+        cursor = self.conn.cursor()
+        cursor.execute("""
+            SELECT * FROM build_sessions
+            WHERE base_job_id = ?
+            ORDER BY attempt DESC
+            LIMIT 1
+        """, (base_job_id,))
+        row = cursor.fetchone()
+        return dict(row) if row else None
+
+    def record_budget_event(
+        self,
+        event_type: str,
+        trigger: str,
+        daily_spend: float,
+        monthly_spend: float,
+        builds_killed: int = 0,
+        details: str = "{}",
+    ) -> int:
+        """Record a budget enforcement event for audit trail."""
+        self.connect()
+        cursor = self.conn.cursor()
+        cursor.execute("""
+            INSERT INTO budget_events (event_type, trigger, daily_spend, monthly_spend, builds_killed, details, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, (event_type, trigger, daily_spend, monthly_spend, builds_killed, details, datetime.now().isoformat()))
+        self.conn.commit()
+        return cursor.lastrowid
 
     def update_build_quality_score(self, queue_job_id: str, quality_score: float) -> bool:
         """Set quality_score on a build job (Phase 14b)."""

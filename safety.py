@@ -1,14 +1,22 @@
 """
 Metroplex Safety Systems
-Circuit breaker, cycle caps, and graceful shutdown handler to prevent runaway autonomous behavior.
+Circuit breaker, cycle caps, budget enforcement, and graceful shutdown handler
+to prevent runaway autonomous behavior.
 """
+import json
+import logging
+import os
 import signal
+import time
 import threading
+from pathlib import Path
 from typing import Literal
 
 from config import Config
 from db import StateDB
 from models import GateStatus
+
+logger = logging.getLogger(__name__)
 
 
 class CircuitBreaker:
@@ -150,6 +158,115 @@ class CycleCaps:
             True if under cap (can apply more), False if at/over cap
         """
         return current_count < self.max_patches
+
+
+class BudgetEnforcer:
+    """Kill running builds when spending exceeds budget limits.
+
+    Inspired by Paperclip's budget hard-stop pattern. Checks daily and monthly
+    spend against limits and sends SIGTERM to the YCE queue runner if exceeded.
+    Feature-flagged via config.budget_hard_stop.
+    """
+
+    RUNNER_PID_FILE = Path(__file__).parent / "data" / "runner.pid"
+    KILL_GRACE_SECONDS = 15
+
+    def __init__(self, config: Config, state_db: StateDB):
+        self.config = config
+        self.state_db = state_db
+        self._already_enforced = False  # Prevent repeated kills in same cycle
+
+    def check_and_enforce(self) -> bool:
+        """Check budget and kill running builds if exceeded.
+
+        Returns True if enforcement was triggered.
+        """
+        if not self.config.budget_hard_stop:
+            return False
+
+        daily = self.state_db.get_daily_spend()
+        monthly = self.state_db.get_monthly_spend()
+        daily_limit = self.config.daily_cost_limit * self.config.budget_grace_percent
+        monthly_limit = self.config.monthly_cost_limit * self.config.budget_grace_percent
+
+        exceeded_daily = daily >= daily_limit
+        exceeded_monthly = monthly >= monthly_limit
+
+        if not exceeded_daily and not exceeded_monthly:
+            self._already_enforced = False
+            return False
+
+        if self._already_enforced:
+            return True  # Already killed this cycle, don't re-trigger
+
+        trigger = []
+        if exceeded_daily:
+            trigger.append(f"daily=${daily:.2f}>=${daily_limit:.2f}")
+        if exceeded_monthly:
+            trigger.append(f"monthly=${monthly:.2f}>=${monthly_limit:.2f}")
+        trigger_str = ", ".join(trigger)
+
+        builds_killed = self._kill_running_builds()
+
+        self.state_db.record_budget_event(
+            event_type="hard_stop",
+            trigger=trigger_str,
+            daily_spend=daily,
+            monthly_spend=monthly,
+            builds_killed=builds_killed,
+            details=json.dumps({
+                "daily_limit": self.config.daily_cost_limit,
+                "monthly_limit": self.config.monthly_cost_limit,
+                "grace_percent": self.config.budget_grace_percent,
+            }),
+        )
+
+        logger.warning(
+            "BUDGET HARD-STOP: %s — killed %d build(s)",
+            trigger_str, builds_killed,
+        )
+
+        self._already_enforced = True
+        return True
+
+    def _kill_running_builds(self) -> int:
+        """Send SIGTERM to the YCE queue runner, wait, then SIGKILL if needed.
+
+        Returns number of processes killed (0 or 1).
+        """
+        if not self.RUNNER_PID_FILE.exists():
+            return 0
+
+        try:
+            pid = int(self.RUNNER_PID_FILE.read_text().strip())
+        except (ValueError, OSError):
+            return 0
+
+        # Check if process is alive
+        try:
+            os.kill(pid, 0)
+        except (ProcessLookupError, PermissionError):
+            self.RUNNER_PID_FILE.unlink(missing_ok=True)
+            return 0
+
+        # SIGTERM → grace period → SIGKILL
+        try:
+            os.kill(pid, signal.SIGTERM)
+            logger.info("Sent SIGTERM to runner PID %d", pid)
+        except (ProcessLookupError, PermissionError):
+            return 0
+
+        time.sleep(self.KILL_GRACE_SECONDS)
+
+        try:
+            os.kill(pid, 0)  # Check if still alive
+            os.kill(pid, signal.SIGKILL)
+            logger.warning("Runner PID %d did not exit after SIGTERM, sent SIGKILL", pid)
+        except (ProcessLookupError, PermissionError):
+            pass  # Already dead, good
+
+        self.RUNNER_PID_FILE.unlink(missing_ok=True)
+        return 1
 
 
 class ShutdownHandler:

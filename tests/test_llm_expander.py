@@ -11,7 +11,7 @@ import os
 
 from config import Config
 from gates.build import SpecGenerator
-from gates.llm_expander import LLMSpecExpander, SPEC_EXPANSION_PROMPT
+from gates.llm_expander import LLMSpecExpander, SPEC_EXPANSION_PROMPT, validate_spec
 
 
 @pytest.fixture
@@ -81,6 +81,65 @@ def _mock_openai_response(text: str) -> Mock:
     response.choices = [choice]
     response.usage = usage
     return response
+
+
+class TestValidateSpec:
+    """Tests for validate_spec quality checks."""
+
+    def _spec_with_lines(self, n: int) -> str:
+        """Generate a spec with exactly n lines and valid structure."""
+        header = "# Test Spec\n\n## Overview\nContent.\n\n## Tech Stack\nPython.\n\n## Core Features\nStuff.\n\n## Architecture\nSimple."
+        header_lines = header.split("\n")
+        # Pad to desired length
+        while len(header_lines) < n:
+            header_lines.append("- filler line")
+        return "\n".join(header_lines[:n])
+
+    def test_valid_spec_passes(self):
+        valid = _make_valid_spec("Test Tool")
+        is_valid, reason = validate_spec(valid)
+        assert is_valid, f"Expected valid, got: {reason}"
+
+    def test_rejects_too_short(self):
+        short = self._spec_with_lines(30)
+        is_valid, reason = validate_spec(short)
+        assert not is_valid
+        assert "Degenerate spec" in reason
+
+    def test_rejects_too_long(self):
+        long = self._spec_with_lines(500)
+        is_valid, reason = validate_spec(long)
+        assert not is_valid
+        assert "Over-scoped spec" in reason
+
+    def test_rejects_duplicate_overview(self):
+        spec = _make_valid_spec("Test") + "\n\n## Overview\nDuplicate!"
+        is_valid, reason = validate_spec(spec)
+        assert not is_valid
+        assert "Duplicate content" in reason
+
+    def test_rejects_template_parroting(self):
+        spec = _make_valid_spec("Test")
+        spec = spec.replace(
+            "## Environment Setup",
+            "## Environment Setup\nEnvironment variables table — should be 0-2 variables",
+        )
+        is_valid, reason = validate_spec(spec)
+        assert not is_valid
+        assert "Template parroting" in reason
+
+    def test_rejects_cot_leakage(self):
+        spec = _make_valid_spec("Test")
+        spec += "\nlet's consider this. however, note that. alternatively we could."
+        is_valid, reason = validate_spec(spec)
+        assert not is_valid
+        assert "CoT leakage" in reason
+
+    def test_rejects_insufficient_headers(self):
+        spec = "# Title\nSome content without any ## headers at all.\n" * 30
+        is_valid, reason = validate_spec(spec)
+        assert not is_valid
+        assert "Insufficient structure" in reason
 
 
 class TestLLMSpecExpander:
@@ -210,6 +269,86 @@ class TestLLMSpecExpander:
             )
 
 
+def _make_valid_spec(title: str) -> str:
+    """Build a mock LLM spec that passes all validate_spec checks."""
+    lines = [
+        f"# {title} - App Specification",
+        "",
+        "## Overview",
+        f"LLM-generated content for {title}.",
+        "",
+        "**Problem Statement**: Solves a real problem.",
+        "**Target Audience**: Developers.",
+        "",
+        "## Tech Stack",
+        "- Python 3.11+",
+        "- click",
+        "- pytest",
+        "",
+        "## Environment Setup",
+        "### Prerequisites",
+        "- Python 3.11+",
+        "",
+        "### Configuration",
+        "| Variable | Required | Description |",
+        "|----------|----------|-------------|",
+        "| DEBUG | No | Enable debug logging |",
+        "",
+        "## Architecture",
+        "```",
+        "CLI -> Core -> Output",
+        "```",
+        "",
+        "## Core Features",
+        "",
+        "### Feature 1: Core Analysis",
+        f"**Description**: Main engine for {title}",
+        "**Requirements**:",
+        "- Accept input via CLI",
+        "- Process data",
+        "- Output JSON",
+        "**Test Steps**:",
+        "1. `tool analyze input.json` -> JSON output",
+        "",
+        "### Feature 2: Reporting",
+        "**Description**: Generate reports",
+        "**Requirements**:",
+        "- Accept results",
+        "- Output markdown",
+        "**Test Steps**:",
+        "1. `tool report results.json` -> Markdown",
+        "",
+        "## Data Models",
+        "```python",
+        "from dataclasses import dataclass",
+        "@dataclass",
+        "class Result:",
+        "    score: float",
+        "```",
+        "",
+        "## File Structure",
+        "```",
+        "project/",
+        "├── src/",
+        "│   ├── cli.py",
+        "│   └── core.py",
+        "├── tests/",
+        "│   └── test_core.py",
+        "└── requirements.txt",
+        "```",
+        "",
+        "## Success Criteria",
+        "1. CLI works",
+        "2. Tests pass",
+        "3. Output correct",
+        "",
+        "## Constraints & Notes",
+        "- No external API calls",
+        "- MVP in 5 iterations",
+    ]
+    return "\n".join(lines)
+
+
 class TestSpecGeneratorLLMIntegration:
     """Tests for SpecGenerator with LLM expansion enabled."""
 
@@ -218,7 +357,7 @@ class TestSpecGeneratorLLMIntegration:
         config = Config()
         config.spec_use_llm = True
 
-        llm_spec = "# Agent Supply Chain Scanner - App Specification\n\n## Overview\nLLM-generated content..."
+        llm_spec = _make_valid_spec("Agent Supply Chain Scanner")
 
         with patch("gates.build.LLMSpecExpander") as MockExpander:
             mock_instance = MockExpander.return_value
@@ -232,8 +371,8 @@ class TestSpecGeneratorLLMIntegration:
             assert "LLM-generated content" in content
             mock_instance.expand.assert_called_once_with(tool_idea)
 
-    def test_llm_failure_falls_back_to_jinja2(self, template_dir, output_dir, tool_idea):
-        """Test that SpecGenerator falls back to Jinja2 when LLM fails."""
+    def test_llm_failure_raises_runtime_error(self, template_dir, output_dir, tool_idea):
+        """Test that LLM failure raises RuntimeError (no Jinja2 fallback)."""
         config = Config()
         config.spec_use_llm = True
 
@@ -242,31 +381,23 @@ class TestSpecGeneratorLLMIntegration:
             mock_instance.expand.side_effect = Exception("API error")
 
             generator = SpecGenerator(config, template_dir)
-            path = generator.generate_spec(tool_idea, output_dir)
 
-            # Should still produce output via Jinja2
-            assert path.exists()
-            content = path.read_text()
-            # Jinja2 template contains these generic sections
-            assert "## Tech Stack" in content
-            assert "CLI Argument Parsing" in content  # Generic Jinja2 feature
+            with pytest.raises(RuntimeError, match="LLM expansion failed"):
+                generator.generate_spec(tool_idea, output_dir)
 
-    def test_llm_disabled_uses_jinja2(self, template_dir, output_dir, tool_idea):
-        """Test that SpecGenerator uses Jinja2 when LLM is disabled."""
+    def test_llm_disabled_raises_runtime_error(self, template_dir, output_dir, tool_idea):
+        """Test that generate_spec raises RuntimeError when LLM is disabled."""
         config = Config()
         config.spec_use_llm = False
 
         generator = SpecGenerator(config, template_dir)
         assert generator.llm_expander is None
 
-        path = generator.generate_spec(tool_idea, output_dir)
-        assert path.exists()
-        content = path.read_text()
-        assert tool_idea["title"] in content
-        assert "## Tech Stack" in content
+        with pytest.raises(RuntimeError, match="LLM expander not configured"):
+            generator.generate_spec(tool_idea, output_dir)
 
-    def test_llm_init_failure_falls_back_gracefully(self, template_dir, output_dir, tool_idea):
-        """Test that SpecGenerator works even if LLMSpecExpander init fails."""
+    def test_llm_init_failure_raises_runtime_error(self, template_dir, output_dir, tool_idea):
+        """Test that generate_spec raises when LLMSpecExpander init fails."""
         config = Config()
         config.spec_use_llm = True
 
@@ -274,18 +405,19 @@ class TestSpecGeneratorLLMIntegration:
             generator = SpecGenerator(config, template_dir)
             assert generator.llm_expander is None
 
-            # Should still work via Jinja2
-            path = generator.generate_spec(tool_idea, output_dir)
-            assert path.exists()
+            with pytest.raises(RuntimeError, match="LLM expander not configured"):
+                generator.generate_spec(tool_idea, output_dir)
 
     def test_output_path_format_with_llm(self, template_dir, output_dir, tool_idea):
         """Test output path follows convention even with LLM expansion."""
         config = Config()
         config.spec_use_llm = True
 
+        llm_spec = _make_valid_spec("Agent Supply Chain Scanner")
+
         with patch("gates.build.LLMSpecExpander") as MockExpander:
             mock_instance = MockExpander.return_value
-            mock_instance.expand.return_value = "# Spec Content"
+            mock_instance.expand.return_value = llm_spec
 
             generator = SpecGenerator(config, template_dir)
             path = generator.generate_spec(tool_idea, output_dir)
@@ -298,14 +430,15 @@ class TestSpecGeneratorLLMIntegration:
         config = Config()
         config.spec_use_llm = True
 
+        llm_spec = _make_valid_spec("PR Review Agent")
+
         with patch("gates.build.LLMSpecExpander") as MockExpander:
             mock_instance = MockExpander.return_value
-            mock_instance.expand.return_value = "# PR Review Agent\n## Overview\n..."
+            mock_instance.expand.return_value = llm_spec
 
             generator = SpecGenerator(config, template_dir)
             generator.generate_spec(agent_idea, output_dir)
 
-            # Verify the idea dict was passed to expand
             call_args = mock_instance.expand.call_args[0][0]
             assert call_args["artifact_type"] == "agent"
             assert call_args["title"] == "PR Review Agent"

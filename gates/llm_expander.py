@@ -12,14 +12,101 @@ from openai import OpenAI
 
 logger = logging.getLogger(__name__)
 
+# Chain-of-thought leakage markers that indicate the LLM included its reasoning
+COT_MARKERS = [
+    "let's consider",
+    "however, note",
+    "alternatively",
+    "given the constraints",
+    "this is getting messy",
+    "too long",
+    "we'll need to",
+    "count the lines",
+    "let me think",
+    "on second thought",
+    "wait,",
+    "hmm,",
+]
+
+MIN_SECTION_HEADERS = 3
+MIN_SPEC_LINES = 50
+MAX_SPEC_LINES = 400
+
+# Template instruction fragments that should never appear in a generated spec.
+# Their presence means the LLM parroted the prompt template instead of following it.
+PARROT_MARKERS = [
+    "Environment variables table — should be 0-2 variables",
+    "Simple ASCII diagram. Should fit in 10 lines",
+    "Short bullet list. For tools:",
+    "1-2 paragraphs: what this builds",
+    "EXACTLY 2-3 features",
+    "1-2 Pydantic models or dataclasses",
+    "Flat structure preferred. 8-12 files max",
+]
+
+
+def validate_spec(spec_text: str) -> tuple[bool, str]:
+    """Validate an LLM-generated spec for quality issues.
+
+    Checks for:
+    - Chain-of-thought leakage (3+ CoT markers)
+    - Minimum section structure (## headers)
+    - Length bounds (too short = degenerate, too long = over-scoped)
+    - Duplicate content (spec repeated in output)
+    - Template parroting (LLM copied prompt instructions verbatim)
+
+    Args:
+        spec_text: The generated spec markdown text.
+
+    Returns:
+        Tuple of (is_valid, reason). If invalid, reason describes the failure.
+    """
+    spec_lower = spec_text.lower()
+
+    # Check for chain-of-thought leakage
+    cot_hits = [m for m in COT_MARKERS if m in spec_lower]
+    if len(cot_hits) >= 3:
+        return False, f"CoT leakage detected ({len(cot_hits)} markers: {cot_hits[:5]})"
+
+    # Check for minimum section structure (## headers)
+    header_count = spec_text.count("\n## ")
+    # Also count if spec starts with ## (no preceding newline)
+    if spec_text.startswith("## "):
+        header_count += 1
+    if header_count < MIN_SECTION_HEADERS:
+        return False, f"Insufficient structure: {header_count} section headers (need >= {MIN_SECTION_HEADERS})"
+
+    # Fix A: Length bounds
+    line_count = spec_text.count("\n") + 1
+    if line_count < MIN_SPEC_LINES:
+        return False, f"Degenerate spec: {line_count} lines (need >= {MIN_SPEC_LINES})"
+    if line_count > MAX_SPEC_LINES:
+        return False, f"Over-scoped spec: {line_count} lines (max {MAX_SPEC_LINES})"
+
+    # Fix B: Duplicate content detection
+    overview_count = spec_text.count("## Overview")
+    if overview_count > 1:
+        return False, f"Duplicate content: '## Overview' appears {overview_count} times"
+
+    # Fix C: Template parrot detection
+    parrot_hits = [m for m in PARROT_MARKERS if m in spec_text]
+    if parrot_hits:
+        return False, f"Template parroting: LLM copied {len(parrot_hits)} instruction fragments"
+
+    return True, ""
+
 # Prompt that produces YCE-compatible app_spec.txt content
 SPEC_EXPANSION_PROMPT = """\
+CRITICAL: Output ONLY the final Markdown specification document. No preamble, no reasoning, no alternatives considered, no internal debate. Do not include phrases like "let's consider", "however, note", "alternatively", or any chain-of-thought. Start directly with the markdown heading.
+
 You are a senior software architect writing a build specification for an autonomous coding agent.
 
 The agent gets EXACTLY 5 iterations to produce a working project. Scope accordingly.
 
 Given the following idea data, produce a focused, minimal-scope app specification in Markdown format.
 The spec must be specific to THIS idea -- no generic boilerplate.
+
+If problem_statement or target_audience is empty, blank, or "General", INVENT a concrete one from the description. Never leave them blank or generic.
 
 ## Idea Data
 
@@ -35,15 +122,16 @@ The spec must be specific to THIS idea -- no generic boilerplate.
 The builder is a single AI coding agent with 5 iterations. Specs that violate these constraints WILL be rejected:
 
 1. **Maximum 3 core features**. Pick the 3 most essential. Everything else is out of scope.
-2. **Maximum 8-12 source files** (excluding tests). If your design needs more, simplify.
-3. **ZERO external API dependencies**. No calls to OpenAI, Anthropic, Google, Slack, GitHub API, etc.
+2. **Each feature must be implementable in ~50-100 lines**. If a feature requires scoring algorithms, ML inference, embedding models, real-time polling, Canvas/chart rendering, or async orchestration -- it is TOO COMPLEX. Replace with a simpler alternative using basic data structures and string operations.
+3. **Maximum 8-12 source files** (excluding tests). If your design needs more, simplify.
+4. **ZERO external API dependencies**. No calls to OpenAI, Anthropic, Google, Slack, GitHub API, etc.
    The tool must work entirely offline with local data, stdin/stdout, or local files.
-4. **ZERO paid services**. No cloud providers, no SaaS integrations, no API keys required.
-5. **Single data store only**: SQLite OR JSON files OR in-memory. Never multiple storage backends.
-6. **No multi-process architectures**. No separate servers, workers, message queues, or microservices.
+5. **ZERO paid services**. No cloud providers, no SaaS integrations, no API keys required.
+6. **Single data store only**: SQLite OR JSON files OR in-memory. Never multiple storage backends.
+7. **No multi-process architectures**. No separate servers, workers, message queues, or microservices.
    Everything runs in a single process.
-7. **No web frontends** for tool/agent types. CLI only. Products may have a simple single-page UI.
-8. **Standard library + 3-5 pip packages max**. Every dependency is a risk.
+8. **No web frontends** for tool/agent types. CLI only. Products may have a simple single-page UI.
+9. **Standard library + 3-5 pip packages max**. Every dependency is a risk.
 
 Think of the SMALLEST thing that solves the core problem. A tool that does ONE thing well
 ships and works. A tool that tries to do five things ships broken.
@@ -102,7 +190,7 @@ Produce a Markdown document with EXACTLY these sections:
 
 IMPORTANT RULES:
 - Every feature must be SPECIFIC to this idea. No generic features like "Error Handling" or "Logging".
-- Test steps must be concrete CLI commands with expected output.
+- Every test step MUST be a concrete CLI command with EXACT expected stdout output. Do NOT write vague test steps like "verify the output is correct".
 - If the idea sounds like it needs external APIs, find a LOCAL alternative (mock data, local analysis, file-based).
 - Keep the total length between 300-600 lines of markdown. Shorter is better.
 - The spec must be buildable by a coding agent with NO human help and NO API keys.

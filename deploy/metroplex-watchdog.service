@@ -5,5 +5,7 @@ After=metroplex.service
 [Service]
 Type=oneshot
 WorkingDirectory=/home/apexaipc/projects/metroplex
+EnvironmentFile=/home/apexaipc/.env.shared
 ExecStart=/home/apexaipc/projects/metroplex/venv/bin/python watchdog.py
 Environment=HOME=/home/apexaipc
+Environment=PATH=/home/apexaipc/projects/metroplex/venv/bin:/usr/local/bin:/usr/bin:/bin

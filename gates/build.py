@@ -18,7 +18,8 @@ from config import Config
 from models import BuildJob, PriorityItem
 from db import StateDB
 from audit import AuditLogger
-from gates.llm_expander import LLMSpecExpander
+from cost_rates import estimate_cost
+from gates.llm_expander import LLMSpecExpander, validate_spec
 from oz_bridge import submit_to_oz
 from readers.ideaforge_reader import IdeaForgeReader
 
@@ -111,27 +112,30 @@ class SpecGenerator:
 
         output_path = output_dir / f"app_spec_{idea['id']}.txt"
 
-        # Try LLM expansion first
-        if self.llm_expander is not None:
-            try:
-                rendered_spec = self.llm_expander.expand(idea)
-                output_path.write_text(rendered_spec, encoding="utf-8")
-                logger.info(
-                    "LLM spec generated for idea %s: %s (%d chars)",
-                    idea["id"], idea["title"], len(rendered_spec),
-                )
-                return output_path
-            except Exception as e:
-                logger.warning(
-                    "LLM expansion failed for idea %s, falling back to Jinja2: %s",
-                    idea["id"], e,
-                )
+        # LLM expansion only -- no fallback to generic templates.
+        # A bad spec wastes a build slot. Better to skip and retry next cycle.
+        if self.llm_expander is None:
+            raise RuntimeError(
+                f"LLM expander not configured. Cannot generate spec for idea {idea['id']}."
+            )
 
-        # Jinja2 fallback
-        rendered_spec = self._render_jinja2(idea)
+        try:
+            rendered_spec = self.llm_expander.expand(idea)
+        except Exception as e:
+            raise RuntimeError(
+                f"LLM expansion failed for idea {idea['id']} ({idea['title']}): {e}"
+            ) from e
+
+        # Post-generation validation: reject bad specs instead of falling back to generic template
+        is_valid, rejection_reason = validate_spec(rendered_spec)
+        if not is_valid:
+            raise ValueError(
+                f"LLM spec rejected for idea {idea['id']} ({idea['title']}): {rejection_reason}"
+            )
+
         output_path.write_text(rendered_spec, encoding="utf-8")
         logger.info(
-            "Jinja2 spec generated for idea %s: %s (%d chars)",
+            "LLM spec generated for idea %s: %s (%d chars)",
             idea["id"], idea["title"], len(rendered_spec),
         )
 
@@ -178,9 +182,14 @@ class SpecGenerator:
 
 
 class BuildOrchestrator:
-    """Gate 2: Build Orchestration - Queue Runner Integration."""
+    """Gate 2: Build Orchestration - Queue Runner Integration.
 
-    def __init__(self, config: Config, state_db: StateDB, spec_generator: SpecGenerator, audit_logger: AuditLogger, tyrest_gate=None, ideaforge_reader: Optional[IdeaForgeReader] = None):
+    Supports pluggable build adapters (Paperclip pattern). When an adapter is
+    provided, queue/poll/start operations delegate to it. Otherwise, falls back
+    to the inline subprocess implementation for backward compatibility.
+    """
+
+    def __init__(self, config: Config, state_db: StateDB, spec_generator: SpecGenerator, audit_logger: AuditLogger, tyrest_gate=None, ideaforge_reader: Optional[IdeaForgeReader] = None, adapter=None):
         """
         Initialize Build Orchestrator.
 
@@ -191,6 +200,7 @@ class BuildOrchestrator:
             audit_logger: Audit logger for tracking decisions
             tyrest_gate: Optional TyrestGate for pre-build spec review
             ideaforge_reader: Optional IdeaForgeReader for refreshing stale snapshot data
+            adapter: Optional BuildAdapter for runtime-agnostic dispatch
         """
         self.config = config
         self.state_db = state_db
@@ -198,12 +208,14 @@ class BuildOrchestrator:
         self.audit_logger = audit_logger
         self.tyrest_gate = tyrest_gate
         self.ideaforge_reader = ideaforge_reader
+        self.adapter = adapter
         self.queue_runner_path = Path(config.yce_dir) / "queue_runner.py"
         self.yce_python = Path(config.yce_dir) / "venv" / "bin" / "python"
 
     def queue_build(self, idea: dict, spec_path: Path, dry_run: bool = False, attempt: int = 0) -> BuildJob | None:
         """
-        Queue a build job via queue_runner.py add.
+        Queue a build job. Delegates to adapter if available, otherwise
+        falls back to inline subprocess logic.
 
         Args:
             idea: Idea dictionary with id and title
@@ -217,108 +229,83 @@ class BuildOrchestrator:
         source = idea.get("_source", "ideaforge")
         base_job_id = f"metroplex-{source}-{idea['id']}"
         job_id = f"{base_job_id}-r{attempt}" if attempt > 0 else base_job_id
-        command = [
-            str(self.yce_python),
-            str(self.queue_runner_path),
-            "add",
-            str(spec_path.resolve()),
-            "--id",
-            job_id,
-            "--model",
-            self.config.build_model,
-        ]
-        if self.config.build_parallel:
-            command.append("--parallel")
-            command.extend(["--max-workers", str(self.config.build_max_workers)])
 
         if dry_run:
-            print(f"[DRY RUN] Would execute: {' '.join(command)}")
+            print(f"[DRY RUN] Would queue build {job_id} from {spec_path}")
             return None
 
-        try:
-            result = subprocess.run(
-                command,
-                capture_output=True,
-                text=True,
-                timeout=30
+        queued_at = datetime.now()
+        error_msg = None
+
+        if self.adapter is not None:
+            # Delegate to pluggable adapter
+            result = self.adapter.queue(
+                spec_path=spec_path,
+                job_id=job_id,
+                model=self.config.build_model,
+                parallel=self.config.build_parallel,
+                max_workers=self.config.build_max_workers,
             )
+            status = result.status
+            error_msg = result.error
+        else:
+            # Inline subprocess fallback (original implementation)
+            command = [
+                str(self.yce_python),
+                str(self.queue_runner_path),
+                "add",
+                str(spec_path.resolve()),
+                "--id",
+                job_id,
+                "--model",
+                self.config.build_model,
+            ]
+            if self.config.build_parallel:
+                command.append("--parallel")
+                command.extend(["--max-workers", str(self.config.build_max_workers)])
 
-            queued_at = datetime.now()
+            try:
+                proc_result = subprocess.run(
+                    command, capture_output=True, text=True, timeout=30
+                )
+                if proc_result.returncode == 0:
+                    status = "queued"
+                else:
+                    status = "failed"
+                    error_msg = proc_result.stderr.strip() or proc_result.stdout.strip() or "Unknown error"
+            except subprocess.TimeoutExpired:
+                status = "failed"
+                error_msg = "queue_build command timed out after 30 seconds"
+            except Exception as e:
+                status = "failed"
+                error_msg = f"Unexpected error queuing build: {e}"
 
-            if result.returncode == 0:
-                job = BuildJob(
-                    idea_id=idea["id"],
-                    title=idea["title"],
-                    spec_path=str(spec_path),
-                    queue_job_id=job_id,
-                    status="queued",
-                    queued_at=queued_at
-                )
-                self.state_db.record_build_job(job)
-                self.audit_logger.log_decision(
-                    gate="build",
-                    action="queue_build",
-                    details={
-                        "idea_id": idea["id"],
-                        "job_id": job_id,
-                        "spec_path": str(spec_path),
-                        "status": "queued"
-                    }
-                )
-                return job
-            else:
-                error_msg = result.stderr.strip() or result.stdout.strip() or "Unknown error"
-                job = BuildJob(
-                    idea_id=idea["id"],
-                    title=idea["title"],
-                    spec_path=str(spec_path),
-                    queue_job_id=job_id,
-                    status="failed",
-                    queued_at=queued_at
-                )
-                self.state_db.record_build_job(job)
-                self.audit_logger.log_error(
-                    gate="build",
-                    error=f"Failed to queue build: {error_msg}",
-                    details={
-                        "idea_id": idea["id"],
-                        "job_id": job_id,
-                        "returncode": result.returncode,
-                        "stderr": error_msg
-                    }
-                )
-                return job
+        job = BuildJob(
+            idea_id=idea["id"],
+            title=idea["title"],
+            spec_path=str(spec_path),
+            queue_job_id=job_id,
+            status=status,
+            queued_at=queued_at,
+        )
+        self.state_db.record_build_job(job)
 
-        except subprocess.TimeoutExpired:
-            error_msg = "queue_build command timed out after 30 seconds"
-            job = BuildJob(
-                idea_id=idea["id"],
-                title=idea["title"],
-                spec_path=str(spec_path),
-                queue_job_id=job_id,
-                status="failed",
-                queued_at=datetime.now()
+        if status == "queued":
+            self.audit_logger.log_decision(
+                gate="build", action="queue_build",
+                details={"idea_id": idea["id"], "job_id": job_id, "spec_path": str(spec_path)},
             )
-            self.state_db.record_build_job(job)
-            self.audit_logger.log_error(gate="build", error=error_msg, details={"idea_id": idea["id"], "job_id": job_id})
-            return job
-
-        except Exception as e:
-            error_msg = f"Unexpected error queuing build: {str(e)}"
-            job = BuildJob(
-                idea_id=idea["id"],
-                title=idea["title"],
-                spec_path=str(spec_path),
-                queue_job_id=job_id,
-                status="failed",
-                queued_at=datetime.now()
+        else:
+            self.audit_logger.log_error(
+                gate="build", error=error_msg or f"Failed to queue build {job_id}",
+                details={"idea_id": idea["id"], "job_id": job_id},
             )
-            self.state_db.record_build_job(job)
-            self.audit_logger.log_error(gate="build", error=error_msg, details={"idea_id": idea["id"], "job_id": job_id})
-            return job
+        return job
 
     def is_runner_active(self) -> bool:
         """Check if a queue_runner process is still running from a previous dispatch."""
+        if self.adapter is not None:
+            return self.adapter.is_active()
         if not RUNNER_PID_FILE.exists():
             return False
         try:
@@ -334,6 +321,7 @@ class BuildOrchestrator:
         """
         Start queue_runner.py as a background process (non-blocking).
         Stores PID in data/runner.pid for later monitoring.
+        Delegates to adapter if available.
 
         Args:
             dry_run: If True, print command without executing
@@ -342,6 +330,14 @@ class BuildOrchestrator:
             True if started, False otherwise
         """
         concurrency = self.config.max_concurrent_builds
+
+        if dry_run:
+            print(f"[DRY RUN] Would start queue runner (concurrency={concurrency})")
+            return True
+
+        if self.adapter is not None:
+            return self.adapter.start(concurrency)
+
         command = [
             str(self.yce_python),
             str(self.queue_runner_path),
@@ -349,10 +345,6 @@ class BuildOrchestrator:
             "--concurrency",
             str(concurrency),
         ]
-
-        if dry_run:
-            print(f"[DRY RUN] Would execute (background): {' '.join(command)}")
-            return True
 
         if self.is_runner_active():
             print("Queue runner already active, skipping start")
@@ -445,11 +437,14 @@ class BuildOrchestrator:
 
     def check_status(self) -> dict:
         """
-        Check queue status via queue_runner.py status --json.
+        Check queue status. Delegates to adapter if available.
 
         Returns:
             Parsed status dict, or empty dict on error
         """
+        if self.adapter is not None:
+            return self.adapter.poll()
+
         command = [
             str(self.yce_python),
             str(self.queue_runner_path),
@@ -530,6 +525,8 @@ class BuildOrchestrator:
                             self.state_db.update_build_job_project_dir(job_id, project_dir)
                         # Extract per-build log for postmortem analysis
                         self._extract_build_log(job_id)
+                        # Record build cost in ledger
+                        self._record_build_cost(job_id, job_data)
                 except Exception as e:
                     self.audit_logger.log_error(
                         gate="build",
@@ -547,6 +544,8 @@ class BuildOrchestrator:
                             self.state_db.update_build_job_project_dir(job_id, project_dir)
                         # Extract per-build log for postmortem analysis
                         self._extract_build_log(job_id)
+                        # Record build cost even for failed builds (tokens were still consumed)
+                        self._record_build_cost(job_id, job_data)
                 except Exception as e:
                     self.audit_logger.log_error(
                         gate="build",
@@ -665,6 +664,53 @@ class BuildOrchestrator:
         except Exception as e:
             logger.warning("Failed to extract build log for %s: %s", job_id, e)
 
+    def _record_build_cost(self, job_id: str, job_data: dict) -> None:
+        """Record build cost in the cost ledger.
+
+        Uses actual token counts from the queue runner if available,
+        otherwise falls back to the configured per-build cost estimate.
+        Best-effort: silently returns on any error.
+        """
+        try:
+            input_tokens = job_data.get("input_tokens")
+            output_tokens = job_data.get("output_tokens")
+            model_used = job_data.get("model_used") or job_data.get("model", "unknown")
+            duration = job_data.get("duration_seconds")
+
+            if input_tokens is not None and output_tokens is not None:
+                # Real token counts available — use actual cost calculation
+                cost = estimate_cost(model_used, input_tokens, output_tokens)
+                details = json.dumps({
+                    "source_type": "actual_tokens",
+                    "duration_seconds": duration,
+                })
+            else:
+                # No token counts (Max subscription builds) — use per-build estimate
+                input_tokens = 0
+                output_tokens = 0
+                cost = self.config.build_cost_estimate
+                details = json.dumps({
+                    "source_type": "estimate",
+                    "duration_seconds": duration,
+                    "note": "Max subscription build, no token counts available",
+                })
+
+            self.state_db.record_cost(
+                source="yce_build",
+                model=model_used,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                estimated_cost=cost,
+                queue_job_id=job_id,
+                details=details,
+            )
+            logger.info(
+                "Recorded build cost for %s: $%.2f (model=%s, tokens=%d/%d)",
+                job_id, cost, model_used, input_tokens, output_tokens,
+            )
+        except Exception as e:
+            logger.warning("Failed to record build cost for %s: %s", job_id, e)
+
     @staticmethod
     def _has_source_code(project_dir: Path) -> bool:
         """Check if a generation directory contains actual source code (not just scaffolding).
@@ -752,7 +798,12 @@ class BuildOrchestrator:
         queued_jobs = []
 
         for _ in range(dispatch_limit):
-            item = state_db.get_next_pending(sources=buildable_sources)
+            if dry_run:
+                item = state_db.get_next_pending(sources=buildable_sources)
+            else:
+                item = state_db.claim_next_pending(
+                    claimer_id=f"build-{os.getpid()}", sources=buildable_sources
+                )
             if item is None:
                 break
 
@@ -797,6 +848,44 @@ class BuildOrchestrator:
                         )
                 except Exception as e:
                     logger.warning("Failed to refresh idea %s from IdeaForge: %s", item.source_id, e)
+
+            # Idea quality gate: reject ideas with insufficient data
+            idea_description = idea.get("description") or ""
+            idea_feasibility = idea.get("feasibility_score")
+            if idea_feasibility is not None and float(idea_feasibility) < 5.0:
+                logger.info(
+                    "Idea quality gate REJECT for %s: feasibility_score=%.1f < 5.0",
+                    idea.get("title", "?"), float(idea_feasibility),
+                )
+                self.audit_logger.log_decision(
+                    gate="build",
+                    action="idea_quality_rejected",
+                    details={
+                        "idea_id": idea.get("id"),
+                        "title": idea.get("title"),
+                        "reason": f"feasibility_score {idea_feasibility} < 5.0",
+                    },
+                )
+                if not dry_run and item.id:
+                    state_db.update_item_status(item.id, "failed", "completed_at")
+                continue
+            if len(idea_description.strip()) < 20:
+                logger.info(
+                    "Idea quality gate REJECT for %s: description too short (%d chars)",
+                    idea.get("title", "?"), len(idea_description.strip()),
+                )
+                self.audit_logger.log_decision(
+                    gate="build",
+                    action="idea_quality_rejected",
+                    details={
+                        "idea_id": idea.get("id"),
+                        "title": idea.get("title"),
+                        "reason": f"description too short ({len(idea_description.strip())} chars)",
+                    },
+                )
+                if not dry_run and item.id:
+                    state_db.update_item_status(item.id, "failed", "completed_at")
+                continue
 
             source = idea.get("_source", "ideaforge")
             base_job_id = f"metroplex-{source}-{idea['id']}"
@@ -1040,12 +1129,12 @@ class BuildOrchestrator:
                 },
             )
 
-            # Mark as dispatched in priority queue
+            # Item was already atomically claimed as 'dispatched' by claim_next_pending().
+            # Only update if the build dispatch actually failed.
             if not dry_run and item.id:
                 last_status = jobs[-1].status if jobs else "failed"
-                dispatch_status = "dispatched" if last_status == "queued" else "failed"
-                timestamp_col = "dispatched_at" if dispatch_status == "dispatched" else "completed_at"
-                state_db.update_item_status(item.id, dispatch_status, timestamp_col)
+                if last_status != "queued":
+                    state_db.update_item_status(item.id, "failed", "completed_at")
 
         if not jobs:
             print("No pending items in priority queue")

@@ -81,7 +81,8 @@ def create_ideaforge_db():
                 signal_count INTEGER,
                 status TEXT,
                 claimed_by TEXT,
-                claimed_at TEXT
+                claimed_at TEXT,
+                strategic_theme TEXT
             )
         """)
 

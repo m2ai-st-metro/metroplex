@@ -12,11 +12,30 @@ from typing import TYPE_CHECKING
 
 logger = logging.getLogger(__name__)
 
+# Internal ST Metro infrastructure names — ideas referencing these are self-referential
+# and should not enter the pipeline for external distribution.
+INTERNAL_KEYWORDS = {
+    "ultra magnus", "metroplex", "st metro", "ideaforge", "idea forge",
+    "sky-lynx", "skylynx", "galvatron", "starscream", "soundwave",
+    "yce harness", "st records", "swindle", "teletraan",
+    "m2ai-portfolio", "m2ai portfolio",
+}
+
 from config import Config
 from models import TriageDecision, PriorityItem
 from db import StateDB
 from audit import AuditLogger
 from readers.ideaforge_reader import IdeaForgeReader
+
+
+def _is_internal_project(idea: dict) -> bool:
+    """Check if an idea references internal ST Metro infrastructure."""
+    text = " ".join([
+        idea.get("title", ""),
+        idea.get("description", ""),
+        idea.get("problem_statement", ""),
+    ]).lower()
+    return any(kw in text for kw in INTERNAL_KEYWORDS)
 
 
 def _normalize_title(title: str) -> str:
@@ -97,6 +116,31 @@ class TriageGate:
         already_triaged = self.state_db.get_triaged_idea_ids(decisions=("approve", "reject"))
         ideas = [i for i in ideas if i["id"] not in already_triaged]
 
+        # Filter out self-referential internal infrastructure projects
+        internal_ideas = [i for i in ideas if _is_internal_project(i)]
+        for idea in internal_ideas:
+            decision = TriageDecision(
+                idea_id=idea["id"],
+                title=idea["title"],
+                weighted_score=idea.get("weighted_score", 0) or 0,
+                scaled_score=0.0,
+                decision="reject",
+                reason="self-referential internal project",
+                decided_at=datetime.now(),
+            )
+            if not dry_run:
+                self.state_db.record_triage_decision(decision)
+            self.audit_logger.log_decision(
+                gate="triage",
+                action="reject",
+                details={
+                    "idea_id": idea["id"],
+                    "title": idea["title"],
+                    "reason": "self-referential internal project",
+                },
+            )
+        ideas = [i for i in ideas if not _is_internal_project(i)]
+
         if not ideas:
             return []
 
@@ -171,6 +215,7 @@ class TriageGate:
                         description=idea.get("description", idea["title"]),
                         priority_score=priority_score,
                         idea_data=json.dumps(idea, default=str),
+                        strategic_theme=idea.get("strategic_theme"),
                     )
                     self.state_db.enqueue_item(item)
 

@@ -4,6 +4,7 @@ Sequences all four gates into cycles with safety systems integration.
 Includes notifications, schedule windows, and priority queue dispatch.
 """
 import json
+import os
 import re
 import subprocess
 import time
@@ -15,7 +16,7 @@ from config import Config
 from models import CycleResult, PriorityItem, TriageDecision
 from db import StateDB
 from audit import AuditLogger
-from safety import CircuitBreaker, CycleCaps, ShutdownHandler
+from safety import BudgetEnforcer, CircuitBreaker, CycleCaps, ShutdownHandler
 from gates.triage import TriageGate
 from gates.build import BuildOrchestrator
 from gates.patcher import PatchGate
@@ -89,7 +90,7 @@ class CycleOrchestrator:
             review_gate: ReviewGate instance (optional, enables Gate 4.5 code review)
             tyrest_gate: TyrestGate instance (optional, enables Gate 4.25 LLM QA review)
             dispatcher: Dispatcher for routing non-buildable items to ClaudeClaw workers
-            outcome_emitter: OutcomeEmitter for writing terminal-state outcomes to ST Factory
+            outcome_emitter: OutcomeEmitter for writing terminal-state outcomes to ST Records
             readme_gate: ReadmeGate instance (optional, enables Gate 4.7 README enhancement)
         """
         self.config = config
@@ -117,6 +118,8 @@ class CycleOrchestrator:
             self.ideaforge_writer = IdeaForgeWriter(config.ideaforge_db)
         except Exception:
             self.ideaforge_writer = None
+        # Budget enforcer: kills running builds when spend exceeds limits
+        self.budget_enforcer = BudgetEnforcer(config, state_db)
         # Track which gates have already sent a halted notification.
         # Prevents spamming Telegram every cycle while a breaker is tripped.
         self._halted_notified: set[str] = set()
@@ -332,7 +335,7 @@ class CycleOrchestrator:
             else:
                 row_id = self.state_db.enqueue_item(item)
                 if row_id > 0:
-                    # Mark as dispatched in ST Factory DB
+                    # Mark as dispatched in ST Records DB
                     try:
                         self.skylynx_reader.mark_dispatched(rec["recommendation_id"])
                     except Exception as e:
@@ -499,7 +502,12 @@ class CycleOrchestrator:
         seen_ids: set[int] = set()
 
         for _ in range(max_dispatch):
-            item = self.state_db.get_next_pending(sources=dispatch_sources)
+            if dry_run:
+                item = self.state_db.get_next_pending(sources=dispatch_sources)
+            else:
+                item = self.state_db.claim_next_pending(
+                    claimer_id=f"dispatch-{os.getpid()}", sources=dispatch_sources
+                )
             if item is None or item.id in seen_ids:
                 break
             seen_ids.add(item.id)
@@ -531,7 +539,7 @@ class CycleOrchestrator:
             else:
                 try:
                     task_id = self.dispatcher.dispatch(prompt, worker)
-                    self.state_db.update_item_status(item.id, "dispatched", "dispatched_at")
+                    # Item already claimed as 'dispatched' by claim_next_pending()
                     self.state_db.set_dispatch_task_id(item.id, task_id)
                     self.audit_logger.log_decision(
                         "dispatch", "dispatched",
@@ -660,6 +668,11 @@ class CycleOrchestrator:
         now = datetime.now()
         cycle_id = f"cycle-{now.strftime('%Y%m%d-%H%M%S')}-{now.microsecond:06d}"
 
+        # Force WAL checkpoint to ensure fresh snapshot (prevents stale reads
+        # when other processes have written to the DB between cycles)
+        self.state_db.connect()
+        self.state_db.conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
+
         # Start cycle
         cycle_result = self.state_db.start_cycle(cycle_id)
         self.audit_logger.log_cycle_start(cycle_id)
@@ -669,6 +682,13 @@ class CycleOrchestrator:
         patch_count = 0
         errors = []
         outcome_count_before = self.outcome_emitter.emit_count if self.outcome_emitter else 0
+
+        # Budget hard-stop check at cycle start (kills running builds if over limit)
+        if not dry_run and self.budget_enforcer.check_and_enforce():
+            msg = "Budget hard-stop triggered — running builds killed"
+            errors.append(msg)
+            print(f"! {msg}")
+            self.notifier.notify(f"BUDGET HARD-STOP: {msg}", "error")
 
         # Sky-Lynx Intake (enqueue recommendations directly into priority queue)
         skylynx_count = self.ingest_skylynx(dry_run=dry_run)
@@ -867,6 +887,13 @@ class CycleOrchestrator:
         except Exception as e:
             # Non-fatal -- log and continue to publish gate
             self.audit_logger.log_error("build", f"Status poll failed: {e}")
+
+        # Budget hard-stop check after sync (new cost data may have arrived)
+        if not dry_run and self.budget_enforcer.check_and_enforce():
+            msg = "Budget hard-stop triggered after build sync"
+            errors.append(msg)
+            print(f"! {msg}")
+            self.notifier.notify(f"BUDGET HARD-STOP: {msg}", "error")
 
         # Oz Cloud Build Status Sync
         if self.config.build_target in ("cloud", "auto") and self.config.oz_environment_id:

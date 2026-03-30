@@ -12,15 +12,105 @@ from datetime import datetime
 
 from config import Config
 from gates.build import SpecGenerator, BuildOrchestrator
+from gates.llm_expander import validate_spec
 from models import BuildJob
 from db import StateDB
 from audit import AuditLogger
 
 
+def _make_valid_spec(title: str, idea_desc: str, problem: str, audience: str) -> str:
+    """Build a mock LLM spec that passes all validate_spec checks."""
+    # Must have >= 3 ## headers, 50-400 lines, no duplicates, no parrot markers
+    lines = [
+        f"# {title} - App Specification",
+        "",
+        "## Overview",
+        f"{idea_desc}",
+        "",
+        f"**Problem Statement**: {problem}",
+        f"**Target Audience**: {audience}",
+        "",
+        "## Tech Stack",
+        "- Python 3.11+",
+        "- click",
+        "- pytest",
+        "",
+        "## Environment Setup",
+        "",
+        "### Prerequisites",
+        "- Python 3.11+",
+        "",
+        "### Configuration",
+        "| Variable | Required | Description |",
+        "|----------|----------|-------------|",
+        "| DEBUG | No | Enable debug logging |",
+        "",
+        "## Architecture",
+        "```",
+        "CLI -> Core -> Output",
+        "```",
+        "",
+        "## Core Features",
+        "",
+        f"### Feature 1: Core Analysis",
+        f"**Description**: Main analysis engine for {title}",
+        "**Requirements**:",
+        "- Accept input via CLI arguments",
+        "- Process and validate input data",
+        "- Output results to stdout in JSON format",
+        "**Test Steps**:",
+        f"1. `{title.lower().replace(' ', '-')} analyze input.json` -> JSON output with results",
+        "",
+        f"### Feature 2: Report Generation",
+        f"**Description**: Generate human-readable reports",
+        "**Requirements**:",
+        "- Accept analysis results as input",
+        "- Format output as markdown",
+        "**Test Steps**:",
+        f"1. `{title.lower().replace(' ', '-')} report results.json` -> Markdown report on stdout",
+        "",
+        "## Data Models",
+        "```python",
+        "from dataclasses import dataclass",
+        "",
+        "@dataclass",
+        "class AnalysisResult:",
+        "    score: float",
+        "    findings: list[str]",
+        "```",
+        "",
+        "## File Structure",
+        "```",
+        f"{title.lower().replace(' ', '-')}/",
+        "├── src/",
+        "│   ├── __init__.py",
+        "│   ├── cli.py",
+        "│   ├── core.py",
+        "│   └── models.py",
+        "├── tests/",
+        "│   ├── test_cli.py",
+        "│   └── test_core.py",
+        "├── requirements.txt",
+        "└── README.md",
+        "```",
+        "",
+        "## Success Criteria",
+        "1. CLI accepts arguments and displays help correctly",
+        "2. Core analysis produces correct output for sample input",
+        "3. All tests pass with >80% coverage",
+        "",
+        "## Constraints & Notes",
+        "- No external API calls",
+        "- Target: working MVP in 5 build iterations",
+        "- Prioritize correctness over features",
+    ]
+    return "\n".join(lines)
+
+
 @pytest.fixture
 def config(monkeypatch):
-    """Create test configuration with LLM disabled to avoid real API calls."""
-    monkeypatch.setenv("METROPLEX_SPEC_USE_LLM", "false")
+    """Create test configuration with LLM enabled (mocked in tests)."""
+    monkeypatch.setenv("METROPLEX_SPEC_USE_LLM", "true")
     return Config()
 
 
@@ -93,10 +183,10 @@ class TestSpecGenerator:
 
     def test_init_valid_template_dir(self, config, template_dir):
         """Test initialization with valid template directory."""
-        generator = SpecGenerator(config, template_dir)
-        assert generator.config == config
-        assert generator.template_dir == template_dir
-        assert generator.env is not None
+        with patch("gates.build.LLMSpecExpander"):
+            generator = SpecGenerator(config, template_dir)
+            assert generator.config == config
+            assert generator.template_dir == template_dir
 
     def test_init_invalid_template_dir(self, config):
         """Test initialization with non-existent template directory."""
@@ -105,230 +195,152 @@ class TestSpecGenerator:
             SpecGenerator(config, invalid_dir)
         assert "Template directory not found" in str(exc.value)
 
-    def test_generate_spec_tool_type(self, config, template_dir, output_dir, tool_idea):
-        """Test 1: Generate a spec for a 'tool' type idea → verify CLI-appropriate structure."""
-        generator = SpecGenerator(config, template_dir)
-        output_path = generator.generate_spec(tool_idea, output_dir)
+    def test_generate_spec_with_mock_llm(self, config, template_dir, output_dir, tool_idea):
+        """Test spec generation via LLM produces valid output."""
+        spec = _make_valid_spec(
+            tool_idea["title"], tool_idea["description"],
+            tool_idea["problem_statement"], tool_idea["target_audience"],
+        )
+        with patch("gates.build.LLMSpecExpander") as MockExp:
+            MockExp.return_value.expand.return_value = spec
+            generator = SpecGenerator(config, template_dir)
+            path = generator.generate_spec(tool_idea, output_dir)
 
-        # Verify file was created
-        assert output_path.exists()
-        assert output_path.name == "app_spec_1.txt"
-
-        # Read generated content
-        content = output_path.read_text()
-
-        # Verify CLI-appropriate features are present
-        assert "CLI Argument Parsing" in content
-        assert "argparse" in content or "click" in content
-        assert "Core Command Implementation" in content
-        assert "File I/O Operations" in content
-        assert "stdin/stdout" in content
-
-        # Verify tech stack is tool-appropriate
-        assert "Python 3.11+" in content
-        assert "CLI Framework" in content or "CLI Tool" in content
-
-        # Verify no web UI elements
-        assert "React" not in content or "Frontend" not in content
-        assert "FastAPI" not in content or "Backend" not in content
-
-    def test_generate_spec_agent_type(self, config, template_dir, output_dir, agent_idea):
-        """Test 2: Generate a spec for an 'agent' type idea → verify agent-appropriate structure."""
-        generator = SpecGenerator(config, template_dir)
-        output_path = generator.generate_spec(agent_idea, output_dir)
-
-        # Verify file was created
-        assert output_path.exists()
-        assert output_path.name == "app_spec_2.txt"
-
-        # Read generated content
-        content = output_path.read_text()
-
-        # Verify agent-appropriate features are present
-        assert "Agent Core Setup" in content or "Agent Core" in content
-        assert "Prompt Management" in content or "Prompts" in content
-        assert "Tool Implementation" in content or "Tools" in content
-        assert "Agent Execution Loop" in content or "Execution" in content
-        assert "State and Memory Management" in content or "Memory" in content
-
-        # Verify tech stack is agent-appropriate
-        assert "Claude" in content or "LLM" in content
-        assert "Agent Framework" in content or "agent" in content.lower()
-        assert "ANTHROPIC_API_KEY" in content
-
-    def test_generate_spec_product_type(self, config, template_dir, output_dir, product_idea):
-        """Test 3: Generate a spec for a 'product' type idea → verify full-stack structure."""
-        generator = SpecGenerator(config, template_dir)
-        output_path = generator.generate_spec(product_idea, output_dir)
-
-        # Verify file was created
-        assert output_path.exists()
-        assert output_path.name == "app_spec_3.txt"
-
-        # Read generated content
-        content = output_path.read_text()
-
-        # Verify full-stack features are present
-        assert "Frontend" in content
-        assert "Backend" in content
-        assert "Database" in content
-        assert "React" in content
-        assert "FastAPI" in content
-
-        # Verify product-appropriate features
-        assert "Project Foundation" in content or "Foundation" in content
-        assert "Database Setup" in content or "Database" in content
-        assert "API Endpoints" in content
-        assert "Frontend UI Components" in content or "Components" in content
-        assert "Frontend-Backend Integration" in content or "Integration" in content
-
-        # Verify API endpoints section exists
-        assert "| Method | Path | Description |" in content or "GET" in content
+        assert path.exists()
+        assert path.name == "app_spec_1.txt"
+        content = path.read_text()
+        assert tool_idea["title"] in content
+        assert "## Overview" in content
+        assert "## Core Features" in content
 
     def test_generate_spec_contains_idea_data(self, config, template_dir, output_dir, tool_idea):
-        """Test 4: Verify generated spec contains the idea's title and description verbatim."""
-        generator = SpecGenerator(config, template_dir)
-        output_path = generator.generate_spec(tool_idea, output_dir)
+        """Test generated spec contains idea title, description, problem, audience."""
+        spec = _make_valid_spec(
+            tool_idea["title"], tool_idea["description"],
+            tool_idea["problem_statement"], tool_idea["target_audience"],
+        )
+        with patch("gates.build.LLMSpecExpander") as MockExp:
+            MockExp.return_value.expand.return_value = spec
+            generator = SpecGenerator(config, template_dir)
+            path = generator.generate_spec(tool_idea, output_dir)
 
-        content = output_path.read_text()
-
-        # Verify title appears in the spec
+        content = path.read_text()
         assert tool_idea["title"] in content
-
-        # Verify description appears verbatim
         assert tool_idea["description"] in content
-
-        # Verify problem statement appears
         assert tool_idea["problem_statement"] in content
-
-        # Verify target audience appears
         assert tool_idea["target_audience"] in content
 
-    def test_generate_spec_no_jinja_syntax(self, config, template_dir, output_dir, tool_idea):
-        """Test 5: Verify output file is valid text (no Jinja2 syntax errors, no {{ }} remaining)."""
+    def test_generate_spec_no_llm_raises(self, template_dir, output_dir, tool_idea):
+        """Test that generate_spec raises RuntimeError when LLM is unavailable."""
+        config = Config()
+        config.spec_use_llm = False
         generator = SpecGenerator(config, template_dir)
-        output_path = generator.generate_spec(tool_idea, output_dir)
+        assert generator.llm_expander is None
 
-        content = output_path.read_text()
+        with pytest.raises(RuntimeError, match="LLM expander not configured"):
+            generator.generate_spec(tool_idea, output_dir)
 
-        # Verify no remaining Jinja2 syntax
-        assert "{{" not in content, "Found unrendered Jinja2 variable syntax: {{"
-        assert "}}" not in content, "Found unrendered Jinja2 variable syntax: }}"
-        assert "{%" not in content, "Found unrendered Jinja2 block syntax: {%"
-        assert "%}" not in content, "Found unrendered Jinja2 block syntax: %}"
+    def test_generate_spec_llm_failure_raises(self, config, template_dir, output_dir, tool_idea):
+        """Test that LLM API failure raises RuntimeError (no Jinja2 fallback)."""
+        with patch("gates.build.LLMSpecExpander") as MockExp:
+            MockExp.return_value.expand.side_effect = Exception("API error")
+            generator = SpecGenerator(config, template_dir)
 
-        # Verify content is not empty
-        assert len(content) > 100, "Generated spec is too short"
+            with pytest.raises(RuntimeError, match="LLM expansion failed"):
+                generator.generate_spec(tool_idea, output_dir)
 
-        # Verify basic markdown structure
-        assert content.startswith("#"), "Spec should start with markdown header"
-        assert "## Overview" in content
-        assert "## Tech Stack" in content
-        assert "## Core Features" in content
-        assert "## Success Criteria" in content
+    def test_generate_spec_validation_failure_raises(self, config, template_dir, output_dir, tool_idea):
+        """Test that a bad LLM spec raises ValueError (no Jinja2 fallback)."""
+        bad_spec = "# Title\nToo short."  # Fails length check
+        with patch("gates.build.LLMSpecExpander") as MockExp:
+            MockExp.return_value.expand.return_value = bad_spec
+            generator = SpecGenerator(config, template_dir)
+
+            with pytest.raises(ValueError, match="LLM spec rejected"):
+                generator.generate_spec(tool_idea, output_dir)
 
     def test_generate_spec_missing_required_fields(self, config, template_dir, output_dir):
         """Test error handling when idea is missing required fields."""
         incomplete_idea = {
             "id": 99,
             "title": "Incomplete Idea",
-            # Missing description, problem_statement, target_audience, artifact_type
         }
-
-        generator = SpecGenerator(config, template_dir)
-
-        with pytest.raises(ValueError) as exc:
-            generator.generate_spec(incomplete_idea, output_dir)
-
-        assert "missing required fields" in str(exc.value).lower()
+        with patch("gates.build.LLMSpecExpander"):
+            generator = SpecGenerator(config, template_dir)
+            with pytest.raises(ValueError, match="missing required fields"):
+                generator.generate_spec(incomplete_idea, output_dir)
 
     def test_generate_spec_creates_output_dir(self, config, template_dir, tool_idea):
         """Test that output directory is created if it doesn't exist."""
-        # Use a nested path that doesn't exist
+        spec = _make_valid_spec(
+            tool_idea["title"], tool_idea["description"],
+            tool_idea["problem_statement"], tool_idea["target_audience"],
+        )
         with tempfile.TemporaryDirectory() as temp_base:
             output_dir = Path(temp_base) / "nested" / "output" / "dir"
             assert not output_dir.exists()
 
-            generator = SpecGenerator(config, template_dir)
-            output_path = generator.generate_spec(tool_idea, output_dir)
+            with patch("gates.build.LLMSpecExpander") as MockExp:
+                MockExp.return_value.expand.return_value = spec
+                generator = SpecGenerator(config, template_dir)
+                output_path = generator.generate_spec(tool_idea, output_dir)
 
-            # Verify directory was created
             assert output_dir.exists()
             assert output_path.exists()
-            assert output_path.parent == output_dir
 
     def test_generate_spec_output_path_format(self, config, template_dir, output_dir, agent_idea):
         """Test that output file follows naming convention: app_spec_{idea_id}.txt"""
-        generator = SpecGenerator(config, template_dir)
-        output_path = generator.generate_spec(agent_idea, output_dir)
+        spec = _make_valid_spec(
+            agent_idea["title"], agent_idea["description"],
+            agent_idea["problem_statement"], agent_idea["target_audience"],
+        )
+        with patch("gates.build.LLMSpecExpander") as MockExp:
+            MockExp.return_value.expand.return_value = spec
+            generator = SpecGenerator(config, template_dir)
+            output_path = generator.generate_spec(agent_idea, output_dir)
 
-        # Verify naming convention
         assert output_path.name == f"app_spec_{agent_idea['id']}.txt"
         assert output_path.parent == output_dir
 
-    def test_generate_spec_with_optional_tech_stack(self, config, template_dir, output_dir, tool_idea):
-        """Test spec generation with optional tech_stack field."""
-        # Add optional tech_stack field
-        idea_with_tech = tool_idea.copy()
-        idea_with_tech["tech_stack"] = "Redis for caching, Docker for deployment"
-
-        generator = SpecGenerator(config, template_dir)
-        output_path = generator.generate_spec(idea_with_tech, output_dir)
-
-        content = output_path.read_text()
-
-        # Verify tech_stack appears in generated spec
-        assert "Redis for caching, Docker for deployment" in content
-
-    def test_generate_spec_without_optional_tech_stack(self, config, template_dir, output_dir, tool_idea):
-        """Test spec generation without optional tech_stack field."""
-        generator = SpecGenerator(config, template_dir)
-        output_path = generator.generate_spec(tool_idea, output_dir)
-
-        content = output_path.read_text()
-
-        # Should generate successfully even without tech_stack
-        assert len(content) > 100
-        assert "## Tech Stack" in content
-
     def test_generate_spec_file_encoding(self, config, template_dir, output_dir, product_idea):
         """Test that generated file uses UTF-8 encoding."""
-        # Add some unicode characters to test encoding
         idea_with_unicode = product_idea.copy()
         idea_with_unicode["description"] = "A tool with unicode: 你好, здравствуй, مرحبا"
+        spec = _make_valid_spec(
+            idea_with_unicode["title"], idea_with_unicode["description"],
+            idea_with_unicode["problem_statement"], idea_with_unicode["target_audience"],
+        )
+        with patch("gates.build.LLMSpecExpander") as MockExp:
+            MockExp.return_value.expand.return_value = spec
+            generator = SpecGenerator(config, template_dir)
+            output_path = generator.generate_spec(idea_with_unicode, output_dir)
 
-        generator = SpecGenerator(config, template_dir)
-        output_path = generator.generate_spec(idea_with_unicode, output_dir)
-
-        # Read with explicit UTF-8 encoding
         content = output_path.read_text(encoding="utf-8")
-
-        # Verify unicode characters are preserved
         assert "你好" in content
         assert "здравствуй" in content
         assert "مرحبا" in content
 
     def test_generate_spec_multiple_ideas(self, config, template_dir, output_dir, tool_idea, agent_idea, product_idea):
         """Test generating specs for multiple ideas in the same output directory."""
-        generator = SpecGenerator(config, template_dir)
+        specs = {}
+        for idea in [tool_idea, agent_idea, product_idea]:
+            specs[idea["id"]] = _make_valid_spec(
+                idea["title"], idea["description"],
+                idea["problem_statement"], idea["target_audience"],
+            )
 
-        # Generate specs for all three ideas
-        path1 = generator.generate_spec(tool_idea, output_dir)
-        path2 = generator.generate_spec(agent_idea, output_dir)
-        path3 = generator.generate_spec(product_idea, output_dir)
+        with patch("gates.build.LLMSpecExpander") as MockExp:
+            MockExp.return_value.expand.side_effect = lambda idea: specs[idea["id"]]
+            generator = SpecGenerator(config, template_dir)
 
-        # Verify all files exist
-        assert path1.exists()
-        assert path2.exists()
-        assert path3.exists()
+            path1 = generator.generate_spec(tool_idea, output_dir)
+            path2 = generator.generate_spec(agent_idea, output_dir)
+            path3 = generator.generate_spec(product_idea, output_dir)
 
-        # Verify unique filenames
-        assert path1.name != path2.name != path3.name
+        assert path1.exists() and path2.exists() and path3.exists()
         assert path1.name == "app_spec_1.txt"
         assert path2.name == "app_spec_2.txt"
         assert path3.name == "app_spec_3.txt"
-
-        # Verify each contains correct content
         assert tool_idea["title"] in path1.read_text()
         assert agent_idea["title"] in path2.read_text()
         assert product_idea["title"] in path3.read_text()
@@ -443,7 +455,7 @@ class TestBuildOrchestrator:
             # Verify audit logger logged error
             assert mock_audit_logger.log_error.called
             error_call_args = mock_audit_logger.log_error.call_args
-            assert "Failed to queue build" in error_call_args[1]["error"]
+            assert "Queue runner error" in error_call_args[1]["error"]
 
     def test_queue_build_dry_run(self, orchestrator, tool_idea, capsys):
         """Test 3: Verify dry_run=True prints command but does not call subprocess.run."""
@@ -719,7 +731,7 @@ class TestBuildOrchestrator:
 
         captured = capsys.readouterr()
         assert "[DRY RUN]" in captured.out
-        assert "--concurrency" in captured.out
+        assert "concurrency" in captured.out
         assert "2" in captured.out
 
     def test_start_queue_background_skips_if_active(self, orchestrator, mock_audit_logger, capsys):
@@ -922,16 +934,16 @@ class TestBuildOrchestrator:
 
         # Create mock priority items (3 available, but per-cycle cap is 2)
         mock_items = [
-            Mock(id=10, source="ideaforge", source_id=10, title="Idea A", description="Desc A",
-                 idea_data=json.dumps({"id": 10, "title": "Idea A", "description": "Desc A",
+            Mock(id=10, source="ideaforge", source_id=10, title="Idea A", description="A CLI tool that scans codebases for issues",
+                 idea_data=json.dumps({"id": 10, "title": "Idea A", "description": "A CLI tool that scans codebases for issues",
                                        "problem_statement": "P", "target_audience": "T",
                                        "artifact_type": "tool"})),
-            Mock(id=11, source="ideaforge", source_id=11, title="Idea B", description="Desc B",
-                 idea_data=json.dumps({"id": 11, "title": "Idea B", "description": "Desc B",
+            Mock(id=11, source="ideaforge", source_id=11, title="Idea B", description="A markdown linter for documentation files",
+                 idea_data=json.dumps({"id": 11, "title": "Idea B", "description": "A markdown linter for documentation files",
                                        "problem_statement": "P", "target_audience": "T",
                                        "artifact_type": "tool"})),
         ]
-        mock_state_db.get_next_pending = Mock(side_effect=mock_items + [None])
+        mock_state_db.claim_next_pending = Mock(side_effect=mock_items + [None])
         mock_state_db.update_item_status = Mock()
         mock_state_db.has_completed_build = Mock(return_value=False)
         mock_state_db.has_exhausted_retries = Mock(return_value=False)
