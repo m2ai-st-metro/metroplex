@@ -1326,6 +1326,43 @@ class StateDB:
         self.conn.commit()
         return build_updated or pq_updated
 
+    # Failure categories that are deterministic — retrying won't help
+    NON_RETRYABLE_CATEGORIES = frozenset({
+        "dependency_error",  # Missing packages won't appear on retry
+        "test_failure",      # Same code = same test failures
+        "build_error",       # Syntax/type errors are deterministic
+        "quality_rejected",  # Tyrest QA rejection — same code = same result
+        "review_failed",     # Automated review check failures are deterministic
+        "low_quality",       # Quality score below threshold won't change on retry
+    })
+
+    def get_failure_category(self, queue_job_id: str) -> str | None:
+        """Get the postmortem failure category for a build, if one exists."""
+        self.connect()
+        # Also check base_job_id variants (retries use _retry{N} suffix in postmortem)
+        base_job_id = re.sub(r'-r\d+$', '', queue_job_id)
+        cursor = self.conn.cursor()
+        cursor.execute(
+            "SELECT failure_category FROM build_postmortems "
+            "WHERE queue_job_id LIKE ? "
+            "ORDER BY created_at DESC LIMIT 1",
+            (f"{base_job_id}%",),
+        )
+        row = cursor.fetchone()
+        return row[0] if row else None
+
+    def is_retryable_failure(self, queue_job_id: str) -> bool:
+        """Check if a build failure is worth retrying based on its postmortem category.
+
+        Returns True if the failure is transient (timeout, environment_error, spec_unclear)
+        or if no postmortem exists yet.
+        Returns False if the failure is deterministic (dependency, test, build errors).
+        """
+        category = self.get_failure_category(queue_job_id)
+        if category is None:
+            return True  # No postmortem yet — allow retry
+        return category not in self.NON_RETRYABLE_CATEGORIES
+
     # --- Publish Jobs ---
 
     def get_unpublished_builds(self, require_review: bool = True) -> list[dict]:

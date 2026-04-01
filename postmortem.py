@@ -112,6 +112,27 @@ def _infer_stage(category: str, log_text: str) -> str:
     return "unknown"
 
 
+def _classify_from_gate_status(
+    review_status: str | None,
+    quality_score: float | None,
+) -> tuple[str, str, str]:
+    """Classify a failure from gate/review metadata when no crash log exists.
+
+    Returns:
+        (failure_category, failure_stage, error_signature)
+    """
+    if review_status == "tyrest_rejected":
+        sig = f"Tyrest QA rejected build (quality_score={quality_score})"
+        return ("quality_rejected", "review", sig)
+    if review_status == "review_failed":
+        sig = f"Automated review checks failed (quality_score={quality_score})"
+        return ("review_failed", "review", sig)
+    if quality_score is not None and quality_score < 40:
+        sig = f"Quality score {quality_score} below minimum threshold"
+        return ("low_quality", "scoring", sig)
+    return ("spec_unclear", "unknown", "")
+
+
 def _read_log_file(log_path: str | None) -> str:
     """Read a log file, capped at MAX_LOG_BYTES."""
     if not log_path:
@@ -140,6 +161,8 @@ def capture_postmortem(
     idea_score: float | None = None,
     artifact_type: str | None = None,
     retry_count: int | None = None,
+    review_status: str | None = None,
+    quality_score: float | None = None,
 ) -> bool:
     """Capture a structured post-mortem for a failed build.
 
@@ -155,6 +178,8 @@ def capture_postmortem(
         idea_score: IdeaForge weighted score (optional)
         artifact_type: Artifact type from classification (optional)
         retry_count: Retry attempt number (0 or None = first attempt)
+        review_status: Build's review_status from build_jobs (optional)
+        quality_score: Build's quality_score from build_jobs (optional)
 
     Returns:
         True if postmortem was captured, False if skipped or errored
@@ -175,9 +200,19 @@ def capture_postmortem(
             logger.debug("Postmortem already exists for %s, skipping", dedup_key)
             return False
 
-        # Read and classify
+        # Read and classify from log text
         log_text = _read_log_file(log_path)
         failure_category, failure_stage, error_signature = classify_failure(log_text)
+
+        # If log-based classification yielded spec_unclear, try gate-based classification
+        if failure_category == "spec_unclear" and (review_status or quality_score is not None):
+            gate_category, gate_stage, gate_sig = _classify_from_gate_status(
+                review_status, quality_score
+            )
+            if gate_category != "spec_unclear":
+                failure_category = gate_category
+                failure_stage = gate_stage
+                error_signature = gate_sig
 
         now = datetime.now(timezone.utc).isoformat()
 

@@ -852,6 +852,8 @@ class CycleOrchestrator:
                                 idea_score=build.get("quality_score"),
                                 artifact_type=None,
                                 retry_count=build.get("retry_count"),
+                                review_status=build.get("review_status"),
+                                quality_score=build.get("quality_score"),
                             )
 
                 # Resolve feasibility predictions for terminal builds (L5 B2)
@@ -949,9 +951,19 @@ class CycleOrchestrator:
                         )
 
             # 2. Retry builds that haven't exhausted retries and whose backoff has expired
+            #    Skip deterministic failures (dependency, test, build errors) — retrying won't help
             retryable = self.state_db.get_retryable_builds()
             for build in retryable:
                 queue_job_id = build["queue_job_id"]
+                if not self.state_db.is_retryable_failure(queue_job_id):
+                    category = self.state_db.get_failure_category(queue_job_id)
+                    print(f"  Skip retry (deterministic {category}): {build['title']} ({queue_job_id})")
+                    self.audit_logger.log_decision(
+                        "build", "skip_retry_deterministic",
+                        {"queue_job_id": queue_job_id, "failure_category": category}
+                    )
+                    self.state_db.mark_build_abandoned(queue_job_id)
+                    continue
                 if self.state_db.mark_build_for_retry(queue_job_id):
                     retry_num = (build.get("retry_count") or 0) + 1
                     print(f"  Auto-retry #{retry_num}: {build['title']} ({queue_job_id})")
