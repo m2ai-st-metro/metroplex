@@ -1137,7 +1137,19 @@ class StateDB:
               AND pq.status = 'dispatched'
             WHERE b.status = 'queued'
               AND b.queued_at < ?
-        """, (cutoff,))
+
+            UNION
+
+            SELECT b.queue_job_id, b.idea_id, b.title, b.queued_at,
+                   pq.id AS priority_queue_id, pq.source, pq.source_id
+            FROM build_jobs b
+            JOIN priority_queue pq
+              ON pq.source_id = CAST(b.idea_id AS TEXT)
+              AND pq.status = 'pending'
+              AND pq.claimed_by IS NOT NULL
+            WHERE b.status = 'queued'
+              AND b.queued_at < ?
+        """, (cutoff, cutoff))
         return [dict(row) for row in cursor.fetchall()]
 
     def reset_stale_queued_build(self, queue_job_id: str, priority_queue_id: int):

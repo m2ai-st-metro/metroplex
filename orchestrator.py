@@ -481,7 +481,8 @@ class CycleOrchestrator:
         if source and source_id:
             self.state_db.connect()
             self.state_db.conn.execute(
-                "UPDATE priority_queue SET status = 'pending', completed_at = NULL "
+                "UPDATE priority_queue SET status = 'pending', completed_at = NULL, "
+                "claimed_by = NULL, claimed_at = NULL "
                 "WHERE source = ? AND source_id = ? AND status IN ('failed', 'dispatched')",
                 (source, source_id),
             )
