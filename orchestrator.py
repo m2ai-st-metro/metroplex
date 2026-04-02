@@ -1444,6 +1444,38 @@ class CycleOrchestrator:
 
         return cycle_result
 
+    def _maybe_run_ego(self, cycle_count: int, dry_run: bool = False) -> None:
+        """Run EGO learning cycle if cadence conditions are met."""
+        from learning.config import RUN_EVERY_N_CYCLES
+
+        if RUN_EVERY_N_CYCLES <= 0:
+            return
+        if cycle_count % RUN_EVERY_N_CYCLES != 0:
+            return
+
+        try:
+            from learning.ego_runner import run_ego_cycle
+
+            print(f"\n--- EGO learning cycle (every {RUN_EVERY_N_CYCLES} cycles) ---")
+            result = run_ego_cycle(
+                state_db=self.state_db,
+                event_emitter=self.event_emitter,
+                dry_run=dry_run,
+            )
+            if result:
+                print(
+                    f"  EGO: baseline={result.baseline_score:.1f} "
+                    f"variant={result.variant_score:.1f} "
+                    f"improvement={result.improvement_pct:.1%} "
+                    f"winner={result.is_winner}"
+                )
+            else:
+                print("  EGO: skipped (preconditions not met or rollback triggered)")
+        except Exception as e:
+            print(f"  EGO: error -- {e}")
+            import logging
+            logging.getLogger(__name__).warning("EGO cycle failed: %s", e, exc_info=True)
+
     def run_continuous(self, max_cycles: int = 0, dry_run: bool = False) -> list[CycleResult]:
         """
         Run cycles continuously until max_cycles reached or shutdown signal received.
@@ -1490,6 +1522,9 @@ class CycleOrchestrator:
             cycle_result = self.run_cycle(dry_run=dry_run)
             results.append(cycle_result)
             cycle_count += 1
+
+            # EGO learning cycle (Phase F) -- runs every N cycles
+            self._maybe_run_ego(cycle_count, dry_run=dry_run)
 
             print(f"\nCycle {cycle_count} completed")
             print(f"  Triage: {cycle_result.triage_count}")

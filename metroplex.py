@@ -1351,6 +1351,40 @@ def cmd_health(args, config: Config):
     return int(report.overall_status)
 
 
+def cmd_ego(args, config: Config):
+    """EGO learning system: show status or run an experiment."""
+    from db import StateDB
+    state_db = StateDB("data/metroplex.db")
+    state_db.connect()
+    state_db.init_db()
+
+    if args.run:
+        from learning.ego_runner import run_ego_cycle
+        from event_emitter import create_event_emitter
+
+        emitter = create_event_emitter()
+        result = run_ego_cycle(
+            state_db=state_db,
+            event_emitter=emitter,
+            dry_run=args.dry_run,
+        )
+        if result:
+            print(f"\nExperiment result:")
+            print(f"  Baseline score: {result.baseline_score:.1f}")
+            print(f"  Variant score:  {result.variant_score:.1f}")
+            print(f"  Improvement:    {result.improvement_pct:.1%}")
+            print(f"  Winner:         {result.is_winner}")
+            print(f"  Reason:         {result.reason}")
+        else:
+            print("No experiment ran (preconditions not met or rollback triggered)")
+    else:
+        from learning.ego_runner import ego_status
+        print(ego_status(state_db))
+
+    state_db.close()
+    return 0
+
+
 def main():
     """Main CLI entry point."""
     parser = argparse.ArgumentParser(
@@ -1451,6 +1485,11 @@ def main():
     readiness_fix_parser.add_argument("--all", action="store_true", dest="all_repos", help="Run on all 16 known repos")
     readiness_fix_parser.add_argument("--dry-run", action="store_true", help="Show checks without fixing")
 
+    # ego command (Phase F learning loop)
+    ego_parser = subparsers.add_parser("ego", help="EGO learning system status and manual experiment run")
+    ego_parser.add_argument("--run", action="store_true", help="Run one EGO experiment cycle now")
+    ego_parser.add_argument("--dry-run", action="store_true", help="Evaluate but don't apply winners")
+
     # Parse arguments
     args = parser.parse_args()
 
@@ -1509,6 +1548,8 @@ def main():
         sys.exit(cmd_readiness(args, config))
     elif args.command == "readiness-fix":
         sys.exit(cmd_readiness_fix(args, config))
+    elif args.command == "ego":
+        sys.exit(cmd_ego(args, config))
     else:
         parser.print_help()
         sys.exit(1)

@@ -249,6 +249,28 @@ FAILURE_PATTERN_DESCRIPTIONS = {
 }
 
 
+# Default constraint mapping -- EGO may override this at runtime via active variant file
+_DEFAULT_CONSTRAINTS = {
+    "spec_unclear": "Every feature MUST have concrete CLI commands with exact expected output.",
+    "dependency_error": "Limit to 3-5 well-known pip packages. Specify exact versions.",
+    "timeout": "Reduce scope. Max 2-3 features. Each feature < 100 lines of code.",
+    "test_failure": "Test steps must be unambiguous with literal expected output strings.",
+    "build_error": "Keep code patterns simple. Avoid complex generics or metaclasses.",
+}
+
+
+def _load_constraint_mapping() -> dict[str, str]:
+    """Load the active constraint mapping -- EGO variant if available, else defaults."""
+    try:
+        from learning.applier import get_active_variant
+        active = get_active_variant()
+        if active:
+            return active
+    except ImportError:
+        pass
+    return _DEFAULT_CONSTRAINTS
+
+
 def format_failure_feedback(failure_patterns: list[dict]) -> str:
     """Format postmortem failure patterns into a prompt section for spec generation.
 
@@ -262,6 +284,8 @@ def format_failure_feedback(failure_patterns: list[dict]) -> str:
     """
     if not failure_patterns:
         return ""
+
+    constraints = _load_constraint_mapping()
 
     lines = [
         "\n## LESSONS FROM PAST BUILD FAILURES (CRITICAL)\n",
@@ -277,17 +301,9 @@ def format_failure_feedback(failure_patterns: list[dict]) -> str:
 
         lines.append(f"- **{category}** ({count} occurrences, stage: {stage}): {desc}")
 
-        # Add one actionable constraint per category
-        if category == "spec_unclear":
-            lines.append("  -> Every feature MUST have concrete CLI commands with exact expected output.")
-        elif category == "dependency_error":
-            lines.append("  -> Limit to 3-5 well-known pip packages. Specify exact versions.")
-        elif category == "timeout":
-            lines.append("  -> Reduce scope. Max 2-3 features. Each feature < 100 lines of code.")
-        elif category == "test_failure":
-            lines.append("  -> Test steps must be unambiguous with literal expected output strings.")
-        elif category == "build_error":
-            lines.append("  -> Keep code patterns simple. Avoid complex generics or metaclasses.")
+        constraint = constraints.get(category)
+        if constraint:
+            lines.append(f"  -> {constraint}")
 
     return "\n".join(lines) + "\n"
 
