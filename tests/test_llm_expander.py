@@ -369,7 +369,7 @@ class TestSpecGeneratorLLMIntegration:
             assert path.exists()
             content = path.read_text()
             assert "LLM-generated content" in content
-            mock_instance.expand.assert_called_once_with(tool_idea)
+            mock_instance.expand.assert_called_once_with(tool_idea, failure_patterns=[])
 
     def test_llm_failure_raises_runtime_error(self, template_dir, output_dir, tool_idea):
         """Test that LLM failure raises RuntimeError (no Jinja2 fallback)."""

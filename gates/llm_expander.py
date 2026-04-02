@@ -2,6 +2,7 @@
 LLM Spec Expander - Gate 2 Enhancement
 Calls Claude (via DeepInfra) to expand thin IdeaForge idea data into rich, idea-specific app specs.
 Falls back to Jinja2 template rendering on failure.
+Injects past build failure patterns as constraints to improve spec quality over time.
 """
 import os
 import logging
@@ -235,6 +236,62 @@ but keep it SHORT — 200-400 lines of markdown.
 """
 
 
+FAILURE_PATTERN_DESCRIPTIONS = {
+    "spec_unclear": "Specs were too vague or ambiguous for the builder to implement correctly",
+    "dependency_error": "Projects failed at install time due to missing or incompatible dependencies",
+    "timeout": "Builds exceeded the 90-minute time limit, usually because scope was too large",
+    "test_failure": "Code compiled but tests failed, often due to underspecified test expectations",
+    "build_error": "Syntax or type errors in generated code",
+    "review_failed": "Automated quality checks rejected the build output",
+    "quality_rejected": "QA reviewer rejected the build for low quality",
+    "low_quality": "Build scored below minimum quality threshold",
+    "environment_error": "Build failed due to filesystem or OS-level issues",
+}
+
+
+def format_failure_feedback(failure_patterns: list[dict]) -> str:
+    """Format postmortem failure patterns into a prompt section for spec generation.
+
+    Args:
+        failure_patterns: Output of postmortem.get_failure_patterns() -- list of dicts
+            with keys: category, stage, count, sample_signatures.
+
+    Returns:
+        Markdown section to append to the spec expansion prompt, or empty string if
+        no patterns are worth reporting.
+    """
+    if not failure_patterns:
+        return ""
+
+    lines = [
+        "\n## LESSONS FROM PAST BUILD FAILURES (CRITICAL)\n",
+        "Previous builds in this pipeline have failed with these patterns. "
+        "Write specs that AVOID triggering these failure modes:\n",
+    ]
+
+    for p in failure_patterns:
+        category = p["category"]
+        count = p["count"]
+        stage = p.get("stage", "unknown")
+        desc = FAILURE_PATTERN_DESCRIPTIONS.get(category, category)
+
+        lines.append(f"- **{category}** ({count} occurrences, stage: {stage}): {desc}")
+
+        # Add one actionable constraint per category
+        if category == "spec_unclear":
+            lines.append("  -> Every feature MUST have concrete CLI commands with exact expected output.")
+        elif category == "dependency_error":
+            lines.append("  -> Limit to 3-5 well-known pip packages. Specify exact versions.")
+        elif category == "timeout":
+            lines.append("  -> Reduce scope. Max 2-3 features. Each feature < 100 lines of code.")
+        elif category == "test_failure":
+            lines.append("  -> Test steps must be unambiguous with literal expected output strings.")
+        elif category == "build_error":
+            lines.append("  -> Keep code patterns simple. Avoid complex generics or metaclasses.")
+
+    return "\n".join(lines) + "\n"
+
+
 class LLMSpecExpander:
     """Expands thin idea data into rich app specs using Claude via DeepInfra."""
 
@@ -269,13 +326,16 @@ class LLMSpecExpander:
             base_url="https://api.deepinfra.com/v1/openai",
         )
 
-    def expand(self, idea: dict) -> str:
+    def expand(self, idea: dict, failure_patterns: list[dict] | None = None) -> str:
         """
         Expand an idea dict into a full app specification using Claude.
 
         Args:
             idea: Dictionary with fields: title, description, problem_statement,
                   target_audience, artifact_type, and optionally score fields.
+            failure_patterns: Optional list of failure pattern dicts from
+                  postmortem.get_failure_patterns(). When provided, injects
+                  past failure lessons as constraints in the prompt.
 
         Returns:
             Markdown string containing the full app specification.
@@ -293,6 +353,12 @@ class LLMSpecExpander:
             problem_score=idea.get("problem_score", "N/A"),
             feasibility_score=idea.get("feasibility_score", "N/A"),
         )
+
+        # Inject failure feedback from past builds
+        if failure_patterns:
+            feedback_section = format_failure_feedback(failure_patterns)
+            if feedback_section:
+                prompt = prompt + feedback_section
 
         logger.info(
             "Expanding spec for '%s' (type=%s) using %s",

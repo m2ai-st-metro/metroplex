@@ -330,7 +330,7 @@ class TestSpecGenerator:
             )
 
         with patch("gates.build.LLMSpecExpander") as MockExp:
-            MockExp.return_value.expand.side_effect = lambda idea: specs[idea["id"]]
+            MockExp.return_value.expand.side_effect = lambda idea, **kwargs: specs[idea["id"]]
             generator = SpecGenerator(config, template_dir)
 
             path1 = generator.generate_spec(tool_idea, output_dir)

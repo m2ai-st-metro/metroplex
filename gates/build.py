@@ -19,7 +19,8 @@ from models import BuildJob, PriorityItem
 from db import StateDB
 from audit import AuditLogger
 from cost_rates import estimate_cost
-from gates.llm_expander import LLMSpecExpander, validate_spec
+from gates.llm_expander import LLMSpecExpander, validate_spec, format_failure_feedback
+from postmortem import get_failure_patterns
 from oz_bridge import submit_to_oz
 from readers.ideaforge_reader import IdeaForgeReader
 
@@ -45,6 +46,7 @@ class SpecGenerator:
         """
         self.config = config
         self.template_dir = template_dir
+        self.state_db = state_db
 
         if not template_dir.exists():
             raise FileNotFoundError(f"Template directory not found at {template_dir}")
@@ -119,8 +121,16 @@ class SpecGenerator:
                 f"LLM expander not configured. Cannot generate spec for idea {idea['id']}."
             )
 
+        # Fetch failure patterns from past builds to inject as constraints
+        failure_patterns = []
+        if self.state_db is not None:
+            try:
+                failure_patterns = get_failure_patterns(self.state_db, min_count=2)
+            except Exception as e:
+                logger.warning("Failed to fetch failure patterns for spec feedback: %s", e)
+
         try:
-            rendered_spec = self.llm_expander.expand(idea)
+            rendered_spec = self.llm_expander.expand(idea, failure_patterns=failure_patterns)
         except Exception as e:
             raise RuntimeError(
                 f"LLM expansion failed for idea {idea['id']} ({idea['title']}): {e}"
