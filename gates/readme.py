@@ -20,14 +20,18 @@ from models import PublishJob
 logger = logging.getLogger(__name__)
 
 BANANA_MAKER_SCRIPT = Path.home() / ".claude" / "skills" / "banana-maker" / "generate_image.py"
+BANANA_MAKER_PYTHON = Path.home() / ".claude" / "skills" / "banana-maker" / "venv" / "bin" / "python3"
 
 README_SYSTEM_PROMPT = """\
-You are a technical writer creating polished GitHub README.md files.
+You are a technical writer creating polished, high-quality GitHub README.md files.
+These READMEs are the public face of open-source developer tools -- they must be
+visually appealing, informative, and demonstrate clear value within 30 seconds of scanning.
 Write clear, professional documentation with proper markdown formatting.
-Do NOT wrap the output in a markdown code fence — output raw markdown directly."""
+Do NOT wrap the output in a markdown code fence -- output raw markdown directly.
+Do NOT use em-dashes. Use commas, periods, or double-hyphens instead."""
 
 README_USER_PROMPT = """\
-Generate a comprehensive README.md for this project.
+Generate a comprehensive, visually polished README.md for this project.
 
 **Title**: {title}
 
@@ -39,21 +43,77 @@ Generate a comprehensive README.md for this project.
 
 ## Requirements
 
-Include these sections in order:
+Include these sections in this exact order. Output raw markdown only.
 
-1. **Title** with relevant badges (e.g. Python version, license)
-2. **Infographic** — include `![{title} Overview](assets/infographic.png)` right after the title
-3. **Overview** — what this project does and who it's for (derive from the spec)
-4. **Problem Statement** — the core problem being solved
-5. **Features** — key features derived from the source code and spec (bullet list)
-6. **Tech Stack** — languages, frameworks, libraries used
-7. **Quick Start / Installation** — steps to get running locally
-8. **Usage** — example commands or workflows
-9. **Architecture** — brief description of how the code is organized
-10. **License** — MIT
+### 1. Centered Banner Block (HTML)
+```html
+<p align="center">
+  <img src="assets/infographic.png" alt="{title}" width="800">
+</p>
 
-Keep it concise but informative. Use the spec for context and the file tree for accuracy.
-Output raw markdown only — no code fences wrapping the entire document."""
+<h3 align="center">ONE-LINE DESCRIPTION OF WHAT THIS DOES</h3>
+
+<p align="center">
+  <a href="#quick-start">Quick Start</a> &bull;
+  <a href="#features">Features</a> &bull;
+  <a href="#examples">Examples</a> &bull;
+  <a href="#contributing">Contributing</a>
+</p>
+```
+
+### 2. What is this?
+2-3 sentences explaining what the tool does and who it's for. Include a short
+code block showing a realistic usage example with the command AND its output:
+```
+$ command --flag input
+[show realistic output here]
+```
+
+### 3. Features
+A markdown table with two columns: Feature | Description. 4-8 rows covering the
+key capabilities. Derive features from the source code and spec, not generic filler.
+
+### 4. Quick Start
+Numbered steps to get running. Include clone, install, and first command. Use actual
+package/command names from the file tree and spec.
+
+### 5. Examples
+2-3 concrete usage examples. Each example should have:
+- A bold title describing the use case
+- The command to run
+- Realistic sample output (not just "output here" placeholders)
+Make examples progressively more advanced.
+
+### 6. File Structure
+A clean file tree showing the project layout. Use the provided file tree but clean
+it up -- remove noise files, group logically, add inline comments for key files:
+```
+{title}/
+  src/          # Core source code
+  tests/        # Test suite
+  ...
+```
+
+### 7. Tech Stack
+A compact markdown table: Technology | Purpose. Only include what's actually used.
+
+### 8. Contributing
+Brief section: fork, edit, test, PR. 4 lines max.
+
+### 9. License
+MIT
+
+### 10. Author
+```
+Matthew Snow -- [M2AI](https://m2ai.co) | [@m2ai-portfolio](https://github.com/m2ai-portfolio)
+```
+
+## Quality Rules
+- Every example must show BOTH input AND output -- never leave output as a placeholder
+- Use realistic data in examples, not "foo/bar/example.txt"
+- Feature table rows must describe actual capabilities from the code, not marketing fluff
+- Keep total length between 150-250 lines
+- No em-dashes -- use commas, periods, or double-hyphens"""
 
 
 class ReadmeGate:
@@ -342,7 +402,7 @@ class ReadmeGate:
                 {"role": "system", "content": README_SYSTEM_PROMPT},
                 {"role": "user", "content": prompt},
             ],
-            max_tokens=4096,
+            max_tokens=6144,
         )
 
         content = response.choices[0].message.content or ""
@@ -403,9 +463,10 @@ class ReadmeGate:
         output_path.parent.mkdir(parents=True, exist_ok=True)
 
         try:
+            python_bin = str(BANANA_MAKER_PYTHON) if BANANA_MAKER_PYTHON.is_file() else "python3"
             result = subprocess.run(
                 [
-                    "python3",
+                    python_bin,
                     str(BANANA_MAKER_SCRIPT),
                     prompt,
                     "--model", "flash",
@@ -442,6 +503,23 @@ class ReadmeGate:
             Tuple of (success, error_message)
         """
         try:
+            # Detect default branch
+            branch_result = subprocess.run(
+                ["git", "-C", str(project_path), "rev-parse", "--abbrev-ref", "HEAD"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            branch = branch_result.stdout.strip() or "main"
+
+            # Pull latest from remote before committing (Gate 4.9 may have pushed)
+            subprocess.run(
+                ["git", "-C", str(project_path), "pull", "origin", branch, "--rebase"],
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+
             # Stage files
             add_paths = ["README.md"]
             if has_infographic:
@@ -475,7 +553,7 @@ class ReadmeGate:
 
             # Push
             push_result = subprocess.run(
-                ["git", "-C", str(project_path), "push", "origin", "main"],
+                ["git", "-C", str(project_path), "push", "origin", branch],
                 capture_output=True,
                 text=True,
                 timeout=120,
@@ -509,8 +587,9 @@ class ReadmeGate:
             f"Use a dark theme with blue/purple accents. "
             f"Minimalist style, no text-heavy elements."
         )
+        python_bin = str(BANANA_MAKER_PYTHON) if BANANA_MAKER_PYTHON.is_file() else "python3"
         return [
-            "python3",
+            python_bin,
             str(BANANA_MAKER_SCRIPT),
             prompt,
             "--model", "flash",

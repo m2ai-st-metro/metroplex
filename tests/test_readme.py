@@ -142,7 +142,7 @@ class TestInfographicCommand:
             features="CLI, automation, fast",
             output_path="/tmp/infographic.png",
         )
-        assert cmd[0] == "python3"
+        assert "python3" in cmd[0]
         assert str(BANANA_MAKER_SCRIPT) in cmd[1]
         assert "--model" in cmd
         assert "flash" in cmd
