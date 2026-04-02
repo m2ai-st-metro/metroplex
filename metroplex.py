@@ -198,8 +198,12 @@ def initialize_components(config: Config):
     raw_notifier = create_notifier(config.telegram_bot_token, config.telegram_chat_id)
     notifier = FilteredNotifier(raw_notifier, config.notify_mode)
 
-    # Initialize outcome emitter (Phase 14a — write OutcomeRecords to ST Records)
+    # Initialize outcome emitter (Phase 14a -- write OutcomeRecords to ST Records)
     outcome_emitter = create_outcome_emitter()
+
+    # Initialize event emitter (Phase F -- Sky-Lynx reactive triggers)
+    from event_emitter import create_event_emitter
+    event_emitter = create_event_emitter()
 
     # Initialize dispatcher for non-buildable queue items (Sky-Lynx -> ClaudeClaw)
     dispatcher = create_dispatcher(config.dispatch_db, config.dispatch_chat_id)
@@ -225,6 +229,7 @@ def initialize_components(config: Config):
         tyrest_gate=tyrest_gate,
         dispatcher=dispatcher,
         outcome_emitter=outcome_emitter,
+        event_emitter=event_emitter,
         readme_gate=readme_gate,
         readiness_gate=readiness_gate,
     )

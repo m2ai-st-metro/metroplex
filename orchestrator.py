@@ -32,6 +32,7 @@ from oz_bridge import poll_oz_run
 from readers.skylynx_reader import SkyLynxReader
 from readers.linear_reader import LinearReader
 from outcome_emitter import OutcomeEmitter
+from event_emitter import EventEmitter
 from gates.quality_scorer import score_project
 from quality_ratchet import evaluate_ratchet, evaluate_test_ratchet
 from postmortem import capture_postmortem, get_failure_patterns
@@ -67,6 +68,7 @@ class CycleOrchestrator:
         tyrest_gate: TyrestGate | None = None,
         dispatcher: Dispatcher | None = None,
         outcome_emitter: OutcomeEmitter | None = None,
+        event_emitter: EventEmitter | None = None,
         readme_gate: ReadmeGate | None = None,
         readiness_gate: ReadinessGate | None = None,
     ):
@@ -93,6 +95,7 @@ class CycleOrchestrator:
             tyrest_gate: TyrestGate instance (optional, enables Gate 4.25 LLM QA review)
             dispatcher: Dispatcher for routing non-buildable items to ClaudeClaw workers
             outcome_emitter: OutcomeEmitter for writing terminal-state outcomes to ST Records
+            event_emitter: EventEmitter for Sky-Lynx reactive triggers (Phase F)
             readme_gate: ReadmeGate instance (optional, enables Gate 4.7 README enhancement)
             readiness_gate: ReadinessGate instance (optional, enables Gate 4.9 publish readiness)
         """
@@ -115,6 +118,7 @@ class CycleOrchestrator:
         self.academy_reader = academy_reader
         self.dispatcher = dispatcher or LogDispatcher()
         self.outcome_emitter = outcome_emitter
+        self.event_emitter = event_emitter
         self.readme_gate = readme_gate
         self.readiness_gate = readiness_gate
         # IdeaForge writer for build outcome feedback (L5 B3)
@@ -891,6 +895,23 @@ class CycleOrchestrator:
                                 build_outcome=f"yce_build_failed: {job_id}",
                                 tags=["build"],
                             )
+
+                # Emit Sky-Lynx pipeline events (Phase F)
+                if self.event_emitter:
+                    for job_id in completed:
+                        build = self.state_db.get_build_by_queue_job_id(job_id)
+                        self.event_emitter.emit("build_completed", {
+                            "job_id": job_id,
+                            "title": build["title"] if build else job_id,
+                            "quality_score": build.get("quality_score") if build else None,
+                        })
+                    for job_id in failed:
+                        build = self.state_db.get_build_by_queue_job_id(job_id)
+                        self.event_emitter.emit("build_failed", {
+                            "job_id": job_id,
+                            "title": build["title"] if build else job_id,
+                            "retry_count": build.get("retry_count") if build else None,
+                        })
         except Exception as e:
             # Non-fatal -- log and continue to publish gate
             self.audit_logger.log_error("build", f"Status poll failed: {e}")
@@ -1184,6 +1205,13 @@ class CycleOrchestrator:
                     action="tightened" if ratchet_result["tightened"] else "unchanged",
                     details=ratchet_result,
                 )
+                # Emit Sky-Lynx event on ratchet change (Phase F)
+                if ratchet_result["tightened"] and self.event_emitter:
+                    self.event_emitter.emit("ratchet_tightened", {
+                        "previous": ratchet_result.get("current_threshold"),
+                        "new": ratchet_result.get("proposed_threshold"),
+                        "reason": ratchet_result.get("reason", ""),
+                    })
         except Exception as e:
             self.audit_logger.log_error("quality_ratchet", f"Ratchet evaluation failed: {e}")
 
