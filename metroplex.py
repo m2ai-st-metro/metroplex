@@ -1513,7 +1513,6 @@ def main():
 
 BATCH_FIX_REPOS = [
     "agenticstarter",
-    "great-tool",
     "hipaa-compliant-mcp-security-proxy-for-healthcare-ai-agents",
     "landingflow-audit",
     "local-ai-coding-agent-optimizer",
@@ -1524,7 +1523,6 @@ BATCH_FIX_REPOS = [
     "personalokr",
     "self-hosted-mcp-server-for-local-ai-agent-orchestration",
     "semantiguard",
-    "spec-driven-quality-gate-framework-for-ultra-magnus-pipeline",
     "suprlogs",
     "timebill",
     "workflowmcp",

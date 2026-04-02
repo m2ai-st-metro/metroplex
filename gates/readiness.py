@@ -592,7 +592,7 @@ class ReadinessGate:
         return True
 
     def _fix_generate_topics(self, org: str, repo_name: str) -> bool:
-        """Generate and set topics via LLM."""
+        """Generate and set topics via LLM with retry on bad format."""
         if not self.client:
             logger.warning("No LLM client — cannot generate topics")
             return False
@@ -601,24 +601,36 @@ class ReadinessGate:
         readme_excerpt = (readme_content or "")[:2000]
 
         prompt = TOPICS_USER_PROMPT.format(readme_excerpt=readme_excerpt)
-        try:
-            response = self.client.chat.completions.create(
-                model=self.config.spec_llm_model,
-                messages=[
-                    {"role": "system", "content": TOPICS_SYSTEM_PROMPT},
-                    {"role": "user", "content": prompt},
-                ],
-                max_tokens=256,
-            )
-            raw = response.choices[0].message.content or "[]"
-            # Extract JSON array from response
-            match = re.search(r"\[.*\]", raw, re.DOTALL)
-            if not match:
-                logger.warning(f"LLM returned no JSON array for topics: {raw[:100]}")
+        messages = [
+            {"role": "system", "content": TOPICS_SYSTEM_PROMPT},
+            {"role": "user", "content": prompt},
+        ]
+
+        topics = None
+        for attempt in range(2):
+            try:
+                response = self.client.chat.completions.create(
+                    model=self.config.spec_llm_model,
+                    messages=messages,
+                    max_tokens=256,
+                )
+                raw = response.choices[0].message.content or "[]"
+                match = re.search(r"\[.*\]", raw, re.DOTALL)
+                if match:
+                    topics = json.loads(match.group())
+                    break
+                if attempt == 0:
+                    logger.info(f"Topics attempt 1 for {repo_name}: no JSON array, retrying with correction")
+                    messages.append({"role": "assistant", "content": raw})
+                    messages.append({"role": "user", "content": 'That was not a valid JSON array. Output ONLY a JSON array like ["python", "cli", "automation"]. Nothing else.'})
+                else:
+                    logger.warning(f"LLM returned no JSON array for topics after retry: {raw[:100]}")
+                    return False
+            except Exception as e:
+                logger.warning(f"LLM topics generation failed: {e}")
                 return False
-            topics = json.loads(match.group())
-        except Exception as e:
-            logger.warning(f"LLM topics generation failed: {e}")
+
+        if topics is None:
             return False
 
         # Enforce bounds: min 3, max 8
@@ -643,7 +655,7 @@ class ReadinessGate:
         return True
 
     def _fix_generate_description(self, org: str, repo_name: str) -> bool:
-        """Generate and set repo description via LLM."""
+        """Generate and set repo description via LLM with retry on bad format."""
         if not self.client:
             logger.warning("No LLM client — cannot generate description")
             return False
@@ -655,18 +667,43 @@ class ReadinessGate:
             repo_name=repo_name,
             readme_excerpt=readme_excerpt,
         )
-        try:
-            response = self.client.chat.completions.create(
-                model=self.config.spec_llm_model,
-                messages=[
-                    {"role": "system", "content": DESCRIPTION_SYSTEM_PROMPT},
-                    {"role": "user", "content": prompt},
-                ],
-                max_tokens=256,
-            )
-            description = (response.choices[0].message.content or "").strip().strip('"').strip("'")
-        except Exception as e:
-            logger.warning(f"LLM description generation failed: {e}")
+        messages = [
+            {"role": "system", "content": DESCRIPTION_SYSTEM_PROMPT},
+            {"role": "user", "content": prompt},
+        ]
+
+        description = None
+        for attempt in range(2):
+            try:
+                response = self.client.chat.completions.create(
+                    model=self.config.spec_llm_model,
+                    messages=messages,
+                    max_tokens=256,
+                )
+                raw = (response.choices[0].message.content or "").strip().strip('"').strip("'")
+                # Check if it looks like thinking text (starts with common CoT patterns)
+                if raw and len(raw) <= 200 and not raw.lower().startswith(("okay", "we need", "the user", "let me", "i need")):
+                    description = raw
+                    break
+                # Extract last sentence as fallback — often the actual description is at the end
+                sentences = [s.strip() for s in raw.split(".") if len(s.strip()) > 20]
+                if sentences and len(sentences[-1]) <= 200:
+                    candidate = sentences[-1].strip().rstrip(".")
+                    if len(candidate) >= 30:
+                        description = candidate
+                        break
+                if attempt == 0:
+                    logger.info(f"Description attempt 1 for {repo_name}: got thinking text, retrying")
+                    messages.append({"role": "assistant", "content": raw})
+                    messages.append({"role": "user", "content": "That included extra text. Output ONLY one sentence (max 200 chars) describing this repo's value. No preamble, no thinking, just the sentence."})
+                else:
+                    logger.warning(f"LLM description failed after retry: {raw[:100]}")
+                    return False
+            except Exception as e:
+                logger.warning(f"LLM description generation failed: {e}")
+                return False
+
+        if description is None:
             return False
 
         # Enforce bounds: min 30, max 200 chars
