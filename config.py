@@ -99,6 +99,10 @@ class Config:
     max_publish_per_cycle: int = field(default=3)
     require_review: bool = field(default=True)
 
+    # Readiness gate (Gate 4.9)
+    max_readiness_per_cycle: int = field(default=5)
+    readiness_enabled: bool = field(default=True)
+
     # Budget controls
     daily_cost_limit: float = field(default=50.0)
     monthly_cost_limit: float = field(default=500.0)
@@ -234,6 +238,13 @@ class Config:
         self.telegram_bot_token = os.environ.get("METROPLEX_TELEGRAM_BOT_TOKEN", self.telegram_bot_token)
         self.telegram_chat_id = os.environ.get("METROPLEX_TELEGRAM_CHAT_ID", self.telegram_chat_id)
         self.notify_mode = os.environ.get("METROPLEX_NOTIFY_MODE", self.notify_mode)
+
+        # Readiness gate (Gate 4.9)
+        self.readiness_enabled = os.environ.get("METROPLEX_READINESS_ENABLED", "true").lower() in ("true", "1", "yes")
+        try:
+            self.max_readiness_per_cycle = int(os.environ.get("METROPLEX_MAX_READINESS_PER_CYCLE", self.max_readiness_per_cycle))
+        except ValueError:
+            pass
 
         # Publish gate
         self.github_org = os.environ.get("METROPLEX_GITHUB_ORG", self.github_org)

@@ -331,6 +331,26 @@ class StateDB:
         """)
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_readme_jobs_build ON readme_jobs(build_job_id)")
 
+        # Readiness jobs table (Gate 4.9 — publish readiness checks + auto-fixes)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS readiness_jobs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                build_job_id TEXT,
+                repo_name TEXT NOT NULL,
+                repo_url TEXT,
+                status TEXT DEFAULT 'pending' CHECK(status IN ('pending', 'completed', 'partial', 'failed')),
+                checks_passed TEXT DEFAULT '[]',
+                checks_failed TEXT DEFAULT '[]',
+                fixes_applied TEXT DEFAULT '[]',
+                fixes_failed TEXT DEFAULT '[]',
+                error TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                completed_at TIMESTAMP
+            )
+        """)
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_readiness_jobs_build ON readiness_jobs(build_job_id)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_readiness_jobs_repo ON readiness_jobs(repo_name)")
+
         # Build sessions table (Paperclip pattern: session compaction between retries)
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS build_sessions (
@@ -956,8 +976,9 @@ class StateDB:
 
         if source and source_id:
             cursor.execute(
-                "UPDATE priority_queue SET status = 'pending', completed_at = NULL "
-                "WHERE source = ? AND source_id = ? AND status = 'failed'",
+                "UPDATE priority_queue SET status = 'pending', completed_at = NULL, "
+                "claimed_by = NULL, claimed_at = NULL "
+                "WHERE source = ? AND source_id = ? AND status IN ('failed', 'completed')",
                 (source, source_id),
             )
 
@@ -1719,3 +1740,86 @@ class StateDB:
         ))
 
         self.conn.commit()
+
+    # --- Readiness Jobs (Gate 4.9) ---
+
+    def has_readiness(self, build_job_id: str) -> bool:
+        """Check if a build already has a completed readiness job."""
+        self.connect()
+        cursor = self.conn.cursor()
+        cursor.execute(
+            "SELECT 1 FROM readiness_jobs WHERE build_job_id = ? AND status = 'completed' LIMIT 1",
+            (build_job_id,),
+        )
+        return cursor.fetchone() is not None
+
+    def get_readiness_pending(self) -> list[dict]:
+        """Get published builds that haven't had readiness checks yet.
+
+        Returns publish_jobs with status='published' that have no completed
+        readiness_jobs entry.
+        """
+        self.connect()
+        cursor = self.conn.cursor()
+        cursor.execute("""
+            SELECT p.build_job_id, p.title, p.repo_name, p.repo_url, p.project_dir
+            FROM publish_jobs p
+            WHERE p.status = 'published'
+            AND p.build_job_id NOT IN (
+                SELECT build_job_id FROM readiness_jobs WHERE status = 'completed'
+            )
+        """)
+        return [dict(row) for row in cursor.fetchall()]
+
+    def record_readiness_job(
+        self,
+        build_job_id: str | None,
+        repo_name: str,
+        repo_url: str | None = None,
+        status: str = "pending",
+        checks_passed: str = "[]",
+        checks_failed: str = "[]",
+        fixes_applied: str = "[]",
+        fixes_failed: str = "[]",
+        error: str | None = None,
+    ):
+        """Record a readiness job result."""
+        self.connect()
+        cursor = self.conn.cursor()
+
+        completed_at = datetime.now().isoformat() if status in ("completed", "partial") else None
+
+        cursor.execute("""
+            INSERT INTO readiness_jobs
+                (build_job_id, repo_name, repo_url, status, checks_passed, checks_failed,
+                 fixes_applied, fixes_failed, error, created_at, completed_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            build_job_id,
+            repo_name,
+            repo_url,
+            status,
+            checks_passed,
+            checks_failed,
+            fixes_applied,
+            fixes_failed,
+            error,
+            datetime.now().isoformat(),
+            completed_at,
+        ))
+
+        self.conn.commit()
+
+    def get_readiness_stats(self) -> dict:
+        """Get readiness job statistics."""
+        self.connect()
+        cursor = self.conn.cursor()
+        cursor.execute("""
+            SELECT status, COUNT(*) as cnt
+            FROM readiness_jobs
+            GROUP BY status
+        """)
+        stats = {row["status"]: row["cnt"] for row in cursor.fetchall()}
+        cursor.execute("SELECT COUNT(*) as total FROM readiness_jobs")
+        stats["total"] = cursor.fetchone()["total"]
+        return stats

@@ -17,6 +17,7 @@ from gates.build import SpecGenerator, BuildOrchestrator
 from gates.patcher import PatchGate
 from gates.publish import PublishGate
 from gates.readme import ReadmeGate
+from gates.readiness import ReadinessGate
 from gates.review import ReviewGate
 from gates.tyrest import TyrestGate
 from orchestrator import CycleOrchestrator
@@ -187,6 +188,12 @@ def initialize_components(config: Config):
         audit_logger=audit_logger,
     )
 
+    readiness_gate = ReadinessGate(
+        config=config,
+        state_db=state_db,
+        audit_logger=audit_logger,
+    ) if config.readiness_enabled else None
+
     # Initialize notifier (wrapped with FilteredNotifier for anomaly/summary modes)
     raw_notifier = create_notifier(config.telegram_bot_token, config.telegram_chat_id)
     notifier = FilteredNotifier(raw_notifier, config.notify_mode)
@@ -219,6 +226,7 @@ def initialize_components(config: Config):
         dispatcher=dispatcher,
         outcome_emitter=outcome_emitter,
         readme_gate=readme_gate,
+        readiness_gate=readiness_gate,
     )
 
     return orchestrator, state_db, circuit_breaker
@@ -1428,6 +1436,16 @@ def main():
     # health command
     health_parser = subparsers.add_parser("health", help="Run pipeline health checks (Phase D)")
 
+    # readiness command (Gate 4.9)
+    readiness_parser = subparsers.add_parser("readiness", help="Run Gate 4.9 (readiness checks) on published builds")
+    readiness_parser.add_argument("--dry-run", action="store_true", help="Show checks without fixing")
+
+    # readiness-fix command (batch mode)
+    readiness_fix_parser = subparsers.add_parser("readiness-fix", help="Run readiness checks + fixes on specific repos")
+    readiness_fix_parser.add_argument("--repo", type=str, help="Single repo name to check/fix")
+    readiness_fix_parser.add_argument("--all", action="store_true", dest="all_repos", help="Run on all 16 known repos")
+    readiness_fix_parser.add_argument("--dry-run", action="store_true", help="Show checks without fixing")
+
     # Parse arguments
     args = parser.parse_args()
 
@@ -1482,9 +1500,96 @@ def main():
         sys.exit(cmd_funnel(args, config))
     elif args.command == "health":
         sys.exit(cmd_health(args, config))
+    elif args.command == "readiness":
+        sys.exit(cmd_readiness(args, config))
+    elif args.command == "readiness-fix":
+        sys.exit(cmd_readiness_fix(args, config))
     else:
         parser.print_help()
         sys.exit(1)
+
+
+# --- Readiness Commands (Gate 4.9) ---
+
+BATCH_FIX_REPOS = [
+    "agenticstarter",
+    "great-tool",
+    "hipaa-compliant-mcp-security-proxy-for-healthcare-ai-agents",
+    "landingflow-audit",
+    "local-ai-coding-agent-optimizer",
+    "march-2026-ai-coding-tool-power-rankings-update",
+    "mcp-healthcare",
+    "mcpick",
+    "microservice-contract-validator",
+    "personalokr",
+    "self-hosted-mcp-server-for-local-ai-agent-orchestration",
+    "semantiguard",
+    "spec-driven-quality-gate-framework-for-ultra-magnus-pipeline",
+    "suprlogs",
+    "timebill",
+    "workflowmcp",
+]
+
+
+def cmd_readiness(args, config: Config):
+    """Run Gate 4.9 (readiness) on published builds missing readiness checks."""
+    state_db = StateDB()
+    state_db.init_db()
+    audit_logger = AuditLogger()
+
+    gate = ReadinessGate(config=config, state_db=state_db, audit_logger=audit_logger)
+
+    try:
+        print("Running Gate 4.9 (Readiness)...")
+        results = gate.run(dry_run=args.dry_run)
+        ok_count = sum(1 for r in results if r.get("status") == "completed")
+        print(f"\nReadiness: {len(results)} processed, {ok_count} fully ready")
+        return 0
+    except Exception as e:
+        print(f"ERROR: {e}")
+        return 1
+    finally:
+        state_db.close()
+
+
+def cmd_readiness_fix(args, config: Config):
+    """Run readiness checks + fixes on specific repos (batch mode)."""
+    state_db = StateDB()
+    state_db.init_db()
+    audit_logger = AuditLogger()
+
+    gate = ReadinessGate(config=config, state_db=state_db, audit_logger=audit_logger)
+
+    if args.repo:
+        repo_names = [args.repo]
+    elif args.all_repos:
+        repo_names = BATCH_FIX_REPOS
+    else:
+        print("ERROR: Specify --repo <name> or --all")
+        return 1
+
+    try:
+        print(f"Running readiness fix on {len(repo_names)} repo(s)...")
+        results = gate.run_batch(repo_names=repo_names, dry_run=args.dry_run)
+
+        # Summary table
+        print(f"\n{'Repo':<60} {'Status':<10} {'Fixed':<8} {'Remaining':<10}")
+        print("-" * 88)
+        for r in results:
+            name = r.get("repo_name", "?")
+            status = r.get("status", "?")
+            fixed = len(r.get("fixes_applied", []))
+            remaining = len(r.get("fixes_failed", []))
+            print(f"{name:<60} {status:<10} {fixed:<8} {remaining:<10}")
+
+        ok_count = sum(1 for r in results if r.get("status") == "completed")
+        print(f"\nTotal: {len(results)} repos, {ok_count} fully ready")
+        return 0
+    except Exception as e:
+        print(f"ERROR: {e}")
+        return 1
+    finally:
+        state_db.close()
 
 
 if __name__ == "__main__":

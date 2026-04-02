@@ -22,6 +22,7 @@ from gates.build import BuildOrchestrator
 from gates.patcher import PatchGate
 from gates.publish import PublishGate
 from gates.readme import ReadmeGate
+from gates.readiness import ReadinessGate
 from gates.review import ReviewGate
 from gates.tyrest import TyrestGate
 from notifier import Notifier, LogNotifier
@@ -67,6 +68,7 @@ class CycleOrchestrator:
         dispatcher: Dispatcher | None = None,
         outcome_emitter: OutcomeEmitter | None = None,
         readme_gate: ReadmeGate | None = None,
+        readiness_gate: ReadinessGate | None = None,
     ):
         """
         Initialize Cycle Orchestrator.
@@ -92,6 +94,7 @@ class CycleOrchestrator:
             dispatcher: Dispatcher for routing non-buildable items to ClaudeClaw workers
             outcome_emitter: OutcomeEmitter for writing terminal-state outcomes to ST Records
             readme_gate: ReadmeGate instance (optional, enables Gate 4.7 README enhancement)
+            readiness_gate: ReadinessGate instance (optional, enables Gate 4.9 publish readiness)
         """
         self.config = config
         self.triage_gate = triage_gate
@@ -113,6 +116,7 @@ class CycleOrchestrator:
         self.dispatcher = dispatcher or LogDispatcher()
         self.outcome_emitter = outcome_emitter
         self.readme_gate = readme_gate
+        self.readiness_gate = readiness_gate
         # IdeaForge writer for build outcome feedback (L5 B3)
         try:
             self.ideaforge_writer = IdeaForgeWriter(config.ideaforge_db)
@@ -1270,6 +1274,23 @@ class CycleOrchestrator:
                 except Exception as e:
                     print(f"x Gate 4.7 (readme) failed: {e}")
                     self.audit_logger.log_error("readme", str(e))
+
+        # Gate 4.9: Readiness (publish readiness checks + auto-fixes)
+        if self.readiness_gate is not None and self.publish_gate is not None:
+            try:
+                published_for_readiness = [j for j in pub_jobs if j.status == "published"] if pub_jobs else []
+            except NameError:
+                published_for_readiness = []
+
+            if published_for_readiness:
+                try:
+                    print(f"Running Gate 4.9 (readiness)...")
+                    readiness_results = self.readiness_gate.run(published_jobs=published_for_readiness, dry_run=dry_run)
+                    readiness_ok = sum(1 for r in readiness_results if r.get("status") == "completed")
+                    print(f"+ Gate 4.9 completed: {len(readiness_results)} processed, {readiness_ok} fully ready")
+                except Exception as e:
+                    print(f"x Gate 4.9 (readiness) failed: {e}")
+                    self.audit_logger.log_error("readiness", str(e))
 
         # Gate 4.8: Swindle (storefront listing)
         swindle_script = Path.home() / "projects" / "swindle" / "swindle.py"
