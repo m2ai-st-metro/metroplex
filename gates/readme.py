@@ -51,7 +51,7 @@ Include these sections in this exact order. Output raw markdown only.
   <img src="assets/infographic.png" alt="{title}" width="800">
 </p>
 
-<h3 align="center">ONE-LINE DESCRIPTION OF WHAT THIS DOES</h3>
+<h3 align="center">REPLACE THIS WITH A ONE-LINE DESCRIPTION (e.g. "Scan dependencies for vulnerabilities without leaving your terminal")</h3>
 
 <p align="center">
   <a href="#quick-start">Quick Start</a> &bull;
@@ -482,7 +482,14 @@ class ReadmeGate:
                 logger.error(f"banana-maker failed: {result.stderr.strip()}")
                 return False
 
-            return output_path.is_file()
+            # banana-maker may save as .jpg instead of .png
+            if output_path.is_file():
+                return True
+            jpg_path = output_path.with_suffix(".jpg")
+            if jpg_path.is_file():
+                jpg_path.rename(output_path)
+                return True
+            return False
 
         except subprocess.TimeoutExpired:
             logger.error("banana-maker timed out (120s)")
