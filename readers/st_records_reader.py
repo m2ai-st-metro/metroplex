@@ -132,6 +132,7 @@ class STRecordsReader:
         """
         # Open a separate writable connection for this write operation
         write_conn = sqlite3.connect(self.db_path)
+        write_conn.execute("PRAGMA busy_timeout=5000")
         try:
             cursor = write_conn.cursor()
             cursor.execute("""
@@ -210,6 +211,7 @@ class STRecordsReader:
             new_status: The new status value
         """
         write_conn = sqlite3.connect(self.db_path)
+        write_conn.execute("PRAGMA busy_timeout=5000")
         try:
             cursor = write_conn.cursor()
             cursor.execute("""

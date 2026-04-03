@@ -196,6 +196,7 @@ class SkyLynxReader:
             recommendation_id: The recommendation_id to update
         """
         write_conn = sqlite3.connect(self.db_path)
+        write_conn.execute("PRAGMA busy_timeout=5000")
         try:
             cursor = write_conn.cursor()
             cursor.execute("""

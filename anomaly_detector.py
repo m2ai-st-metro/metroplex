@@ -48,6 +48,7 @@ class AnomalyDetector:
             # Fallback for older sqlite builds that don't support URI mode.
             conn = sqlite3.connect(self.db_path)
         conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA busy_timeout=5000")
         return conn
 
     def _safe_query(self, conn: sqlite3.Connection, sql: str, params: tuple = ()) -> list[sqlite3.Row]:

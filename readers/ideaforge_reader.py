@@ -109,6 +109,7 @@ class IdeaForgeReader:
         """
         try:
             write_conn = sqlite3.connect(self.db_path)
+            write_conn.execute("PRAGMA busy_timeout=5000")
             cursor = write_conn.cursor()
             cursor.execute(
                 "UPDATE ideas SET claimed_by = ?, claimed_at = datetime('now') WHERE id = ?",
@@ -141,6 +142,7 @@ class IdeaForgeReader:
         """
         try:
             write_conn = sqlite3.connect(self.db_path)
+            write_conn.execute("PRAGMA busy_timeout=5000")
             cursor = write_conn.cursor()
             cursor.execute("UPDATE ideas SET status = ? WHERE id = ?", (status, idea_id))
             changed = cursor.rowcount > 0

@@ -38,6 +38,7 @@ class IdeaForgeWriter:
         if self.conn is None:
             self.conn = sqlite3.connect(self.db_path)
             self.conn.row_factory = sqlite3.Row
+            self.conn.execute("PRAGMA busy_timeout=5000")
             # Ensure build_outcome column exists
             try:
                 self.conn.execute(

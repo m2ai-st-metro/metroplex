@@ -46,6 +46,7 @@ def _readonly_connect(db_path: str) -> sqlite3.Connection:
     """Open a read-only SQLite connection with Row factory."""
     conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=5)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout=5000")
     return conn
 
 

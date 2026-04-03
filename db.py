@@ -36,6 +36,9 @@ class StateDB:
         if self.conn is None:
             self.conn = sqlite3.connect(self.db_path)
             self.conn.row_factory = sqlite3.Row
+            # Set busy_timeout on every new connection so concurrent access
+            # retries instead of immediately raising "database is locked".
+            self.conn.execute("PRAGMA busy_timeout=5000")
         # Force WAL checkpoint so this connection sees all committed writes
         try:
             self.conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
@@ -51,6 +54,12 @@ class StateDB:
     def init_db(self):
         """Initialize database schema."""
         self.connect()
+
+        # Enable WAL mode and busy_timeout for concurrent access safety.
+        # WAL allows concurrent readers + one writer without "database is locked".
+        # busy_timeout tells SQLite to retry for up to 5 seconds before failing.
+        self.conn.execute("PRAGMA journal_mode=WAL")
+        self.conn.execute("PRAGMA busy_timeout=5000")
 
         cursor = self.conn.cursor()
 
