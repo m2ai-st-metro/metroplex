@@ -1214,6 +1214,7 @@ class StateDB:
                 GROUP BY base_job_id
             ) latest ON b.id = latest.max_id
             WHERE b.status = 'failed'
+            AND COALESCE(b.next_retry_at, '') != 'abandoned'
             AND (b.next_retry_at IS NULL OR b.next_retry_at <= ?)
             AND (
                 SELECT COUNT(*) FROM build_jobs b2
@@ -1291,12 +1292,21 @@ class StateDB:
 
         # Get the latest failed row (use queue_job_id for the specific row)
         cursor.execute(
-            "SELECT id, retry_count FROM build_jobs "
+            "SELECT id, retry_count, next_retry_at FROM build_jobs "
             "WHERE queue_job_id = ? AND status = 'failed' ORDER BY id DESC LIMIT 1",
             (queue_job_id,),
         )
         row = cursor.fetchone()
         if not row:
+            return False
+
+        # Guard: if this row was already marked for retry (next_retry_at is set),
+        # don't mark it again. This prevents infinite retry loops when Gate 2
+        # is blocked (circuit breaker, budget, etc.) and no new build row is
+        # created to increment the failed count. Each failed row can only be
+        # marked for retry once. A new build attempt creates a fresh row with
+        # next_retry_at=NULL, which can then be marked independently.
+        if row["next_retry_at"] is not None:
             return False
 
         new_count = failed_count  # Use total failed count, not per-row retry_count

@@ -1010,6 +1010,18 @@ class CycleOrchestrator:
                     # re-dispatches on the next cycle (backoff already enforced
                     # by get_retryable_builds checking next_retry_at).
                     self._reset_priority_queue_for_retry(queue_job_id)
+                else:
+                    # mark_build_for_retry returned False -- either exhausted
+                    # (handled by get_exhausted_builds above) or already marked
+                    # for retry but Gate 2 never picked it up. In the latter
+                    # case, abandon to prevent infinite retry loops.
+                    if not self.state_db.has_exhausted_retries(build.get("base_job_id", queue_job_id)):
+                        print(f"  ABANDON (retry stuck, Gate 2 never consumed): {build['title']} ({queue_job_id})")
+                        self.state_db.mark_build_abandoned(queue_job_id)
+                        self.audit_logger.log_decision(
+                            "build", "retry_stuck_abandoned",
+                            {"queue_job_id": queue_job_id, "title": build["title"]}
+                        )
         except Exception as e:
             self.audit_logger.log_error("build", f"Auto-retry check failed: {e}")
 
