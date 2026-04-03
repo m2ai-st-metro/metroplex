@@ -87,6 +87,10 @@ class PatchGate:
         if not agent_patches:
             return []
 
+        # Enforce per-cycle cap
+        cap = getattr(self.config, "max_patches_per_cycle", len(agent_patches))
+        agent_patches = agent_patches[:cap]
+
         results = []
 
         for patch in agent_patches:

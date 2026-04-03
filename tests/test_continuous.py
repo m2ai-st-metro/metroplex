@@ -150,15 +150,17 @@ class TestPatchGateCapEnforcement:
         db.init_db()
         audit = AuditLogger(os.devnull)
 
-        # Mock ST Records reader returning 8 patches
+        # Mock ST Records reader returning 8 agent patches
         mock_reader = Mock()
-        mock_reader.get_proposed_patches.return_value = [
+        mock_reader.get_approved_agent_patches.return_value = [
             {
                 "patch_id": f"patch-{i}",
-                "persona_id": f"persona-{i}",
-                "from_version": "1.0",
-                "to_version": "1.1",
-                "raw_json": {"operations": []},
+                "agent_id": f"agent-{i}",
+                "target": "claude_md",
+                "section": "## Rules",
+                "operation": "append",
+                "value": f"- Rule {i}",
+                "rationale": "Test patch",
             }
             for i in range(1, 9)
         ]
