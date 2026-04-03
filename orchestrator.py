@@ -71,6 +71,7 @@ class CycleOrchestrator:
         event_emitter: EventEmitter | None = None,
         readme_gate: ReadmeGate | None = None,
         readiness_gate: ReadinessGate | None = None,
+        a2a_manager=None,
     ):
         """
         Initialize Cycle Orchestrator.
@@ -121,6 +122,7 @@ class CycleOrchestrator:
         self.event_emitter = event_emitter
         self.readme_gate = readme_gate
         self.readiness_gate = readiness_gate
+        self.a2a_manager = a2a_manager
         # IdeaForge writer for build outcome feedback (L5 B3)
         try:
             self.ideaforge_writer = IdeaForgeWriter(config.ideaforge_db)
@@ -673,6 +675,10 @@ class CycleOrchestrator:
         Returns:
             CycleResult with cycle metrics
         """
+        # Ensure A2A server is running (if manager exists)
+        if self.a2a_manager:
+            self.a2a_manager.ensure_running()
+
         # Generate cycle ID with microseconds to ensure uniqueness
         now = datetime.now()
         cycle_id = f"cycle-{now.strftime('%Y%m%d-%H%M%S')}-{now.microsecond:06d}"
@@ -1547,6 +1553,10 @@ class CycleOrchestrator:
                     print("\nShutdown signal received during sleep, stopping...")
                     return results
                 time.sleep(1)
+
+        # Stop A2A server on shutdown
+        if self.a2a_manager:
+            self.a2a_manager.stop()
 
         print(f"\nCompleted {cycle_count} cycles")
         return results

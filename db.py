@@ -212,6 +212,10 @@ class StateDB:
             # Backfill: no suffixed IDs exist yet, so base = queue_job_id
             cursor.execute("UPDATE build_jobs SET base_job_id = queue_job_id WHERE base_job_id IS NULL")
 
+        # Migrate: add a2a_task_id to build_jobs (Phase E A2A dispatch tracking)
+        if "a2a_task_id" not in bj_columns:
+            cursor.execute("ALTER TABLE build_jobs ADD COLUMN a2a_task_id TEXT DEFAULT NULL")
+
         # Migrate: add publish_count to cycles if missing
         cursor.execute("PRAGMA table_info(cycles)")
         cy_columns = {row[1] for row in cursor.fetchall()}

@@ -313,10 +313,11 @@ class Config:
 
         # Oz Cloud Agent settings
         self.build_target = os.environ.get("METROPLEX_BUILD_TARGET", self.build_target)
-        if self.build_target not in ("local", "cloud", "auto"):
+        if self.build_target not in ("local", "cloud", "a2a", "auto"):
             self.build_target = "local"
         self.oz_environment_id = os.environ.get("METROPLEX_OZ_ENVIRONMENT_ID", self.oz_environment_id)
         self.oz_build_model = os.environ.get("METROPLEX_OZ_BUILD_MODEL", self.oz_build_model)
+        self.a2a_server_url = os.environ.get("METROPLEX_A2A_SERVER_URL", self.a2a_server_url)
 
 
     def validate(self) -> list[str]:
@@ -363,7 +364,10 @@ class Config:
     ratchet_decay_amount: float = field(default=0.5)  # How much to loosen per decay step
 
     # Oz Cloud Agent settings
-    build_target: str = field(default="local")  # local|cloud|auto
+    build_target: str = field(default="local")  # local|cloud|a2a|auto
     oz_environment_id: str = field(default="")
     oz_build_model: str = field(default="claude-sonnet-4-20250514")
+
+    # A2A server settings
+    a2a_server_url: str = field(default="http://127.0.0.1:18900")
 
