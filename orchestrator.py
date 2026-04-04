@@ -1075,6 +1075,23 @@ class CycleOrchestrator:
                                 build = self.state_db.get_build_by_queue_job_id(r.queue_job_id)
                                 if build and str(build["idea_id"]).isdigit():
                                     self._write_ideaforge_outcome(int(build["idea_id"]), "review_failed")
+                                # Capture postmortem for review failures (Phase G fix)
+                                # This feeds back into spec generation constraints
+                                if build:
+                                    checks_desc = ", ".join(r.checks_failed) if r.checks_failed else "unknown"
+                                    capture_postmortem(
+                                        state_db=self.state_db,
+                                        queue_job_id=r.queue_job_id,
+                                        idea_id=int(build["idea_id"]) if str(build["idea_id"]).isdigit() else 0,
+                                        title=r.title,
+                                        log_path=None,
+                                        spec_path=build.get("spec_path"),
+                                        idea_score=None,
+                                        artifact_type=None,
+                                        retry_count=build.get("retry_count"),
+                                        review_status="review_failed",
+                                        quality_score=None,
+                                    )
                         # Emit outcomes for review failures (Phase 14a)
                         if self.outcome_emitter:
                             for r in review_results:

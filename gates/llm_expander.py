@@ -31,7 +31,7 @@ COT_MARKERS = [
 
 MIN_SECTION_HEADERS = 3
 MIN_SPEC_LINES = 50
-MAX_SPEC_LINES = 400
+MAX_SPEC_LINES = 450
 
 # Template instruction fragments that should never appear in a generated spec.
 # Their presence means the LLM parroted the prompt template instead of following it.
@@ -42,7 +42,8 @@ PARROT_MARKERS = [
     "1-2 paragraphs: what this builds",
     "EXACTLY 2-3 features",
     "1-2 Pydantic models or dataclasses",
-    "Flat structure preferred. 8-12 files max",
+    "Flat structure preferred. 8-12 files max.",
+    "Flat structure preferred. 8-12 files max including tests",
 ]
 
 
@@ -94,6 +95,17 @@ def validate_spec(spec_text: str) -> tuple[bool, str]:
     if parrot_hits:
         return False, f"Template parroting: LLM copied {len(parrot_hits)} instruction fragments"
 
+    # Fix D: Test file presence in File Structure
+    # Reject specs where File Structure section exists but has no test references
+    import re
+    file_structure_match = re.search(
+        r"## File Structure.*?```(.*?)```", spec_text, re.DOTALL
+    )
+    if file_structure_match:
+        structure_content = file_structure_match.group(1).lower()
+        if "test_" not in structure_content and "tests/" not in structure_content:
+            return False, "File Structure missing test files (tests/ directory or test_*.py required)"
+
     return True, ""
 
 # Prompt that produces YCE-compatible app_spec.txt content
@@ -133,6 +145,7 @@ The builder is a single AI coding agent with 5 iterations. Specs that violate th
    Everything runs in a single process.
 8. **No web frontends** for tool/agent types. CLI only. Products may have a simple single-page UI.
 9. **Standard library + 3-5 pip packages max**. Every dependency is a risk.
+10. **MANDATORY: Include pytest test files**. The File Structure MUST include a `tests/` directory with at least 2 test files (e.g., `tests/test_core.py`, `tests/test_cli.py`). Every core feature must have corresponding test functions. Builds WITHOUT test files are automatically rejected by the review gate.
 
 Think of the SMALLEST thing that solves the core problem. A tool that does ONE thing well
 ships and works. A tool that tries to do five things ships broken.
@@ -179,7 +192,14 @@ Produce a Markdown document with EXACTLY these sections:
 <1-2 Pydantic models or dataclasses. Keep fields minimal.>
 
 ## File Structure
-<Flat structure preferred. 8-12 files max including tests.>
+<Flat structure preferred. 8-12 files max. MUST include a tests/ directory with test_*.py files for each module. Example: tests/test_core.py, tests/test_cli.py>
+
+## Test Plan
+<For each core feature, list the pytest test file and function names. Example:
+- tests/test_core.py::test_process_valid_input
+- tests/test_core.py::test_process_empty_input_raises
+- tests/test_cli.py::test_help_flag
+Each test must be a proper pytest function with assertions. Minimum 5 test functions total.>
 
 ## Success Criteria
 <3-5 verifiable outcomes that can be checked by running commands>
@@ -256,6 +276,15 @@ _DEFAULT_CONSTRAINTS = {
     "timeout": "Reduce scope. Max 2-3 features. Each feature < 100 lines of code.",
     "test_failure": "Test steps must be unambiguous with literal expected output strings.",
     "build_error": "Keep code patterns simple. Avoid complex generics or metaclasses.",
+    "review_failed": (
+        "Builds MUST include a tests/ directory with pytest test files. "
+        "The review gate rejects projects with 3+ source files and zero test files. "
+        "Include at least 2 test_*.py files with real assertions."
+    ),
+    "quality_rejected": (
+        "Ensure the project includes README.md, proper test coverage, and no secrets or large files. "
+        "Quality reviewer checks spec alignment, completeness, and code quality signals."
+    ),
 }
 
 

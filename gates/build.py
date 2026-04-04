@@ -20,7 +20,7 @@ from db import StateDB
 from audit import AuditLogger
 from cost_rates import estimate_cost
 from gates.llm_expander import LLMSpecExpander, validate_spec, format_failure_feedback
-from postmortem import get_failure_patterns
+from postmortem import capture_postmortem, get_failure_patterns
 from oz_bridge import submit_to_oz
 from readers.ideaforge_reader import IdeaForgeReader
 
@@ -1068,6 +1068,18 @@ class BuildOrchestrator:
                             )
                             self.state_db.record_build_job(job)
                             jobs.append(job)
+                            # Capture postmortem for Tyrest pre-build rejection
+                            if not dry_run:
+                                capture_postmortem(
+                                    state_db=self.state_db,
+                                    queue_job_id=job_id,
+                                    idea_id=idea["id"],
+                                    title=idea["title"],
+                                    log_path=None,
+                                    spec_path=str(spec_path),
+                                    review_status="tyrest_rejected",
+                                    quality_score=None,
+                                )
                             self.audit_logger.log_decision(
                                 gate="build",
                                 action="tyrest_rejected",
@@ -1126,6 +1138,16 @@ class BuildOrchestrator:
                     )
                     self.state_db.record_build_job(job)
                     jobs.append(job)
+                    # Capture postmortem for pre-build failures
+                    if not dry_run:
+                        capture_postmortem(
+                            state_db=self.state_db,
+                            queue_job_id=job_id,
+                            idea_id=idea.get("id", 0),
+                            title=idea.get("title", "Unknown"),
+                            log_path=None,
+                            spec_path=None,
+                        )
 
             self.audit_logger.log_decision(
                 gate="build",
