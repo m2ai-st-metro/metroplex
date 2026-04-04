@@ -151,6 +151,45 @@ class TestHasExhaustedRetries:
         assert not in_memory_db.has_exhausted_retries("metroplex-ideaforge-999")
 
 
+class TestIsBackoffActive:
+    """Test the backoff guard used by run_from_queue to prevent premature re-dispatch."""
+
+    def test_no_builds_returns_false(self, in_memory_db):
+        assert not in_memory_db.is_backoff_active("metroplex-ideaforge-999")
+
+    def test_failed_build_no_retry_at_returns_false(self, db_with_failed_build):
+        """A failed build that hasn't been marked for retry has no backoff."""
+        assert not db_with_failed_build.is_backoff_active("metroplex-ideaforge-1")
+
+    def test_active_backoff_returns_true(self, db_with_failed_build):
+        """After mark_build_for_retry, backoff should be active."""
+        db_with_failed_build.mark_build_for_retry("metroplex-ideaforge-1")
+        assert db_with_failed_build.is_backoff_active("metroplex-ideaforge-1")
+
+    def test_expired_backoff_returns_false(self, db_with_failed_build):
+        """Once next_retry_at is in the past, backoff is no longer active."""
+        db_with_failed_build.mark_build_for_retry("metroplex-ideaforge-1")
+        # Manually set next_retry_at to the past
+        db_with_failed_build.connect()
+        db_with_failed_build.conn.execute(
+            "UPDATE build_jobs SET next_retry_at = ? WHERE base_job_id = ?",
+            ((datetime.now() - timedelta(minutes=1)).isoformat(), "metroplex-ideaforge-1"),
+        )
+        db_with_failed_build.conn.commit()
+        assert not db_with_failed_build.is_backoff_active("metroplex-ideaforge-1")
+
+    def test_abandoned_returns_false(self, db_with_failed_build):
+        """Abandoned builds should not block dispatch."""
+        db_with_failed_build.mark_build_for_retry("metroplex-ideaforge-1")
+        db_with_failed_build.connect()
+        db_with_failed_build.conn.execute(
+            "UPDATE build_jobs SET next_retry_at = 'abandoned' WHERE base_job_id = ?",
+            ("metroplex-ideaforge-1",),
+        )
+        db_with_failed_build.conn.commit()
+        assert not db_with_failed_build.is_backoff_active("metroplex-ideaforge-1")
+
+
 class TestMarkBuildForRetry:
     """Test the retry flagging mechanism."""
 

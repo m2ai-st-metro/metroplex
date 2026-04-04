@@ -900,6 +900,20 @@ class BuildOrchestrator:
             source = idea.get("_source", "ideaforge")
             base_job_id = f"metroplex-{source}-{idea['id']}"
             attempt = state_db.count_failed_builds(base_job_id)
+
+            # Backoff guard: skip if this is a retry and the backoff timer
+            # hasn't expired yet. The priority_queue was reset to 'pending'
+            # by _reset_priority_queue_for_retry, but the actual backoff
+            # lives on build_jobs.next_retry_at. Without this check, every
+            # cycle (~60s) re-dispatches the build, bypassing the 5/20/60
+            # minute backoff schedule.
+            if attempt > 0 and state_db.is_backoff_active(base_job_id):
+                logger.info(
+                    "Skipping %s — backoff timer still active (attempt %d)",
+                    base_job_id, attempt,
+                )
+                continue
+
             job_id = f"{base_job_id}-r{attempt}" if attempt > 0 else base_job_id
             queued_at = datetime.now()
 

@@ -1199,6 +1199,30 @@ class StateDB:
         )
         return cursor.fetchone()[0]
 
+    def is_backoff_active(self, base_job_id: str) -> bool:
+        """Check if the latest failed build for this base_job_id has an
+        unexpired backoff timer. Used by run_from_queue to prevent
+        re-dispatching before the backoff window expires.
+
+        Returns True if next_retry_at is set and in the future.
+        """
+        self.connect()
+        cursor = self.conn.cursor()
+        cursor.execute(
+            "SELECT next_retry_at FROM build_jobs "
+            "WHERE base_job_id = ? AND status = 'failed' "
+            "ORDER BY id DESC LIMIT 1",
+            (base_job_id,),
+        )
+        row = cursor.fetchone()
+        if not row or not row[0] or row[0] == "abandoned":
+            return False
+        try:
+            retry_at = datetime.fromisoformat(row[0])
+            return datetime.now() < retry_at
+        except (ValueError, TypeError):
+            return False
+
     def get_retryable_builds(self) -> list[dict]:
         """Get failed builds eligible for automatic retry.
 

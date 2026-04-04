@@ -90,13 +90,20 @@ class A2AAdapter:
 
             if "error" in data:
                 error_msg = data["error"].get("message", "A2A RPC error")
+                error_code = data["error"].get("code", 0)
                 self._record_failure()
+                logger.error(
+                    "A2A server error for %s: code=%s msg=%s",
+                    job_id, error_code, error_msg,
+                )
                 if self.event_emitter:
                     self.event_emitter.emit("a2a_dispatch_failed", {
                         "job_id": job_id, "error": error_msg,
+                        "error_code": error_code,
                     })
                 return BuildAdapterResult(
-                    job_id=job_id, status="failed", runtime=self.runtime, error=error_msg,
+                    job_id=job_id, status="failed", runtime=self.runtime,
+                    error=f"A2A server error (code={error_code}): {error_msg}",
                 )
 
             # Extract task_id from response
