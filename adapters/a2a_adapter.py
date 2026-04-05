@@ -115,6 +115,20 @@ class A2AAdapter:
             self._consecutive_failures = 0
             return BuildAdapterResult(job_id=job_id, status="queued", runtime=self.runtime)
 
+        except httpx.ReadTimeout:
+            # The A2A server accepted the request (TCP connected, headers
+            # sent) but is still processing. The server's execute() runs
+            # queue_runner add + start, which takes longer than the HTTP
+            # timeout. Treat as "queued" -- the poll loop will pick up
+            # the actual result later.
+            logger.info(
+                "A2A dispatch for %s timed out waiting for response -- "
+                "treating as queued (server is processing)",
+                job_id,
+            )
+            self._consecutive_failures = 0
+            return BuildAdapterResult(job_id=job_id, status="queued", runtime=self.runtime)
+
         except (httpx.HTTPError, json.JSONDecodeError, Exception) as e:
             self._record_failure()
             error_msg = str(e)

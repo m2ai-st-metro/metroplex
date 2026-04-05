@@ -104,6 +104,21 @@ class TestA2AAdapterQueue:
         assert result.status == "failed"
         assert adapter._consecutive_failures == 1
 
+    def test_queue_read_timeout_treated_as_queued(self, adapter, tmp_spec):
+        """ReadTimeout means server accepted but is still processing -- treat as queued."""
+        import httpx
+        with patch("adapters.a2a_adapter.httpx.Client") as mock_client_cls:
+            mock_client = MagicMock()
+            mock_client.__enter__ = MagicMock(return_value=mock_client)
+            mock_client.__exit__ = MagicMock(return_value=False)
+            mock_client.post.side_effect = httpx.ReadTimeout("timed out")
+            mock_client_cls.return_value = mock_client
+
+            result = adapter.queue(tmp_spec, "job-timeout", "haiku")
+
+        assert result.status == "queued"
+        assert adapter._consecutive_failures == 0  # Not a failure
+
 
 class TestA2AAdapterPoll:
     def test_poll_returns_jobs(self, adapter):
