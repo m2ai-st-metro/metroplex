@@ -141,8 +141,19 @@ class A2AAdapter:
             )
 
     def poll(self) -> dict:
-        """Poll all tracked tasks for status updates."""
+        """Poll for build status updates.
+
+        Two-tier polling:
+        1. A2A task_map: query the A2A server for tracked tasks (works when
+           the adapter dispatched and received a task_id in the same process).
+        2. queue.json fallback: read YCE's queue file directly for any
+           metroplex-* jobs. This handles ReadTimeout dispatches (no task_id)
+           and adapter restarts (task_map lost).
+        """
         jobs = []
+        seen_job_ids = set()
+
+        # Tier 1: A2A task_map polling (existing behavior)
         for task_id, job_id in list(self._task_map.items()):
             payload = {
                 "jsonrpc": "2.0",
@@ -190,6 +201,7 @@ class A2AAdapter:
                                     pass
 
                 jobs.append(job_info)
+                seen_job_ids.add(job_id)
 
                 # Clean up terminal tasks
                 if metroplex_status in ("completed", "failed"):
@@ -201,6 +213,31 @@ class A2AAdapter:
 
             except (httpx.HTTPError, Exception) as e:
                 logger.warning("Failed to poll task %s: %s", task_id, e)
+
+        # Tier 2: queue.json fallback for jobs not tracked via A2A task_map.
+        # Covers ReadTimeout dispatches and adapter restarts.
+        queue_file = Path(self.config.yce_dir) / "data" / "queue.json"
+        try:
+            if queue_file.exists():
+                queue_data = json.loads(queue_file.read_text())
+                for job_data in queue_data.get("jobs", []):
+                    job_id = job_data.get("id", "")
+                    if not job_id.startswith("metroplex-"):
+                        continue
+                    if job_id in seen_job_ids:
+                        continue
+                    yce_status = job_data.get("status", "")
+                    if yce_status in ("completed", "failed"):
+                        job_info = {
+                            "job_id": job_id,
+                            "status": yce_status,
+                            "project_dir": job_data.get("project_dir", ""),
+                        }
+                        jobs.append(job_info)
+                    elif yce_status in ("running", "pending"):
+                        jobs.append({"job_id": job_id, "status": "running"})
+        except (json.JSONDecodeError, OSError) as e:
+            logger.warning("Failed to read queue.json fallback: %s", e)
 
         return {"jobs": jobs}
 

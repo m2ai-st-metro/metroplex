@@ -139,7 +139,8 @@ class TestA2AAdapterPoll:
             },
         }
 
-        with patch("adapters.a2a_adapter.httpx.Client") as mock_client_cls:
+        with patch("adapters.a2a_adapter.httpx.Client") as mock_client_cls, \
+             patch("adapters.a2a_adapter.Path.exists", return_value=False):
             mock_client = MagicMock()
             mock_client.__enter__ = MagicMock(return_value=mock_client)
             mock_client.__exit__ = MagicMock(return_value=False)
