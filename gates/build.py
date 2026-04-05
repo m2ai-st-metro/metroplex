@@ -129,18 +129,32 @@ class SpecGenerator:
             except Exception as e:
                 logger.warning("Failed to fetch failure patterns for spec feedback: %s", e)
 
-        try:
-            rendered_spec = self.llm_expander.expand(idea, failure_patterns=failure_patterns)
-        except Exception as e:
-            raise RuntimeError(
-                f"LLM expansion failed for idea {idea['id']} ({idea['title']}): {e}"
-            ) from e
+        # Retry loop: Nemotron-3 leaks CoT ~43% of the time and occasionally
+        # parrots prompt instructions. These are stochastic -- a second call
+        # usually produces a clean spec. Retry here instead of burning a
+        # build-level retry on spec generation failures.
+        max_spec_attempts = 3
+        last_rejection = ""
+        for spec_attempt in range(max_spec_attempts):
+            try:
+                rendered_spec = self.llm_expander.expand(idea, failure_patterns=failure_patterns)
+            except Exception as e:
+                raise RuntimeError(
+                    f"LLM expansion failed for idea {idea['id']} ({idea['title']}): {e}"
+                ) from e
 
-        # Post-generation validation: reject bad specs instead of falling back to generic template
-        is_valid, rejection_reason = validate_spec(rendered_spec)
-        if not is_valid:
+            is_valid, rejection_reason = validate_spec(rendered_spec)
+            if is_valid:
+                break
+            last_rejection = rejection_reason
+            logger.warning(
+                "Spec validation failed for idea %s (attempt %d/%d): %s",
+                idea["id"], spec_attempt + 1, max_spec_attempts, rejection_reason,
+            )
+        else:
             raise ValueError(
-                f"LLM spec rejected for idea {idea['id']} ({idea['title']}): {rejection_reason}"
+                f"LLM spec rejected for idea {idea['id']} ({idea['title']}) "
+                f"after {max_spec_attempts} attempts: {last_rejection}"
             )
 
         output_path.write_text(rendered_spec, encoding="utf-8")
