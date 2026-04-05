@@ -43,7 +43,7 @@ def _get_client():
 def submit_to_oz(
     idea: dict,
     environment_id: str,
-    model_id: str = "claude-sonnet-4-20250514",
+    model_id: str = "claude-sonnet-4-6",
     dry_run: bool = False,
 ) -> Optional[str]:
     """Submit a triaged idea to Oz cloud agent for building.

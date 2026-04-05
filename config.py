@@ -118,7 +118,7 @@ class Config:
 
     # Tyrest QA gate (GPT-based independent review)
     tyrest_enabled: bool = field(default=True)
-    tyrest_model: str = field(default="gpt-4.1")
+    tyrest_model: str = field(default="gpt-5.4-mini")
     tyrest_approve_confidence: float = field(default=0.75)
     tyrest_reject_confidence: float = field(default=0.75)
 
@@ -366,7 +366,7 @@ class Config:
     # Oz Cloud Agent settings
     build_target: str = field(default="local")  # local|cloud|a2a|auto
     oz_environment_id: str = field(default="")
-    oz_build_model: str = field(default="claude-sonnet-4-20250514")
+    oz_build_model: str = field(default="claude-sonnet-4-6")
 
     # A2A server settings
     a2a_server_url: str = field(default="http://127.0.0.1:18900")

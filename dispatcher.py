@@ -206,7 +206,7 @@ class OzCloudDispatcher:
     """Dispatches tasks to Oz cloud agents. Used for batch/background work
     that doesn't need Telegram interaction."""
 
-    def __init__(self, environment_id: str, model_id: str = "claude-sonnet-4-20250514"):
+    def __init__(self, environment_id: str, model_id: str = "claude-sonnet-4-6"):
         self.environment_id = environment_id
         self.model_id = model_id
         self._runs: dict[str, str] = {}  # task_id -> oz_run_id
@@ -265,7 +265,7 @@ def create_dispatcher(
     dispatch_db: str,
     dispatch_chat_id: str,
     oz_environment_id: str = "",
-    oz_build_model: str = "claude-sonnet-4-20250514",
+    oz_build_model: str = "claude-sonnet-4-6",
 ) -> Dispatcher:
     """
     Factory: create the appropriate dispatcher based on config.
@@ -287,7 +287,7 @@ def create_dispatcher(
         return LogDispatcher()
 
 
-def create_oz_dispatcher(environment_id: str, model_id: str = "claude-sonnet-4-20250514") -> OzCloudDispatcher:
+def create_oz_dispatcher(environment_id: str, model_id: str = "claude-sonnet-4-6") -> OzCloudDispatcher:
     """Create an Oz cloud dispatcher for overflow/background work."""
     return OzCloudDispatcher(environment_id, model_id)
 
