@@ -538,6 +538,19 @@ class BuildOrchestrator:
 
             if job_status == "running":
                 result["running"].append(job_id)
+                # Fix A: transition queued → started so the stale-queued recovery
+                # (30-min threshold) doesn't destroy rows for legitimately long
+                # Opus builds (40-70 min). The status check constraint allows
+                # 'started' — see db.py CHECK IN ('queued','started','completed','failed').
+                try:
+                    if self.state_db.update_build_job_status(job_id, "started"):
+                        result["newly_synced"].append(job_id)
+                except Exception as e:
+                    self.audit_logger.log_error(
+                        gate="build",
+                        error=f"Failed to sync running status for {job_id}: {e}",
+                        details={"job_id": job_id}
+                    )
             elif job_status == "completed":
                 result["completed"].append(job_id)
                 try:
@@ -615,11 +628,37 @@ class BuildOrchestrator:
                             details={"job_id": job_id},
                         )
 
+        # Fix C: Before checking for stale queued builds, read the YCE
+        # queue.json directly to find jobs the runner is ACTIVELY working on.
+        # Without this, a build that just transitioned to running in YCE but
+        # hasn't been picked up by this poll's `check_status()` snapshot could
+        # still be classified stale and marked abandoned.  Excluding these
+        # IDs from the stale check prevents that race.
+        excluded_running_jobs: set[str] = set()
+        try:
+            yce_queue_path = Path(self.config.yce_dir) / "data" / "queue.json"
+            if yce_queue_path.exists():
+                with open(yce_queue_path, "r", encoding="utf-8") as f:
+                    yce_jobs = json.load(f)
+                for yj in yce_jobs:
+                    if yj.get("status") in ("running", "pending"):
+                        yjid = yj.get("job_id") or yj.get("id")
+                        if yjid:
+                            excluded_running_jobs.add(yjid)
+        except Exception as e:
+            self.audit_logger.log_error(
+                gate="build",
+                error=f"Failed to read YCE queue.json for stale exclusion: {e}",
+                details={},
+            )
+
         # Stale queued build recovery: detect builds stuck in 'queued' status
         # where priority_queue says 'dispatched' but the YCE runner never picked
         # them up.  Reset to 'pending' so the next cycle re-dispatches.
         try:
-            stale_builds = self.state_db.get_stale_queued_builds()
+            stale_builds = self.state_db.get_stale_queued_builds(
+                exclude_job_ids=excluded_running_jobs
+            )
             for sb in stale_builds:
                 job_id = sb["queue_job_id"]
                 logger.warning(

@@ -800,7 +800,10 @@ class TestBuildOrchestrator:
             assert result["running_count"] == 1
             assert "metroplex-ideaforge-5" in result["newly_synced"]
             assert "metroplex-skylynx-sl-abc" in result["newly_synced"]
-            assert mock_state_db.update_build_job_status.call_count == 2
+            # Fix A: running jobs now also get an update_build_job_status call
+            # (transition queued → started). 2 completed + 1 running = 3 calls.
+            assert "metroplex-linear-TOO-42" in result["newly_synced"]
+            assert mock_state_db.update_build_job_status.call_count == 3
 
     def test_poll_and_sync_unexpected_status_ignored(self, orchestrator, mock_state_db, mock_audit_logger):
         """Jobs with unexpected status are not categorized."""
@@ -818,8 +821,9 @@ class TestBuildOrchestrator:
             assert "metroplex-ideaforge-1" not in result["completed"]
             assert "metroplex-ideaforge-2" in result["newly_synced"]
 
-    def test_poll_and_sync_all_running_no_sync(self, orchestrator, mock_state_db, mock_audit_logger):
-        """When all jobs are running, no DB sync calls are made."""
+    def test_poll_and_sync_all_running_writes_started(self, orchestrator, mock_state_db, mock_audit_logger):
+        """Fix A: running jobs transition queued → started so stale-queued
+        recovery doesn't destroy rows for long-running Opus builds."""
         status_dict = {
             "jobs": [
                 {"id": "metroplex-ideaforge-1", "status": "running"},
@@ -828,11 +832,18 @@ class TestBuildOrchestrator:
         }
         with patch.object(orchestrator, 'check_status', return_value=status_dict), \
              patch.object(orchestrator, 'is_runner_active', return_value=True):
-            mock_state_db.update_build_job_status = Mock()
+            mock_state_db.update_build_job_status = Mock(return_value=True)
             result = orchestrator.poll_and_sync_status()
             assert result["running_count"] == 2
-            assert result["newly_synced"] == []
-            mock_state_db.update_build_job_status.assert_not_called()
+            # Both running jobs should have been marked 'started'
+            assert mock_state_db.update_build_job_status.call_count == 2
+            started_calls = [
+                c for c in mock_state_db.update_build_job_status.call_args_list
+                if c[0][1] == "started"
+            ]
+            assert len(started_calls) == 2
+            assert "metroplex-ideaforge-1" in result["newly_synced"]
+            assert "metroplex-skylynx-sl-x" in result["newly_synced"]
 
     def test_poll_and_sync_db_error_continues(self, orchestrator, mock_state_db, mock_audit_logger):
         """A DB error syncing one job does not prevent syncing others."""
@@ -918,6 +929,100 @@ class TestBuildOrchestrator:
         # Should still return a valid result
         assert result["running"] == []
         mock_audit_logger.log_error.assert_called()
+
+    # --- Fix A: running jobs transition queued → started ---
+
+    def test_fix_a_running_job_marked_started(self, orchestrator, mock_state_db, mock_audit_logger):
+        """A running job triggers update_build_job_status(job_id, 'started')."""
+        status_dict = {"jobs": [{"id": "metroplex-ideaforge-38", "status": "running"}]}
+        with patch.object(orchestrator, 'check_status', return_value=status_dict), \
+             patch.object(orchestrator, 'is_runner_active', return_value=True):
+            mock_state_db.update_build_job_status = Mock(return_value=True)
+            result = orchestrator.poll_and_sync_status()
+            mock_state_db.update_build_job_status.assert_called_once_with(
+                "metroplex-ideaforge-38", "started"
+            )
+            assert "metroplex-ideaforge-38" in result["newly_synced"]
+            assert result["running"] == ["metroplex-ideaforge-38"]
+
+    def test_fix_a_running_sync_error_is_logged_not_raised(self, orchestrator, mock_state_db, mock_audit_logger):
+        """If update_build_job_status raises, error is logged and poll continues."""
+        status_dict = {
+            "jobs": [
+                {"id": "metroplex-ideaforge-99", "status": "running"},
+                {"id": "metroplex-ideaforge-100", "status": "completed"},
+            ]
+        }
+        def side_effect(job_id, status):
+            if status == "started":
+                raise Exception("DB busy")
+            return True
+        with patch.object(orchestrator, 'check_status', return_value=status_dict), \
+             patch.object(orchestrator, 'is_runner_active', return_value=True):
+            mock_state_db.update_build_job_status = Mock(side_effect=side_effect)
+            result = orchestrator.poll_and_sync_status()
+            assert "metroplex-ideaforge-99" in result["running"]
+            # Completed job should still sync
+            assert "metroplex-ideaforge-100" in result["newly_synced"]
+            mock_audit_logger.log_error.assert_called()
+
+    # --- Fix C: YCE queue.json read excludes running jobs from stale check ---
+
+    def test_fix_c_excludes_running_yce_jobs_from_stale(self, orchestrator, mock_state_db, mock_audit_logger, tmp_path):
+        """Jobs marked running in YCE queue.json are excluded from stale check."""
+        yce_dir = tmp_path / "yce"
+        (yce_dir / "data").mkdir(parents=True)
+        queue_path = yce_dir / "data" / "queue.json"
+        queue_path.write_text(json.dumps([
+            {"job_id": "metroplex-ideaforge-38", "status": "running"},
+            {"job_id": "metroplex-ideaforge-50", "status": "pending"},
+        ]))
+        orchestrator.config.yce_dir = str(yce_dir)
+
+        mock_state_db.get_stale_queued_builds = Mock(return_value=[])
+
+        with patch.object(orchestrator, 'check_status', return_value={"jobs": []}), \
+             patch.object(orchestrator, 'is_runner_active', return_value=False):
+            orchestrator.poll_and_sync_status()
+
+        # Verify get_stale_queued_builds was called with the running set
+        mock_state_db.get_stale_queued_builds.assert_called_once()
+        kwargs = mock_state_db.get_stale_queued_builds.call_args.kwargs
+        assert "exclude_job_ids" in kwargs
+        assert "metroplex-ideaforge-38" in kwargs["exclude_job_ids"]
+        assert "metroplex-ideaforge-50" in kwargs["exclude_job_ids"]
+
+    def test_fix_c_missing_yce_queue_does_not_crash(self, orchestrator, mock_state_db, mock_audit_logger, tmp_path):
+        """If YCE queue.json is missing, stale check still runs with empty exclude set."""
+        yce_dir = tmp_path / "yce-missing"
+        yce_dir.mkdir()
+        orchestrator.config.yce_dir = str(yce_dir)
+
+        mock_state_db.get_stale_queued_builds = Mock(return_value=[])
+
+        with patch.object(orchestrator, 'check_status', return_value={"jobs": []}), \
+             patch.object(orchestrator, 'is_runner_active', return_value=False):
+            orchestrator.poll_and_sync_status()
+
+        mock_state_db.get_stale_queued_builds.assert_called_once()
+        kwargs = mock_state_db.get_stale_queued_builds.call_args.kwargs
+        assert kwargs.get("exclude_job_ids") == set()
+
+    def test_fix_c_malformed_yce_queue_logs_error(self, orchestrator, mock_state_db, mock_audit_logger, tmp_path):
+        """A malformed queue.json is logged but poll continues."""
+        yce_dir = tmp_path / "yce-bad"
+        (yce_dir / "data").mkdir(parents=True)
+        (yce_dir / "data" / "queue.json").write_text("{not json")
+        orchestrator.config.yce_dir = str(yce_dir)
+
+        mock_state_db.get_stale_queued_builds = Mock(return_value=[])
+
+        with patch.object(orchestrator, 'check_status', return_value={"jobs": []}), \
+             patch.object(orchestrator, 'is_runner_active', return_value=False):
+            orchestrator.poll_and_sync_status()
+
+        mock_audit_logger.log_error.assert_called()
+        mock_state_db.get_stale_queued_builds.assert_called_once()
 
     def test_run_from_queue_capacity_dispatch(self, mock_state_db, mock_spec_generator, mock_audit_logger):
         """Test run_from_queue dispatches up to max_approve_per_cycle items."""

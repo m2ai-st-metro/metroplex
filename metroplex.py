@@ -4,6 +4,9 @@ Metroplex CLI - Autonomous Build Layer Entry Point
 Orchestrates triage, build, and patch gates with safety systems.
 """
 import sys
+import os
+import fcntl
+import atexit
 import argparse
 import json
 from pathlib import Path
@@ -1402,6 +1405,46 @@ def cmd_ego(args, config: Config):
     return 0
 
 
+_SINGLE_INSTANCE_LOCK_FH = None
+
+
+def _acquire_single_instance_lock():
+    """Acquire an exclusive flock to prevent concurrent run-all instances.
+
+    Fix D1: two run-all processes racing on the same metroplex.db cause
+    interleaved dispatches and duplicate polls that corrupt build state.
+    We use a POSIX flock on data/metroplex.lock; if a second process starts
+    while one already holds it, the second exits with code 2.
+    """
+    global _SINGLE_INSTANCE_LOCK_FH
+    lock_dir = Path(__file__).parent / "data"
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    lock_path = lock_dir / "metroplex.lock"
+    fh = open(lock_path, "w")
+    try:
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        print(
+            f"ERROR: another metroplex run-all is already holding {lock_path}. Exiting.",
+            file=sys.stderr,
+        )
+        fh.close()
+        sys.exit(2)
+    fh.write(str(os.getpid()))
+    fh.flush()
+    _SINGLE_INSTANCE_LOCK_FH = fh
+
+    def _release():
+        try:
+            if _SINGLE_INSTANCE_LOCK_FH is not None:
+                fcntl.flock(_SINGLE_INSTANCE_LOCK_FH.fileno(), fcntl.LOCK_UN)
+                _SINGLE_INSTANCE_LOCK_FH.close()
+        except Exception:
+            pass
+
+    atexit.register(_release)
+
+
 def main():
     """Main CLI entry point."""
     parser = argparse.ArgumentParser(
@@ -1532,6 +1575,12 @@ def main():
     elif args.command == "patch":
         sys.exit(cmd_patch(args, config))
     elif args.command == "run-all":
+        # Single-instance lock: prevent dual metroplex daemons writing to
+        # the same SQLite DB (Bug 2 — April 3 orphan process).
+        # Dry runs are exempt — they don't modify DB state and tests
+        # expect to run them alongside a live daemon.
+        if not getattr(args, "dry_run", False):
+            _acquire_single_instance_lock()
         sys.exit(cmd_run_all(args, config))
     elif args.command == "queue":
         sys.exit(cmd_queue(args, config))

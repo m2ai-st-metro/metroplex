@@ -4,6 +4,8 @@ After=network.target
 
 [Service]
 Type=simple
+ExecStartPre=-/usr/bin/pkill -TERM -f "python metroplex.py run-all"
+ExecStartPre=/bin/sleep 2
 ExecStart=%h/projects/metroplex/venv/bin/python %h/projects/metroplex/metroplex.py run-all --cycles 0
 WorkingDirectory=%h/projects/metroplex
 EnvironmentFile=-%h/.env.shared

@@ -1122,7 +1122,7 @@ class StateDB:
 
     STALE_QUEUED_THRESHOLD_MINUTES = 30
 
-    def get_stale_queued_builds(self) -> list[dict]:
+    def get_stale_queued_builds(self, exclude_job_ids: set[str] | None = None) -> list[dict]:
         """Get builds stuck in 'queued' status past the staleness threshold.
 
         A build is stale-queued when:
@@ -1130,6 +1130,12 @@ class StateDB:
         - queued_at is older than STALE_QUEUED_THRESHOLD_MINUTES ago
         - The corresponding priority_queue item has status = 'dispatched'
           (meaning the dispatch loop won't re-pick it up)
+
+        Args:
+            exclude_job_ids: Optional set of queue_job_ids to exclude from the
+                result. Used by the poller to skip builds that are actively
+                running in the YCE queue.json, so a race between DB snapshot
+                and runner status doesn't kill a live build.
 
         Returns:
             List of dicts with queue_job_id, idea_id, title, queued_at,
@@ -1163,17 +1169,24 @@ class StateDB:
             WHERE b.status = 'queued'
               AND b.queued_at < ?
         """, (cutoff, cutoff))
-        return [dict(row) for row in cursor.fetchall()]
+        rows = [dict(row) for row in cursor.fetchall()]
+        if exclude_job_ids:
+            rows = [r for r in rows if r["queue_job_id"] not in exclude_job_ids]
+        return rows
 
     def reset_stale_queued_build(self, queue_job_id: str, priority_queue_id: int):
-        """Reset a stale queued build so it can be re-dispatched.
+        """Mark a stale queued build as abandoned, preserving lineage.
 
-        Deletes the stale build_jobs row and resets the priority_queue
-        item back to 'pending'.
+        Fix B: previously DELETED the row, which destroyed feasibility
+        linkage and any late writeback from YCE. Now we UPDATE in place,
+        setting status='failed' and next_retry_at='abandoned' (same sentinel
+        used elsewhere to block retries). The priority_queue item resets
+        to 'pending' so other ideas can advance.
         """
         self.connect()
         self.conn.execute(
-            "DELETE FROM build_jobs WHERE queue_job_id = ? AND status = 'queued'",
+            "UPDATE build_jobs SET status = 'failed', next_retry_at = 'abandoned' "
+            "WHERE queue_job_id = ? AND status = 'queued'",
             (queue_job_id,),
         )
         self.conn.execute(

@@ -613,3 +613,91 @@ class TestPriorityQueue:
         cursor = db.conn.cursor()
         cursor.execute("SELECT status FROM priority_queue WHERE source_id = '10'")
         assert cursor.fetchone()["status"] == "dispatched"  # Unchanged
+
+
+class TestStaleQueuedBuildRecovery:
+    """Fix B / Fix C: stale queued build recovery no longer destroys rows."""
+
+    def _enqueue_and_dispatch(self, db, idea_id: int, title: str = "T"):
+        item = PriorityItem(
+            source="ideaforge",
+            source_id=str(idea_id),
+            title=title,
+            description="d",
+            priority_score=70.0,
+        )
+        pq_id = db.enqueue_item(item)
+        db.update_item_status(pq_id, "dispatched", "dispatched_at")
+        return pq_id
+
+    def _record_stale_queued_job(self, db, idea_id: int, queue_job_id: str):
+        """Insert a build_jobs row with a queued_at old enough to be stale."""
+        from datetime import timedelta
+        stale_time = datetime.now() - timedelta(
+            minutes=StateDB.STALE_QUEUED_THRESHOLD_MINUTES + 5
+        )
+        job = BuildJob(
+            idea_id=idea_id,
+            title=f"Idea {idea_id}",
+            spec_path="/tmp/spec.txt",
+            queue_job_id=queue_job_id,
+            status="queued",
+            queued_at=stale_time,
+        )
+        db.record_build_job(job)
+
+    def test_reset_stale_queued_build_preserves_row(self, db):
+        """Fix B: reset_stale_queued_build must UPDATE the row, not delete it."""
+        pq_id = self._enqueue_and_dispatch(db, 77, title="Preserve Me")
+        self._record_stale_queued_job(db, 77, "metroplex-ideaforge-77")
+
+        db.reset_stale_queued_build("metroplex-ideaforge-77", pq_id)
+
+        cursor = db.conn.cursor()
+        cursor.execute(
+            "SELECT status, next_retry_at FROM build_jobs WHERE queue_job_id = ?",
+            ("metroplex-ideaforge-77",),
+        )
+        row = cursor.fetchone()
+        assert row is not None, "build_jobs row must be preserved, not deleted"
+        assert row["status"] == "failed"
+        assert row["next_retry_at"] == "abandoned"
+
+        cursor.execute(
+            "SELECT status, dispatched_at FROM priority_queue WHERE id = ?",
+            (pq_id,),
+        )
+        pq_row = cursor.fetchone()
+        assert pq_row["status"] == "pending"
+        assert pq_row["dispatched_at"] is None
+
+    def test_reset_stale_queued_build_excluded_from_retry(self, db):
+        """Fix B: abandoned stale builds must not appear in get_retryable_builds."""
+        pq_id = self._enqueue_and_dispatch(db, 88)
+        self._record_stale_queued_job(db, 88, "metroplex-ideaforge-88")
+        db.reset_stale_queued_build("metroplex-ideaforge-88", pq_id)
+
+        retryable = db.get_retryable_builds()
+        ids = [r["queue_job_id"] for r in retryable]
+        assert "metroplex-ideaforge-88" not in ids
+
+    def test_get_stale_queued_builds_honors_exclude_set(self, db):
+        """Fix C: exclude_job_ids filters out live-running jobs."""
+        pq_a = self._enqueue_and_dispatch(db, 101, title="Live")
+        pq_b = self._enqueue_and_dispatch(db, 102, title="Really Stale")
+        self._record_stale_queued_job(db, 101, "metroplex-ideaforge-101")
+        self._record_stale_queued_job(db, 102, "metroplex-ideaforge-102")
+
+        # Without exclusion, both should be stale
+        stale_all = db.get_stale_queued_builds()
+        ids_all = {r["queue_job_id"] for r in stale_all}
+        assert "metroplex-ideaforge-101" in ids_all
+        assert "metroplex-ideaforge-102" in ids_all
+
+        # With exclusion of 101, only 102 should remain
+        stale_filtered = db.get_stale_queued_builds(
+            exclude_job_ids={"metroplex-ideaforge-101"}
+        )
+        ids_filtered = {r["queue_job_id"] for r in stale_filtered}
+        assert "metroplex-ideaforge-101" not in ids_filtered
+        assert "metroplex-ideaforge-102" in ids_filtered
