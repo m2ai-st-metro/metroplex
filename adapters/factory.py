@@ -17,6 +17,9 @@ def create_adapter(config: Config, event_emitter=None) -> BuildAdapter:
     elif config.build_target == "a2a":
         from adapters.a2a_adapter import A2AAdapter
         return A2AAdapter(config, event_emitter=event_emitter)
+    elif config.build_target == "self_healing":
+        from adapters.self_healing_adapter import SelfHealingAdapter
+        return SelfHealingAdapter(config)
     elif config.build_target == "auto":
         # Try A2A first, fall back to local
         from adapters.a2a_adapter import A2AAdapter

@@ -313,8 +313,12 @@ class Config:
 
         # Oz Cloud Agent settings
         self.build_target = os.environ.get("METROPLEX_BUILD_TARGET", self.build_target)
-        if self.build_target not in ("local", "cloud", "a2a", "auto"):
+        if self.build_target not in ("local", "cloud", "a2a", "auto", "self_healing"):
             self.build_target = "local"
+        self.self_healing_workspace_root = os.environ.get(
+            "METROPLEX_SELF_HEALING_WORKSPACE_ROOT",
+            getattr(self, "self_healing_workspace_root", ""),
+        )
         self.oz_environment_id = os.environ.get("METROPLEX_OZ_ENVIRONMENT_ID", self.oz_environment_id)
         self.oz_build_model = os.environ.get("METROPLEX_OZ_BUILD_MODEL", self.oz_build_model)
         self.a2a_server_url = os.environ.get("METROPLEX_A2A_SERVER_URL", self.a2a_server_url)
