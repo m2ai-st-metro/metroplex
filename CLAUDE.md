@@ -340,6 +340,20 @@ If the heartbeat is stale, `SelfHealingAdapter.is_active()` returns False and
 `start()` logs a clear warning instead of silently queuing. Metroplex's build
 gate will not dispatch new jobs until the daemon is running again.
 
+**Smoke test:** validate the adapter<->daemon seam end-to-end with a trivial
+build. With the daemon running in a separate terminal, from the metroplex
+venv run:
+
+```bash
+python scripts/smoke_test_self_healing.py
+```
+
+The script queues a hand-crafted calculator spec, polls until terminal
+state, and prints a green SUCCESS block (exit 0) or a FAILED/TIMEOUT block
+with the workspace path for debugging. Exit codes: 0 pass, 1 fail, 2
+timeout, 3 daemon-down. Run weekly or before any change to
+`adapters/self_healing_adapter.py` or the self-healing-daemon skill.
+
 ### Manual Retry
 
 ```bash
