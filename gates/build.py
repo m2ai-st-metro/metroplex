@@ -261,6 +261,20 @@ class BuildOrchestrator:
         queued_at = datetime.now()
         error_msg = None
 
+        if (
+            self.config.build_target == "self_healing"
+            and self.adapter is not None
+            and not self.adapter.is_active()
+        ):
+            logger.warning(
+                "BuildGate: self-healing daemon heartbeat is stale — skipping "
+                "dispatch of %s. Start the daemon with: "
+                "`(cd /home/apexaipc/projects/metroplex && claude)` then "
+                "`/self-healing-daemon start`.",
+                job_id,
+            )
+            return None
+
         if self.adapter is not None:
             # Delegate to pluggable adapter
             result = self.adapter.queue(
@@ -1174,6 +1188,13 @@ class BuildOrchestrator:
 
                     # Queue build via YCE queue_runner
                     job = self.queue_build(idea, spec_path, dry_run=dry_run, attempt=attempt)
+                    if job is None:
+                        # Skip dispatch (e.g., self-healing daemon down). Release the
+                        # priority-queue claim so the next cycle re-attempts without
+                        # burning the retry budget.
+                        if not dry_run and item.id:
+                            state_db.release_claim(item.id)
+                        continue
                     if job:
                         # Store feasibility score on the build job (L5 B2)
                         feas = idea.get("_feasibility_score")

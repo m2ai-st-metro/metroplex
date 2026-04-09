@@ -1111,3 +1111,174 @@ class TestBuildOrchestrator:
             assert not pid_file.exists()
 
 
+class TestSelfHealingLivenessGuard:
+    """Tests for BuildGate liveness guard protecting the self-healing daemon path."""
+
+    @pytest.fixture
+    def mock_state_db(self):
+        db = Mock(spec=StateDB)
+        db.record_build_job = Mock()
+        db.release_claim = Mock()
+        db.update_item_status = Mock()
+        db.has_completed_build = Mock(return_value=False)
+        db.has_exhausted_retries = Mock(return_value=False)
+        db.count_failed_builds = Mock(return_value=0)
+        return db
+
+    @pytest.fixture
+    def mock_audit_logger(self):
+        logger = Mock(spec=AuditLogger)
+        logger.log_decision = Mock()
+        logger.log_error = Mock()
+        return logger
+
+    @pytest.fixture
+    def mock_spec_generator(self):
+        generator = Mock(spec=SpecGenerator)
+        mock_spec_path = Mock()
+        mock_spec_path.read_text.return_value = "test spec"
+        mock_spec_path.resolve.return_value = mock_spec_path
+        generator.generate_spec = Mock(return_value=mock_spec_path)
+        return generator
+
+    @pytest.fixture
+    def queued_result(self):
+        from build_adapter import BuildAdapterResult
+        return BuildAdapterResult(
+            job_id="metroplex-ideaforge-1",
+            status="queued",
+            runtime="self_healing",
+        )
+
+    def _make_orchestrator(self, build_target, mock_state_db, mock_spec_generator,
+                           mock_audit_logger, adapter):
+        config = Config()
+        config.build_target = build_target
+        config.max_approve_per_cycle = 1
+        return BuildOrchestrator(
+            config=config,
+            state_db=mock_state_db,
+            spec_generator=mock_spec_generator,
+            audit_logger=mock_audit_logger,
+            adapter=adapter,
+        )
+
+    def test_queue_build_skips_when_self_healing_daemon_down(
+        self, mock_state_db, mock_spec_generator, mock_audit_logger, tool_idea, caplog,
+    ):
+        from build_adapter import BuildAdapter
+        adapter = MagicMock(spec=BuildAdapter)
+        adapter.is_active.return_value = False
+        orch = self._make_orchestrator(
+            "self_healing", mock_state_db, mock_spec_generator, mock_audit_logger, adapter,
+        )
+
+        with caplog.at_level("WARNING", logger="gates.build"):
+            job = orch.queue_build(tool_idea, Path("/tmp/app_spec_1.txt"), dry_run=False)
+
+        assert job is None
+        adapter.queue.assert_not_called()
+        mock_state_db.record_build_job.assert_not_called()
+        combined = " ".join(rec.getMessage() for rec in caplog.records)
+        assert "self-healing daemon" in combined
+        assert "/self-healing-daemon start" in combined
+
+    def test_queue_build_dispatches_when_self_healing_daemon_up(
+        self, mock_state_db, mock_spec_generator, mock_audit_logger, tool_idea, queued_result,
+    ):
+        from build_adapter import BuildAdapter
+        adapter = MagicMock(spec=BuildAdapter)
+        adapter.is_active.return_value = True
+        adapter.queue.return_value = queued_result
+        orch = self._make_orchestrator(
+            "self_healing", mock_state_db, mock_spec_generator, mock_audit_logger, adapter,
+        )
+
+        job = orch.queue_build(tool_idea, Path("/tmp/app_spec_1.txt"), dry_run=False)
+
+        assert adapter.queue.call_count == 1
+        assert job is not None
+        assert job.queue_job_id == "metroplex-ideaforge-1"
+        assert job.status == "queued"
+        mock_state_db.record_build_job.assert_called_once()
+
+    def test_queue_build_local_target_ignores_heartbeat(
+        self, mock_state_db, mock_spec_generator, mock_audit_logger, tool_idea, queued_result,
+    ):
+        from build_adapter import BuildAdapter
+        adapter = MagicMock(spec=BuildAdapter)
+        adapter.is_active.return_value = False  # stale, but target is local
+        adapter.queue.return_value = queued_result
+        orch = self._make_orchestrator(
+            "local", mock_state_db, mock_spec_generator, mock_audit_logger, adapter,
+        )
+
+        job = orch.queue_build(tool_idea, Path("/tmp/app_spec_1.txt"), dry_run=False)
+
+        # Guard must be a no-op for non-self_healing targets
+        assert adapter.queue.call_count == 1
+        assert job is not None
+
+    def test_run_from_queue_releases_claim_when_daemon_down(
+        self, mock_state_db, mock_spec_generator, mock_audit_logger,
+    ):
+        from build_adapter import BuildAdapter
+        adapter = MagicMock(spec=BuildAdapter)
+        adapter.is_active.return_value = False
+        orch = self._make_orchestrator(
+            "self_healing", mock_state_db, mock_spec_generator, mock_audit_logger, adapter,
+        )
+
+        item = Mock(
+            id=42, source="ideaforge", source_id=10, title="Idea A",
+            description="A CLI tool that scans codebases for issues",
+            idea_data=json.dumps({
+                "id": 10, "title": "Idea A",
+                "description": "A CLI tool that scans codebases for issues",
+                "problem_statement": "P", "target_audience": "T",
+                "artifact_type": "tool",
+            }),
+        )
+        mock_state_db.claim_next_pending = Mock(side_effect=[item, None])
+
+        with patch.object(orch, 'start_queue_background'):
+            jobs = orch.run_from_queue(mock_state_db, dry_run=False)
+
+        mock_state_db.release_claim.assert_called_once_with(42)
+        adapter.queue.assert_not_called()
+        # update_item_status should NOT be invoked with "failed" for this item:
+        failed_calls = [
+            c for c in mock_state_db.update_item_status.call_args_list
+            if len(c.args) >= 2 and c.args[0] == 42 and c.args[1] == "failed"
+        ]
+        assert failed_calls == []
+        assert jobs == []
+
+    def test_skip_does_not_raise(
+        self, mock_state_db, mock_spec_generator, mock_audit_logger,
+    ):
+        from build_adapter import BuildAdapter
+        adapter = MagicMock(spec=BuildAdapter)
+        adapter.is_active.return_value = False
+        orch = self._make_orchestrator(
+            "self_healing", mock_state_db, mock_spec_generator, mock_audit_logger, adapter,
+        )
+
+        item = Mock(
+            id=7, source="ideaforge", source_id=7, title="Idea X",
+            description="A CLI tool that generates changelogs automatically",
+            idea_data=json.dumps({
+                "id": 7, "title": "Idea X",
+                "description": "A CLI tool that generates changelogs automatically",
+                "problem_statement": "P", "target_audience": "T",
+                "artifact_type": "tool",
+            }),
+        )
+        mock_state_db.claim_next_pending = Mock(side_effect=[item, None])
+
+        with patch.object(orch, 'start_queue_background'):
+            jobs = orch.run_from_queue(mock_state_db, dry_run=False)
+
+        assert jobs == []
+
+
