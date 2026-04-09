@@ -2,21 +2,27 @@
 Self-Healing Build Adapter — wraps the /self-healing-pipeline Planner/Builder/Judge
 loop behind the BuildAdapter Protocol.
 
-Phase C Step 1: SKELETON ONLY.
+Phase C Step 2: dispatch via file queue to a long-running Claude Code daemon
+session running the `self-healing-daemon` skill. The daemon reads job files
+from `<queue_root>/pending/`, invokes `/self-healing-pipeline` once per job,
+and writes terminal state back to `<target_dir>/.self-healing-pipeline/state.json`
+where this adapter's `poll()` reads it.
 
-This adapter provides:
-  - Protocol conformance (queue, poll, kill, is_active, start)
-  - Per-job workspace directories under `self_healing_workspace_root`
-  - State tracking via `.self-healing-pipeline/state.json` polling
-  - Status mapping from self-healing loop states to Metroplex build statuses
+Why a file-queue + persistent interactive session instead of a subprocess per
+build or an Agent SDK consumer:
 
-What is NOT wired in Step 1:
-  - The actual dispatch of the P/B/J loop (`_dispatch` raises NotImplementedError).
-    This is the single swap point for Step 2, where a long-running Claude Code
-    session daemon will receive dispatch requests via IPC and invoke the
-    /self-healing-pipeline skill. Keeping the loop in a persistent interactive
-    session avoids the ~87k-token headless boot tax measured 2026-04-08 and
-    keeps billing on Max OAuth rather than reopening the disabled API key.
+  - `claude -p` headless pays ~87k tokens boot tax per invocation (measured
+    2026-04-08) and would bleed ~$4/build on boot alone.
+  - Agent SDK `query()` draws from extra usage credits, not Max base
+    subscription (effective 2026-04-04). We deliberately stay off that path.
+  - An interactive Claude Code session pays boot tax once at startup and
+    processes many builds on Max base subscription before needing restart.
+
+The trade-off is that this adapter cannot auto-start the daemon (no TTY from
+a subprocess). The operator starts one `claude` session per day inside
+`/home/apexaipc/projects/metroplex/` and types `/self-healing-daemon start`.
+The adapter detects liveness via heartbeat-*.txt files that the daemon
+touches each loop iteration.
 
 State mapping (self-healing → Metroplex):
   - planning, building, judging → "running"
@@ -28,6 +34,8 @@ from __future__ import annotations
 
 import json
 import logging
+import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -35,6 +43,10 @@ from build_adapter import BuildAdapter, BuildAdapterResult
 from config import Config
 
 logger = logging.getLogger(__name__)
+
+# Heartbeat freshness window. The daemon loop sleeps 60s when idle, so any
+# interval >120s would catch one missed heartbeat plus normal jitter.
+HEARTBEAT_STALE_SECONDS = 120
 
 
 # Self-healing loop status (from .self-healing-pipeline/state.json) → Metroplex build-job status
@@ -63,11 +75,43 @@ class SelfHealingAdapter:
         workspace_root = getattr(
             config,
             "self_healing_workspace_root",
-            str(Path(__file__).parent.parent / "data" / "self_healing_workspaces"),
-        )
+            "",
+        ) or str(Path(__file__).parent.parent / "data" / "self_healing_workspaces")
         self.workspace_root = Path(workspace_root)
+        queue_root = getattr(
+            config,
+            "self_healing_queue_root",
+            "",
+        ) or str(Path(__file__).parent.parent / "data" / "self_healing_queue")
+        self.queue_root = Path(queue_root)
         # Internal tracking: job_id -> target workspace directory
         self._jobs: dict[str, Path] = {}
+
+    # -------------------------------------------------------- queue layout
+    @property
+    def pending_dir(self) -> Path:
+        return self.queue_root / "pending"
+
+    @property
+    def in_flight_dir(self) -> Path:
+        return self.queue_root / "in_flight" / "worker-1"
+
+    @property
+    def completed_dir(self) -> Path:
+        return self.queue_root / "completed"
+
+    @property
+    def failed_dir(self) -> Path:
+        return self.queue_root / "failed"
+
+    def _ensure_queue_dirs(self) -> None:
+        for d in (
+            self.pending_dir,
+            self.in_flight_dir,
+            self.completed_dir,
+            self.failed_dir,
+        ):
+            d.mkdir(parents=True, exist_ok=True)
 
     # ------------------------------------------------------------------ queue
     def queue(
@@ -78,12 +122,11 @@ class SelfHealingAdapter:
         parallel: bool = False,
         max_workers: int = 2,
     ) -> BuildAdapterResult:
-        """Create a workspace for this job, copy the spec in, and dispatch.
+        """Create a workspace for this job, copy the spec in, and write a job
+        file to the pending queue for the daemon to pick up.
 
-        In Step 1 `_dispatch` is a stub — calling `queue()` will raise until
-        Step 2 wires it to the daemon. The skeleton still creates the workspace
-        and spec copy so poll/kill/status-mapping logic can be exercised by
-        tests with hand-written state files.
+        This does NOT wait for the daemon to consume the job. Metroplex's
+        build gate polls via `poll()` on subsequent cycles.
         """
         try:
             target_dir = self._prepare_workspace(spec_path, job_id)
@@ -99,10 +142,6 @@ class SelfHealingAdapter:
             return BuildAdapterResult(
                 job_id=job_id, status="queued", runtime=self.runtime
             )
-        except NotImplementedError:
-            # Expected in Step 1 skeleton. Re-raise so callers see the clear
-            # "not wired yet" signal instead of a silent queued status.
-            raise
         except Exception as e:
             logger.error("SelfHealingAdapter.queue failed for %s: %s", job_id, e)
             return BuildAdapterResult(
@@ -129,17 +168,29 @@ class SelfHealingAdapter:
         parallel: bool,
         max_workers: int,
     ) -> None:
-        """SWAP POINT for Step 2.
+        """Write a job file to `<queue_root>/pending/<job_id>.json`.
 
-        Step 2 will replace this stub with an IPC call to a long-running
-        Claude Code session daemon that invokes `/self-healing-pipeline` with
-        the prepared spec and target_dir. The daemon will write the
-        `.self-healing-pipeline/state.json` that `poll()` reads.
+        The daemon loop in the `self-healing-daemon` skill reads this file,
+        moves it to `in_flight/worker-1/`, invokes `/self-healing-pipeline`,
+        and routes the finished job to `completed/` or `failed/`.
+
+        Written atomically via tmp + rename so the daemon never reads a
+        half-written file.
         """
-        raise NotImplementedError(
-            "SelfHealingAdapter dispatch is not yet wired. Step 2 will connect "
-            "this to a persistent Claude Code daemon (Path D from the Phase C "
-            "billing review) to avoid headless boot-tax overhead."
+        self._ensure_queue_dirs()
+        payload = {
+            "job_id": job_id,
+            "target_dir": str(target_dir),
+            "spec_path": str(spec_path),
+            "model": model,
+            "queued_at": datetime.now(timezone.utc).isoformat(),
+        }
+        job_file = self.pending_dir / f"{job_id}.json"
+        tmp_file = job_file.with_suffix(".json.tmp")
+        tmp_file.write_text(json.dumps(payload, indent=2))
+        tmp_file.rename(job_file)
+        logger.info(
+            "SelfHealingAdapter: dispatched %s to %s", job_id, job_file
         )
 
     # ------------------------------------------------------------------- poll
@@ -195,14 +246,35 @@ class SelfHealingAdapter:
 
     # ------------------------------------------------------------------- kill
     def kill(self, job_id: str) -> bool:
-        """Mark a tracked job as escalated so the next poll reports failed.
+        """Remove the job from the pending queue (if not yet claimed) and
+        mark its state.json as escalated.
 
-        Step 1: writes `status: "escalated"` into the job's state.json as a
-        best-effort signal. Step 2 will additionally signal the daemon to stop
-        any in-flight attempt.
+        If the daemon has already claimed the job (moved it to in_flight/),
+        this adapter cannot directly interrupt the running P/B/J loop. It
+        writes the escalated state as a best-effort signal; the Judge in the
+        current attempt will see its test contract as failing and route to
+        an escalate verdict on its own schedule. For immediate termination
+        the operator must restart the daemon session.
         """
         if job_id not in self._jobs:
             return False
+
+        # Remove from pending queue if the daemon has not picked it up yet.
+        pending_file = self.pending_dir / f"{job_id}.json"
+        if pending_file.exists():
+            try:
+                pending_file.unlink()
+                logger.info(
+                    "SelfHealingAdapter.kill: removed %s from pending queue",
+                    job_id,
+                )
+            except OSError as e:
+                logger.warning(
+                    "SelfHealingAdapter.kill: could not remove %s from pending: %s",
+                    job_id,
+                    e,
+                )
+
         target_dir = self._jobs[job_id]
         state_file = target_dir / ".self-healing-pipeline" / "state.json"
         try:
@@ -221,18 +293,43 @@ class SelfHealingAdapter:
 
     # -------------------------------------------------------------- lifecycle
     def is_active(self) -> bool:
-        """Step 1: skeleton is always "active" (no background runner yet).
+        """True if at least one daemon heartbeat file was touched within the
+        last HEARTBEAT_STALE_SECONDS (default 120s).
 
-        Step 2 will check whether the Claude Code daemon session is alive.
+        The daemon loop touches `heartbeat-worker-1.txt` at the top of every
+        iteration and again after each build completes. A stale heartbeat
+        means the daemon crashed, was killed, or the operator hasn't started
+        it yet today.
         """
-        return True
+        if not self.queue_root.exists():
+            return False
+        now = time.time()
+        for heartbeat in self.queue_root.glob("heartbeat-*.txt"):
+            try:
+                age = now - heartbeat.stat().st_mtime
+            except OSError:
+                continue
+            if age <= HEARTBEAT_STALE_SECONDS:
+                return True
+        return False
 
     def start(self, concurrency: int = 1) -> bool:
-        """Step 1: no-op, returns True.
+        """Cannot auto-start an interactive Claude Code session from a
+        subprocess — there is no TTY available. Instead, verify that a
+        daemon is already running via heartbeat, and if not, log a clear
+        message telling the operator how to start one manually.
 
-        Step 2 will boot the persistent Claude Code daemon session here.
+        Returns True if a daemon is live, False otherwise.
         """
-        logger.info(
-            "SelfHealingAdapter.start called (skeleton — daemon not yet wired)"
+        if self.is_active():
+            logger.info("SelfHealingAdapter: daemon already active")
+            return True
+        logger.warning(
+            "SelfHealingAdapter: no fresh heartbeat at %s. The self-healing "
+            "daemon cannot be auto-started from a subprocess (requires a TTY "
+            "for the interactive Claude Code session). Open a terminal in "
+            "%s and run `claude`, then type `/self-healing-daemon start`.",
+            self.queue_root,
+            Path(__file__).parent.parent,
         )
-        return True
+        return False

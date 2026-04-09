@@ -269,6 +269,77 @@ python metroplex.py reset --gate all
 
 Use `reset` when the root cause of failures has been fixed (e.g., API key rotated, upstream DB restored). Resetting without fixing the cause just burns through the breaker again.
 
+### Self-Healing Daemon (build_target=self_healing)
+
+When `METROPLEX_BUILD_TARGET=self_healing`, the build gate dispatches jobs to
+a long-running Claude Code daemon session via file queue. The daemon runs the
+`/self-healing-pipeline` Planner/Builder/Judge loop per build and pays boot
+tax once at session startup instead of per invocation. Billing stays on Max
+base subscription; Agent SDK and `claude -p` headless paths are deliberately
+avoided.
+
+**Starting the daemon (once per day, recommended):**
+
+```bash
+# In a dedicated terminal, NOT the one you use for other Claude Code work.
+# Must be started from inside the metroplex project dir — the skill is
+# project-scoped and only loads when claude finds .claude/skills/self-healing-daemon/.
+(cd /home/apexaipc/projects/metroplex && claude)
+```
+
+Inside that session, type:
+```
+/self-healing-daemon start
+```
+
+The daemon will create queue directories under `data/self_healing_queue/`,
+touch `heartbeat-worker-1.txt`, and enter its main loop. From a second
+terminal you can verify it is alive:
+
+```bash
+stat -c '%Y %n' /home/apexaipc/projects/metroplex/data/self_healing_queue/heartbeat-worker-1.txt
+# age should be under 120s while the daemon is running
+```
+
+**Stopping the daemon:**
+
+From inside the daemon session, type `/self-healing-daemon stop`. Or from any
+other shell:
+
+```bash
+touch /home/apexaipc/projects/metroplex/data/self_healing_queue/shutdown.flag
+```
+
+The daemon exits at the next loop iteration. In-flight builds finish first.
+
+**Daily restart discipline:** the parent session grows ~5-10k tokens per build.
+Past ~20 builds in a 200k session or ~100 in a 1M session, Claude Code
+auto-compaction fires. Compaction is safe but adds latency mid-build. Restart
+the daemon each morning to keep latency predictable and scrollback clean.
+
+**Mobile access:** the daemon session shows up in the Claude mobile app with
+a green dot (global remote control is enabled). Use the app to watch the
+daemon — scroll the session history to see what it is building — but do NOT
+type prompts into it. Each typed prompt interrupts the loop and eats context.
+For chat, open a separate session.
+
+**Diagnosing a stalled daemon:**
+
+```bash
+# Is the heartbeat fresh?
+find /home/apexaipc/projects/metroplex/data/self_healing_queue -name 'heartbeat-*.txt' -mmin -2
+
+# What's in the queue?
+ls -la /home/apexaipc/projects/metroplex/data/self_healing_queue/pending/
+ls -la /home/apexaipc/projects/metroplex/data/self_healing_queue/in_flight/worker-1/
+ls /home/apexaipc/projects/metroplex/data/self_healing_queue/completed/ | wc -l
+ls /home/apexaipc/projects/metroplex/data/self_healing_queue/failed/ | wc -l
+```
+
+If the heartbeat is stale, `SelfHealingAdapter.is_active()` returns False and
+`start()` logs a clear warning instead of silently queuing. Metroplex's build
+gate will not dispatch new jobs until the daemon is running again.
+
 ### Manual Retry
 
 ```bash

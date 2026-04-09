@@ -1,10 +1,17 @@
-"""Tests for the Self-Healing build adapter skeleton (Phase C Step 1)."""
+"""Tests for the Self-Healing build adapter (Phase C Steps 1+2).
+
+Step 1 pinned the Protocol skeleton, status mapping, and state-file replay
+against real Phase A dry runs. Step 2 wires dispatch to a file queue consumed
+by a long-running Claude Code daemon session, and heartbeat-based liveness.
+"""
 import json
+import os
+import time
 from pathlib import Path
 
 import pytest
 
-from adapters.self_healing_adapter import SelfHealingAdapter
+from adapters.self_healing_adapter import SelfHealingAdapter, HEARTBEAT_STALE_SECONDS
 from build_adapter import BuildAdapter
 from config import Config
 
@@ -13,6 +20,7 @@ from config import Config
 def config(tmp_path):
     c = Config()
     c.self_healing_workspace_root = str(tmp_path / "workspaces")
+    c.self_healing_queue_root = str(tmp_path / "queue")
     return c
 
 
@@ -45,28 +53,55 @@ class TestProtocolConformance:
 
 # ------------------------------------------------------------------- queue
 class TestQueue:
-    def test_queue_raises_notimplemented_in_skeleton(self, adapter, tmp_spec):
-        """Step 1: dispatch is explicitly not wired. This should be loud."""
-        with pytest.raises(NotImplementedError, match="Step 2"):
-            adapter.queue(tmp_spec, "job-1", "opus")
+    def test_queue_returns_queued_result(self, adapter, tmp_spec):
+        """Successful queue returns status='queued' without raising."""
+        result = adapter.queue(tmp_spec, "job-1", "opus")
+        assert result.status == "queued"
+        assert result.job_id == "job-1"
+        assert result.runtime == "self_healing"
+        assert result.error is None
 
-    def test_queue_prepares_workspace_before_dispatch(self, adapter, tmp_spec):
-        """Workspace + spec copy happen before the dispatch stub raises."""
-        with pytest.raises(NotImplementedError):
-            adapter.queue(tmp_spec, "job-prep", "opus")
+    def test_queue_prepares_workspace(self, adapter, tmp_spec):
+        """Workspace directory is created and spec is copied in."""
+        adapter.queue(tmp_spec, "job-prep", "opus")
         target_dir = adapter.workspace_root / "job-prep"
         assert target_dir.is_dir()
         assert (target_dir / "spec.md").read_text() == tmp_spec.read_text()
 
-    def test_queue_does_not_track_job_on_stub_raise(self, adapter, tmp_spec):
-        """A job that can never dispatch must not linger in internal tracking."""
-        with pytest.raises(NotImplementedError):
-            adapter.queue(tmp_spec, "job-x", "opus")
-        # Step 1 behaviour: we DO currently track the job before _dispatch runs,
-        # so poll() can be exercised against hand-written state files. This
-        # test pins that behaviour intentionally — if Step 2 changes it, update
-        # both the adapter and this assertion in the same commit.
+    def test_queue_tracks_job_internally(self, adapter, tmp_spec):
+        """Queued job is tracked so poll() can find its state.json."""
+        adapter.queue(tmp_spec, "job-x", "opus")
         assert "job-x" in adapter._jobs
+        assert adapter._jobs["job-x"] == adapter.workspace_root / "job-x"
+
+    def test_queue_writes_pending_job_file(self, adapter, tmp_spec):
+        """A job file lands in pending/ with the expected schema."""
+        adapter.queue(tmp_spec, "job-disp", "opus")
+        job_file = adapter.pending_dir / "job-disp.json"
+        assert job_file.exists()
+        payload = json.loads(job_file.read_text())
+        assert payload["job_id"] == "job-disp"
+        assert payload["model"] == "opus"
+        assert payload["target_dir"] == str(adapter.workspace_root / "job-disp")
+        assert payload["spec_path"] == str(
+            adapter.workspace_root / "job-disp" / "spec.md"
+        )
+        assert "queued_at" in payload
+
+    def test_queue_creates_all_queue_subdirs(self, adapter, tmp_spec):
+        """pending/, in_flight/worker-1/, completed/, failed/ all exist."""
+        adapter.queue(tmp_spec, "job-dirs", "opus")
+        assert adapter.pending_dir.is_dir()
+        assert adapter.in_flight_dir.is_dir()
+        assert adapter.completed_dir.is_dir()
+        assert adapter.failed_dir.is_dir()
+
+    def test_queue_writes_job_file_atomically(self, adapter, tmp_spec):
+        """No .tmp residue after a successful queue — rename, not write-in-place."""
+        adapter.queue(tmp_spec, "job-atomic", "opus")
+        tmps = list(adapter.pending_dir.glob("*.tmp"))
+        assert tmps == []
+        assert (adapter.pending_dir / "job-atomic.json").exists()
 
 
 # -------------------------------------------------------------------- poll
@@ -267,17 +302,95 @@ class TestKill:
         assert state_file.exists()
         assert json.loads(state_file.read_text())["status"] == "escalated"
 
+    def test_kill_removes_pending_job_file(self, adapter, tmp_spec):
+        """If the daemon hasn't picked up the job, kill removes it from pending."""
+        adapter.queue(tmp_spec, "job-cancel", "opus")
+        pending_file = adapter.pending_dir / "job-cancel.json"
+        assert pending_file.exists()
+
+        assert adapter.kill("job-cancel") is True
+        assert not pending_file.exists()
+
+    def test_kill_escalates_state_even_if_already_claimed(self, adapter, tmp_spec):
+        """If the daemon already moved the job to in_flight, state is still escalated."""
+        adapter.queue(tmp_spec, "job-inflight", "opus")
+        pending_file = adapter.pending_dir / "job-inflight.json"
+        in_flight_file = adapter.in_flight_dir / "job-inflight.json"
+        # Simulate the daemon claiming the job
+        pending_file.rename(in_flight_file)
+
+        assert adapter.kill("job-inflight") is True
+        assert not pending_file.exists()
+        assert in_flight_file.exists()  # kill does not touch in_flight files
+
+        state_file = adapter._jobs["job-inflight"] / ".self-healing-pipeline" / "state.json"
+        assert json.loads(state_file.read_text())["status"] == "escalated"
+
+
+# ----------------------------------------------------- heartbeat liveness
+class TestHeartbeatLiveness:
+    def test_is_active_false_when_queue_dir_missing(self, adapter):
+        assert not adapter.queue_root.exists()
+        assert adapter.is_active() is False
+
+    def test_is_active_false_when_no_heartbeat_files(self, adapter):
+        adapter._ensure_queue_dirs()
+        assert adapter.is_active() is False
+
+    def test_is_active_true_when_heartbeat_fresh(self, adapter):
+        adapter._ensure_queue_dirs()
+        heartbeat = adapter.queue_root / "heartbeat-worker-1.txt"
+        heartbeat.write_text(str(time.time()))
+        assert adapter.is_active() is True
+
+    def test_is_active_false_when_heartbeat_stale(self, adapter):
+        adapter._ensure_queue_dirs()
+        heartbeat = adapter.queue_root / "heartbeat-worker-1.txt"
+        heartbeat.write_text("stale")
+        # Force mtime to just outside the freshness window
+        stale_mtime = time.time() - (HEARTBEAT_STALE_SECONDS + 10)
+        os.utime(heartbeat, (stale_mtime, stale_mtime))
+        assert adapter.is_active() is False
+
+    def test_is_active_picks_up_any_worker_heartbeat(self, adapter):
+        """Multi-daemon readiness: any fresh heartbeat-*.txt satisfies is_active."""
+        adapter._ensure_queue_dirs()
+        (adapter.queue_root / "heartbeat-worker-3.txt").write_text(str(time.time()))
+        assert adapter.is_active() is True
+
+    def test_is_active_ignores_stale_when_fresh_exists(self, adapter):
+        adapter._ensure_queue_dirs()
+        stale = adapter.queue_root / "heartbeat-worker-1.txt"
+        stale.write_text("stale")
+        os.utime(stale, (time.time() - 3600, time.time() - 3600))
+        fresh = adapter.queue_root / "heartbeat-worker-2.txt"
+        fresh.write_text("fresh")
+        assert adapter.is_active() is True
+
 
 # -------------------------------------------------------------- lifecycle
 class TestLifecycle:
-    def test_is_active_skeleton(self, adapter):
-        assert adapter.is_active() is True
+    def test_start_returns_false_without_heartbeat(self, adapter, caplog):
+        """No daemon running → start() returns False and logs a clear message."""
+        import logging
+        with caplog.at_level(logging.WARNING):
+            assert adapter.start(concurrency=1) is False
+        assert any(
+            "self-healing daemon" in rec.message.lower()
+            for rec in caplog.records
+        )
 
-    def test_start_skeleton_returns_true(self, adapter):
+    def test_start_returns_true_with_fresh_heartbeat(self, adapter):
+        adapter._ensure_queue_dirs()
+        (adapter.queue_root / "heartbeat-worker-1.txt").write_text(str(time.time()))
         assert adapter.start(concurrency=1) is True
 
-    def test_start_concurrency_ignored_in_skeleton(self, adapter):
-        assert adapter.start(concurrency=5) is True
+    def test_start_returns_false_with_stale_heartbeat(self, adapter):
+        adapter._ensure_queue_dirs()
+        hb = adapter.queue_root / "heartbeat-worker-1.txt"
+        hb.write_text("stale")
+        os.utime(hb, (time.time() - 3600, time.time() - 3600))
+        assert adapter.start(concurrency=1) is False
 
 
 # ----------------------------------------------------------------- factory
