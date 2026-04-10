@@ -653,7 +653,14 @@ class BuildOrchestrator:
             yce_queue_path = Path(self.config.yce_dir) / "data" / "queue.json"
             if yce_queue_path.exists():
                 with open(yce_queue_path, "r", encoding="utf-8") as f:
-                    yce_jobs = json.load(f)
+                    yce_data = json.load(f)
+                # YCE's queue.json is {"version": N, "jobs": [...]}; older
+                # fixtures and tests used a bare list. Handle both shapes.
+                yce_jobs = (
+                    yce_data.get("jobs", [])
+                    if isinstance(yce_data, dict)
+                    else yce_data
+                )
                 for yj in yce_jobs:
                     if yj.get("status") in ("running", "pending"):
                         yjid = yj.get("job_id") or yj.get("id")

@@ -284,13 +284,21 @@ avoided.
 # In a dedicated terminal, NOT the one you use for other Claude Code work.
 # Must be started from inside the metroplex project dir — the skill is
 # project-scoped and only loads when claude finds .claude/skills/self-healing-daemon/.
-(cd /home/apexaipc/projects/metroplex && claude)
+# --dangerously-skip-permissions (alias: dsp) is REQUIRED — without it the daemon
+# stalls on the first permission prompt the sub-agents hit mid-build.
+(cd /home/apexaipc/projects/metroplex && claude --dangerously-skip-permissions)
 ```
 
 Inside that session, type:
 ```
 /self-healing-daemon start
 ```
+
+Safety net: `.claude/settings.local.json` in the metroplex project dir
+contains a `permissions.deny` list (rm -rf /, mkfs, dd of=/dev/…, sudo,
+shutdown, etc.) that blocks destructive patterns even under
+`--dangerously-skip-permissions`. Deny always wins over skip. Update
+that file first if you need to add new denied patterns.
 
 The daemon will create queue directories under `data/self_healing_queue/`,
 touch `heartbeat-worker-1.txt`, and enter its main loop. From a second
@@ -303,14 +311,22 @@ stat -c '%Y %n' /home/apexaipc/projects/metroplex/data/self_healing_queue/heartb
 
 **Stopping the daemon:**
 
-From inside the daemon session, type `/self-healing-daemon stop`. Or from any
-other shell:
+Prefer the external shutdown path — from any other shell (ProBook, Surface,
+mobile app):
 
 ```bash
 touch /home/apexaipc/projects/metroplex/data/self_healing_queue/shutdown.flag
 ```
 
-The daemon exits at the next loop iteration. In-flight builds finish first.
+The daemon exits within ~10s (one idle-sleep chunk) when flag is set, or
+immediately after the current build finishes if one is in flight.
+
+Typing `/self-healing-daemon stop` into the daemon session itself works
+but is fragile: the Claude session won't accept keyboard input while a
+Bash tool call (including the idle `sleep 10`) is running, so there's up
+to ~10s of input-lockout before the command lands. The external
+`touch shutdown.flag` path avoids the lockout and is the recommended
+way to stop a running daemon.
 
 **Daily restart discipline:** the parent session grows ~5-10k tokens per build.
 Past ~20 builds in a 200k session or ~100 in a 1M session, Claude Code
