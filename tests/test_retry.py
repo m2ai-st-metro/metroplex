@@ -279,7 +279,7 @@ class TestMarkBuildForRetry:
             description="Test desc",
             priority_score=50.0,
             status="pending",
-            idea_data="{}",
+            idea_data='{"id": 1, "title": "Test"}',
         )
         in_memory_db.enqueue_item(item)
         # Mark as dispatched then failed (simulating build lifecycle)
@@ -320,7 +320,7 @@ class TestMarkBuildAbandoned:
             description="Test desc",
             priority_score=50.0,
             status="pending",
-            idea_data="{}",
+            idea_data='{"id": 1, "title": "Test"}',
         )
         in_memory_db.enqueue_item(item)
         in_memory_db.update_item_status(1, "dispatched", "dispatched_at")
@@ -344,7 +344,7 @@ class TestMarkBuildAbandoned:
             description="Test desc",
             priority_score=50.0,
             status="pending",
-            idea_data="{}",
+            idea_data='{"id": 1, "title": "Test"}',
         )
         in_memory_db.enqueue_item(item)
         in_memory_db.update_item_status(1, "completed", "completed_at")

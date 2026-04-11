@@ -19,7 +19,18 @@ from gates.build import SpecGenerator, BuildOrchestrator
 from gates.patcher import PatchGate
 from orchestrator import CycleOrchestrator
 from notifier import LogNotifier
-from models import TriageDecision, BuildJob, PatchApplication
+from models import TriageDecision, BuildJob, PatchApplication, PriorityItem
+
+
+def make_pq_item(**kwargs) -> PriorityItem:
+    """Test helper: construct a PriorityItem with a non-empty idea_data default.
+
+    The enqueue_item guard rejects items with empty idea_data. Orchestrator
+    tests don't care about payload contents — this helper supplies a minimal
+    valid placeholder.
+    """
+    kwargs.setdefault("idea_data", '{"test": true}')
+    return PriorityItem(**kwargs)
 
 
 @pytest.fixture
@@ -968,7 +979,7 @@ class TestDispatchIntegration:
         from dispatcher import LogDispatcher
 
         # Enqueue a skylynx item
-        item = PriorityItem(
+        item = make_pq_item(
             source="skylynx",
             source_id="sl-dispatch-001",
             title="Fix Session Tracking",
@@ -993,7 +1004,7 @@ class TestDispatchIntegration:
         from dispatcher import LogDispatcher
 
         for source in ("ideaforge", "linear", "academy"):
-            item = PriorityItem(
+            item = make_pq_item(
                 source=source,
                 source_id=f"{source}-001",
                 title=f"Test {source}",
@@ -1015,7 +1026,7 @@ class TestDispatchIntegration:
         from models import PriorityItem
         from dispatcher import LogDispatcher
 
-        item = PriorityItem(
+        item = make_pq_item(
             source="skylynx",
             source_id="sl-dry-001",
             title="Dry Run Dispatch",
@@ -1052,7 +1063,7 @@ class TestDispatchIntegration:
         mock_dispatcher.dispatch.side_effect = Exception("DB locked")
 
         from models import PriorityItem
-        item = PriorityItem(
+        item = make_pq_item(
             source="skylynx",
             source_id="sl-err-001",
             title="Error Test",
@@ -1072,7 +1083,7 @@ class TestDispatchIntegration:
         from models import PriorityItem
         from dispatcher import LogDispatcher
 
-        item = PriorityItem(
+        item = make_pq_item(
             source="skylynx",
             source_id="sl-notify-001",
             title="Notify Test",
@@ -1126,7 +1137,7 @@ class TestDispatchIntegration:
 
         # Enqueue 5 items
         for i in range(5):
-            item = PriorityItem(
+            item = make_pq_item(
                 source="skylynx",
                 source_id=f"sl-cap-{i:03d}",
                 title=f"Cap Test {i}",

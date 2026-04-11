@@ -638,7 +638,23 @@ class StateDB:
     # --- Priority Queue ---
 
     def enqueue_item(self, item: PriorityItem) -> int:
-        """Add an item to the priority queue. Returns the row ID. Skips duplicates."""
+        """Add an item to the priority queue. Returns the row ID. Skips duplicates.
+
+        Rejects items with empty idea_data. The build gate deserializes idea_data
+        to generate specs; an empty payload causes silent dispatch failures that
+        mark the pq row failed without ever creating a build_jobs row. See the
+        2026-04-03 incident where 42 rows were batch-inserted with idea_data='{}'
+        and all failed at dispatch. This guard prevents recurrence.
+        """
+        # Defense against empty-payload inserts. Callers must provide a real
+        # serialized idea; the dispatcher has no graceful path for empty dicts.
+        if not item.idea_data or item.idea_data.strip() in ("", "{}"):
+            raise ValueError(
+                f"enqueue_item refused: idea_data is empty for "
+                f"source={item.source} source_id={item.source_id} title={item.title!r}. "
+                f"Callers must pass json.dumps(<full idea dict>)."
+            )
+
         self.connect()
         cursor = self.conn.cursor()
 
@@ -724,19 +740,25 @@ class StateDB:
         self.connect()
         cursor = self.conn.cursor()
 
-        # Step 1: Find candidate
+        # Step 1: Find candidate. Skip rows with empty idea_data — the dispatcher
+        # cannot build from them, so claiming them just burns a cycle and marks
+        # the row failed. The enqueue_item guard prevents new poisoned rows;
+        # this filter prevents historical poisoned rows from starving live work.
+        poison_filter = "AND idea_data IS NOT NULL AND idea_data != '' AND idea_data != '{}'"
         if sources:
             placeholders = ",".join("?" for _ in sources)
             cursor.execute(f"""
                 SELECT id FROM priority_queue
                 WHERE status = 'pending' AND (claimed_by IS NULL) AND source IN ({placeholders})
+                  {poison_filter}
                 ORDER BY priority_score DESC
                 LIMIT 1
             """, sources)
         else:
-            cursor.execute("""
+            cursor.execute(f"""
                 SELECT id FROM priority_queue
                 WHERE status = 'pending' AND (claimed_by IS NULL)
+                  {poison_filter}
                 ORDER BY priority_score DESC
                 LIMIT 1
             """)

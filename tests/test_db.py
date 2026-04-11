@@ -9,6 +9,19 @@ from db import StateDB
 from models import TriageDecision, BuildJob, PatchApplication, GateStatus, PriorityItem
 
 
+def make_pq_item(**kwargs) -> PriorityItem:
+    """Test helper: construct a PriorityItem with a non-empty idea_data default.
+
+    The enqueue_item guard (added after the 2026-04-03 empty-payload incident)
+    rejects items with empty idea_data. These tests don't care about the payload
+    contents — they only care about queue mechanics — so this helper supplies a
+    minimal valid placeholder. Use PriorityItem directly when a test needs to
+    exercise idea_data behavior explicitly.
+    """
+    kwargs.setdefault("idea_data", '{"test": true}')
+    return PriorityItem(**kwargs)
+
+
 @pytest.fixture
 def db():
     """Create in-memory state database."""
@@ -301,7 +314,7 @@ class TestPriorityQueue:
         assert "idx_priority_queue_source" in indexes
 
     def test_enqueue_item(self, db):
-        item = PriorityItem(
+        item = make_pq_item(
             source="ideaforge",
             source_id="42",
             title="Test Idea",
@@ -323,12 +336,13 @@ class TestPriorityQueue:
         assert row["status"] == "pending"
 
     def test_enqueue_duplicate_skips(self, db):
-        item = PriorityItem(
+        item = make_pq_item(
             source="ideaforge",
             source_id="42",
             title="Test Idea",
             description="Desc",
             priority_score=85.0,
+            idea_data='{"id": 42, "title": "Test Idea"}',
         )
         first_id = db.enqueue_item(item)
         second_id = db.enqueue_item(item)
@@ -341,9 +355,70 @@ class TestPriorityQueue:
         cursor.execute("SELECT COUNT(*) as cnt FROM priority_queue")
         assert cursor.fetchone()["cnt"] == 1
 
+    def test_enqueue_rejects_empty_idea_data(self, db):
+        """Guard against the 2026-04-03 incident: 42 rows inserted with
+        idea_data='{}' caused silent dispatch failures. enqueue_item must
+        refuse empty payloads instead of accepting them."""
+        import pytest
+
+        base_kwargs = dict(
+            source="ideaforge",
+            source_id="99",
+            title="Empty Payload",
+            description="Desc",
+            priority_score=50.0,
+        )
+
+        # Empty string (Pydantic default)
+        with pytest.raises(ValueError, match="idea_data is empty"):
+            db.enqueue_item(make_pq_item(**base_kwargs, idea_data=""))
+
+        # Empty JSON object
+        with pytest.raises(ValueError, match="idea_data is empty"):
+            db.enqueue_item(make_pq_item(**base_kwargs, idea_data="{}"))
+
+        # Whitespace-only
+        with pytest.raises(ValueError, match="idea_data is empty"):
+            db.enqueue_item(make_pq_item(**base_kwargs, idea_data="  {} "))
+
+        # Row count unchanged
+        cursor = db.conn.cursor()
+        cursor.execute("SELECT COUNT(*) as cnt FROM priority_queue WHERE source_id='99'")
+        assert cursor.fetchone()["cnt"] == 0
+
+    def test_claim_next_pending_skips_poisoned_rows(self, db):
+        """Historical poisoned rows (idea_data='{}') must not be claimed —
+        they would burn a worker cycle and fail at dispatch. claim_next_pending
+        must filter them out so live work advances."""
+        # Inject a poisoned row directly, bypassing enqueue_item's guard
+        # (simulating pre-guard data written by an ad-hoc script)
+        db.conn.execute("""
+            INSERT INTO priority_queue (source, source_id, title, description,
+                                        priority_score, status, idea_data, created_at)
+            VALUES ('ideaforge', '666', 'Poisoned', 'p', 99.0, 'pending', '{}',
+                    '2026-04-03T19:44:20')
+        """)
+        db.conn.commit()
+
+        # Enqueue a legitimate lower-priority item
+        db.enqueue_item(make_pq_item(
+            source="ideaforge",
+            source_id="777",
+            title="Good",
+            description="good",
+            priority_score=50.0,
+            idea_data='{"id": 777, "title": "Good"}',
+        ))
+
+        # Despite the poisoned row having a higher priority_score, the claim
+        # must return the legitimate row instead.
+        claimed = db.claim_next_pending("test-worker")
+        assert claimed is not None
+        assert claimed.source_id == "777"
+
     def test_get_next_pending_returns_highest_score(self, db):
         for score, sid in [(50.0, "1"), (90.0, "2"), (70.0, "3")]:
-            item = PriorityItem(
+            item = make_pq_item(
                 source="ideaforge",
                 source_id=sid,
                 title=f"Idea {sid}",
@@ -362,7 +437,7 @@ class TestPriorityQueue:
         assert result is None
 
     def test_get_next_pending_skips_non_pending(self, db):
-        item = PriorityItem(
+        item = make_pq_item(
             source="ideaforge",
             source_id="1",
             title="Dispatched Idea",
@@ -376,7 +451,7 @@ class TestPriorityQueue:
         assert result is None
 
     def test_update_item_status(self, db):
-        item = PriorityItem(
+        item = make_pq_item(
             source="ideaforge",
             source_id="1",
             title="Test Idea",
@@ -394,7 +469,7 @@ class TestPriorityQueue:
         assert row["dispatched_at"] is not None
 
     def test_update_item_status_completed(self, db):
-        item = PriorityItem(
+        item = make_pq_item(
             source="ideaforge",
             source_id="1",
             title="Test Idea",
@@ -412,7 +487,7 @@ class TestPriorityQueue:
         assert row["completed_at"] is not None
 
     def test_update_item_status_no_timestamp(self, db):
-        item = PriorityItem(
+        item = make_pq_item(
             source="ideaforge",
             source_id="1",
             title="Test Idea",
@@ -430,7 +505,7 @@ class TestPriorityQueue:
     def test_get_queue_summary(self, db):
         # Insert items with different statuses
         for sid, score in [("1", 90.0), ("2", 80.0), ("3", 70.0)]:
-            item = PriorityItem(
+            item = make_pq_item(
                 source="ideaforge", source_id=sid, title=f"Idea {sid}",
                 description="Desc", priority_score=score,
             )
@@ -453,7 +528,7 @@ class TestPriorityQueue:
     def test_update_build_job_status_syncs_priority_queue(self, db):
         """Completing a build job also updates the priority queue item."""
         # Insert into priority_queue
-        item = PriorityItem(
+        item = make_pq_item(
             source="ideaforge", source_id="5", title="Build Me",
             description="Desc", priority_score=80.0,
         )
@@ -484,7 +559,7 @@ class TestPriorityQueue:
 
     def test_update_build_job_status_failed_syncs(self, db):
         """Failing a build job marks priority queue item as failed."""
-        item = PriorityItem(
+        item = make_pq_item(
             source="ideaforge", source_id="6", title="Will Fail",
             description="Desc", priority_score=75.0,
         )
@@ -505,11 +580,11 @@ class TestPriorityQueue:
 
     def test_enqueue_different_sources(self, db):
         """Items from different sources with same source_id are allowed."""
-        item1 = PriorityItem(
+        item1 = make_pq_item(
             source="ideaforge", source_id="1", title="From IdeaForge",
             description="Desc", priority_score=80.0,
         )
-        item2 = PriorityItem(
+        item2 = make_pq_item(
             source="skylynx", source_id="1", title="From SkyLynx",
             description="Desc", priority_score=90.0,
         )
@@ -524,7 +599,7 @@ class TestPriorityQueue:
 
     def test_update_build_job_status_skylynx_source(self, db):
         """New format job ID with skylynx source syncs priority_queue correctly."""
-        item = PriorityItem(
+        item = make_pq_item(
             source="skylynx", source_id="sl-abc123", title="SkyLynx Rec",
             description="Desc", priority_score=135.0,
         )
@@ -550,7 +625,7 @@ class TestPriorityQueue:
 
     def test_update_build_job_status_linear_source(self, db):
         """New format job ID with linear source (non-digit source_id) syncs correctly."""
-        item = PriorityItem(
+        item = make_pq_item(
             source="linear", source_id="TOO-42", title="Linear Issue",
             description="Desc", priority_score=160.0,
         )
@@ -574,7 +649,7 @@ class TestPriorityQueue:
 
     def test_update_build_job_status_ideaforge_new_format(self, db):
         """New format with ideaforge source (backward compat with numeric IDs)."""
-        item = PriorityItem(
+        item = make_pq_item(
             source="ideaforge", source_id="5", title="IdeaForge Idea",
             description="Desc", priority_score=80.0,
         )
@@ -598,7 +673,7 @@ class TestPriorityQueue:
 
     def test_update_build_job_status_malformed_job_id_noop(self, db):
         """Malformed job IDs don't crash and don't modify priority_queue."""
-        item = PriorityItem(
+        item = make_pq_item(
             source="ideaforge", source_id="10", title="Safe Item",
             description="Desc", priority_score=70.0,
         )
@@ -619,7 +694,7 @@ class TestStaleQueuedBuildRecovery:
     """Fix B / Fix C: stale queued build recovery no longer destroys rows."""
 
     def _enqueue_and_dispatch(self, db, idea_id: int, title: str = "T"):
-        item = PriorityItem(
+        item = make_pq_item(
             source="ideaforge",
             source_id=str(idea_id),
             title=title,
