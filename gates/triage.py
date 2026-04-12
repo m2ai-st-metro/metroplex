@@ -219,8 +219,10 @@ class TriageGate:
                     )
                     self.state_db.enqueue_item(item)
 
-                # Claim idea in IdeaForge (without changing its status)
+                # Claim idea in IdeaForge and update status
                 self.ideaforge_reader.claim_idea(idea["id"])
+                if decision == "approve":
+                    self.ideaforge_reader.update_idea_status(idea["id"], "exported")
 
                 # Log decision in audit log
                 self.audit_logger.log_decision(
