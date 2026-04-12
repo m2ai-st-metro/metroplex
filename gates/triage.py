@@ -185,6 +185,15 @@ class TriageGate:
                 decision = "defer"
                 reason = "in deferral range"
 
+            # Check deferral count before creating redundant defer records.
+            # Ideas that have already been deferred max_deferrals times should
+            # be auto-rejected instead of accumulating unbounded defer rows.
+            if decision == "defer":
+                deferral_count = self.state_db.get_deferral_count(idea["id"])
+                if deferral_count >= self.config.max_deferrals:
+                    decision = "reject"
+                    reason = f"exceeded max deferrals ({deferral_count})"
+
             # Create TriageDecision object
             triage_decision = TriageDecision(
                 idea_id=idea["id"],
