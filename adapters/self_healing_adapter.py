@@ -46,7 +46,7 @@ logger = logging.getLogger(__name__)
 
 # Heartbeat freshness window. The daemon loop sleeps 60s when idle, so any
 # interval >120s would catch one missed heartbeat plus normal jitter.
-HEARTBEAT_STALE_SECONDS = 120
+HEARTBEAT_STALE_SECONDS = 360  # 6 min: Planner phase can take 3-5 min on complex specs
 
 
 # Self-healing loop status (from .self-healing-pipeline/state.json) → Metroplex build-job status
