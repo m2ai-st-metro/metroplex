@@ -516,6 +516,134 @@ class BuildOrchestrator:
             )
             return {}
 
+    def _record_build_session(self, job_id: str, project_dir: str) -> None:
+        """Record a session snapshot after a build reaches terminal state.
+
+        Reads state.json and the last judge-brief from the workspace to build
+        a summary that future retries can use as context.
+        """
+        state_dir = Path(project_dir) / ".self-healing-pipeline"
+        state_file = state_dir / "state.json"
+        if not state_file.exists():
+            return
+
+        try:
+            state = json.loads(state_file.read_text())
+        except (json.JSONDecodeError, OSError) as e:
+            logger.warning("Session record: unreadable state.json for %s: %s", job_id, e)
+            return
+
+        # Parse base_job_id and attempt from job_id
+        # Format: "metroplex-ideaforge-210-r2" -> base="metroplex-ideaforge-210", attempt=2
+        # Format: "metroplex-ideaforge-210" -> base="metroplex-ideaforge-210", attempt=0
+        if "-r" in job_id and job_id.rsplit("-r", 1)[-1].isdigit():
+            base_job_id = job_id.rsplit("-r", 1)[0]
+            attempt = int(job_id.rsplit("-r", 1)[-1])
+        else:
+            base_job_id = job_id
+            attempt = 0
+
+        # Build summary from state.json history
+        history = state.get("history", [])
+        summary_parts = []
+        summary_parts.append(f"Build {job_id}: status={state.get('status', 'unknown')}, "
+                             f"attempts={state.get('attempt', 0)}/{state.get('max_attempts', 3)}")
+
+        for entry in history:
+            att = entry.get("attempt", "?")
+            verdict = entry.get("judge_verdict", "unknown")
+            failure = entry.get("failure_summary")
+            line = f"  Attempt {att}: builder={entry.get('builder_result', '?')}, judge={verdict}"
+            if failure:
+                line += f", failure: {failure}"
+            summary_parts.append(line)
+
+        # Read the last judge-brief for richer failure context
+        last_attempt = state.get("attempt", 1)
+        judge_brief_path = state_dir / f"judge-brief-{last_attempt}.md"
+        if judge_brief_path.exists():
+            try:
+                brief_text = judge_brief_path.read_text(encoding="utf-8")
+                # Truncate to keep session records manageable (max 2000 chars)
+                if len(brief_text) > 2000:
+                    brief_text = brief_text[:2000] + "\n... (truncated)"
+                summary_parts.append(f"\nJudge brief (attempt {last_attempt}):\n{brief_text}")
+            except OSError:
+                pass
+
+        summary = "\n".join(summary_parts)
+
+        try:
+            self.state_db.record_session(
+                base_job_id=base_job_id,
+                attempt=attempt,
+                session_summary=summary,
+            )
+            logger.info("Recorded build session for %s (attempt %d)", base_job_id, attempt)
+        except Exception as e:
+            logger.warning("Failed to record build session for %s: %s", job_id, e)
+
+    def _inject_session_context(
+        self, base_job_id: str, attempt: int, spec_path: Path
+    ) -> None:
+        """Append prior-attempt context to the spec file before retry dispatch.
+
+        Checks budget guards (token count and age) from config before injecting.
+        If no prior session exists or budget is exceeded, does nothing.
+        """
+        session = self.state_db.get_latest_session(base_job_id)
+        if not session:
+            logger.info("No prior session for %s, dispatching retry without context", base_job_id)
+            return
+
+        # Budget guard: token limit
+        if session.get("input_tokens_total", 0) > self.config.max_session_input_tokens:
+            logger.info(
+                "Session context for %s exceeds token budget (%d > %d), skipping injection",
+                base_job_id,
+                session["input_tokens_total"],
+                self.config.max_session_input_tokens,
+            )
+            return
+
+        # Budget guard: age limit
+        created_at = session.get("created_at", "")
+        if created_at:
+            try:
+                session_time = datetime.fromisoformat(created_at)
+                age_hours = (datetime.now() - session_time).total_seconds() / 3600
+                if age_hours > self.config.max_session_age_hours:
+                    logger.info(
+                        "Session context for %s is too old (%.1fh > %dh), skipping injection",
+                        base_job_id, age_hours, self.config.max_session_age_hours,
+                    )
+                    return
+            except (ValueError, TypeError):
+                pass  # If we can't parse the date, proceed with injection
+
+        summary = session.get("session_summary", "")
+        if not summary:
+            return
+
+        # Append prior-attempt context to spec
+        context_section = (
+            f"\n\n## Prior Build Attempts (attempt {attempt})\n\n"
+            f"**IMPORTANT**: This is retry attempt #{attempt}. The previous attempt(s) "
+            f"failed. Use the context below to avoid repeating the same mistakes. "
+            f"Focus on what went wrong and take a different approach where needed.\n\n"
+            f"{summary}\n"
+        )
+
+        try:
+            existing = spec_path.read_text(encoding="utf-8")
+            spec_path.write_text(existing + context_section, encoding="utf-8")
+            logger.info(
+                "Injected %d chars of session context into spec for %s (attempt %d)",
+                len(context_section), base_job_id, attempt,
+            )
+        except OSError as e:
+            logger.warning("Failed to inject session context for %s: %s", base_job_id, e)
+
     def poll_and_sync_status(self) -> dict:
         """
         Poll queue_runner status and sync completed/failed jobs back to metroplex DB.
@@ -578,6 +706,9 @@ class BuildOrchestrator:
                         self._extract_build_log(job_id)
                         # Record build cost in ledger
                         self._record_build_cost(job_id, job_data)
+                        # Record session snapshot for retry context (Phase 15g)
+                        if project_dir:
+                            self._record_build_session(job_id, project_dir)
                 except Exception as e:
                     self.audit_logger.log_error(
                         gate="build",
@@ -597,6 +728,9 @@ class BuildOrchestrator:
                         self._extract_build_log(job_id)
                         # Record build cost even for failed builds (tokens were still consumed)
                         self._record_build_cost(job_id, job_data)
+                        # Record session snapshot for retry context (Phase 15g)
+                        if project_dir:
+                            self._record_build_session(job_id, project_dir)
                 except Exception as e:
                     self.audit_logger.log_error(
                         gate="build",
@@ -1192,6 +1326,10 @@ class BuildOrchestrator:
                                 "overall": tyrest_result.overall,
                             },
                         )
+
+                    # Inject prior-attempt context for retries (Phase 15g)
+                    if attempt > 0 and not dry_run:
+                        self._inject_session_context(base_job_id, attempt, spec_path)
 
                     # Queue build via YCE queue_runner
                     job = self.queue_build(idea, spec_path, dry_run=dry_run, attempt=attempt)
