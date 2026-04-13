@@ -571,6 +571,23 @@ class BuildOrchestrator:
             except OSError:
                 pass
 
+        # Include Ravage review verdict if present
+        review_verdict = state.get("review_verdict")
+        if review_verdict:
+            summary_parts.append(
+                f"\nRavage review: verdict={review_verdict}, "
+                f"critical_count={state.get('review_critical_count', 0)}"
+            )
+            review_report = state_dir / "review-report.md"
+            if review_report.exists():
+                try:
+                    report_text = review_report.read_text(encoding="utf-8")
+                    if len(report_text) > 2000:
+                        report_text = report_text[:2000] + "\n... (truncated)"
+                    summary_parts.append(f"\nReview report:\n{report_text}")
+                except OSError:
+                    pass
+
         summary = "\n".join(summary_parts)
 
         try:

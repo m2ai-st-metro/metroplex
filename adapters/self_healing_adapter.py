@@ -55,6 +55,7 @@ _STATUS_MAP: dict[str, str] = {
     "building": "running",
     "judging": "running",
     "passed": "completed",
+    "review_rejected": "failed",
     "escalated": "failed",
 }
 
@@ -231,6 +232,8 @@ class SelfHealingAdapter:
         base["attempt"] = state.get("attempt")
         base["judge_verdict"] = state.get("judge_verdict")
         base["escalation_reason"] = state.get("escalation_reason")
+        base["review_verdict"] = state.get("review_verdict")
+        base["review_critical_count"] = state.get("review_critical_count")
         return base
 
     @staticmethod

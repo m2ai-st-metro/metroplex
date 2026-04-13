@@ -129,10 +129,27 @@ Repeat until `SHUTDOWN_FLAG` is present:
        ```
     d. Touch `HEARTBEAT`.
     Skipping this step is how idea 194 hit `review_failed` on 2026-04-09 despite a clean `judge_verdict=pass` -- missing README and missing `.git` are hard fails in the review gate. On `escalated` status, skip workspace prep; the failure path does not need downstream artifacts.
+10.5. **Ravage review** (only on `status == "passed"`):
+    After workspace prep, run two code-quality review agents against the build output. These catch bugs, silent failures, and security issues that the Judge's test-based pass/fail cannot see. The daemon session has Agent tool access, so it can spawn sub-agents directly.
+    a. Touch `HEARTBEAT`.
+    b. Spawn **both** review agents in parallel using the Agent tool (two Agent calls in a single response). For each agent, the prompt must specify the absolute `{target_dir}` path and instruct the agent to review all source files there (not a git diff -- this is a freshly generated project, so all files are "new"). Exclude `.git/`, `.self-healing-pipeline/`, `node_modules/`, `__pycache__/`, `venv/`, and `*.lock` files from review scope.
+       - **Agent 1 -- code-reviewer** (`subagent_type: "pr-review-toolkit:code-reviewer"`): review for bugs, security vulnerabilities, and code quality issues. Ask it to report issues with confidence >= 80 only, grouped by Critical (90-100) and Important (80-89). Tell it the project has no CLAUDE.md guidelines -- judge purely on correctness and security.
+       - **Agent 2 -- silent-failure-hunter** (`subagent_type: "pr-review-toolkit:silent-failure-hunter"`): review for empty catch blocks, swallowed errors, silent fallbacks, and missing error propagation. Ask it to report issues with severity CRITICAL, HIGH, or MEDIUM.
+    c. When both agents return, write their combined output to `{target_dir}/.self-healing-pipeline/review-report.md` with sections `## Code Review` and `## Silent Failure Analysis`.
+    d. Parse the results for **CRITICAL** issues: code-reviewer issues with confidence >= 90, OR silent-failure-hunter issues with severity CRITICAL. Count them.
+    e. Update `{target_dir}/.self-healing-pipeline/state.json` with three new fields:
+       - `review_verdict`: `"approved"` (0 critical issues) or `"rejected"` (1+ critical issues)
+       - `review_critical_count`: integer count of critical issues found
+       - `review_report_path`: absolute path to `review-report.md`
+    f. If `review_verdict == "rejected"`: print `"Ravage review REJECTED: {N} critical issues found. See {review_report_path}"`. Override the routing status for Step 11 -- this build goes to `FAILED_DIR` even though the Judge passed it. Update `state.json` `status` to `"review_rejected"`.
+    g. If `review_verdict == "approved"`: print `"Ravage review approved ({N} non-critical issues noted)"` where N is the total issue count minus critical.
+    h. Touch `HEARTBEAT`.
+    On `escalated` status, skip the review entirely (same as workspace prep).
 11. **Route to terminal dir**:
     - If `status == "passed"`: move the in-flight job file to `COMPLETED_DIR/<job_id>.json`.
+    - If `status == "review_rejected"`: move to `FAILED_DIR/<job_id>.json`. Metroplex will see this as a build failure and apply its normal postmortem/notification flow. The review report at `{target_dir}/.self-healing-pipeline/review-report.md` provides the failure context.
     - If `status == "escalated"` or any other terminal failure: move to `FAILED_DIR/<job_id>.json`.
-12. **Log result**: print `"Job {job_id} finished: status={passed|escalated}, attempts={N}"`.
+12. **Log result**: print `"Job {job_id} finished: status={status}, attempts={N}"`. Include `review_verdict` in the log line when present.
 13. **Touch heartbeat** again, loop.
 
 ## Status command (`/self-healing-daemon status`)
@@ -275,7 +292,7 @@ investigating before letting the daemon continue:
 | `Read` | `spec.md`, `state.json`, `plan.md`, `test-contract.md`, `builder-log-*.md`, `judge-brief-*.md`, source files under `{target_dir}` | Reads outside `{target_dir}` or queue root, especially `~/.claude/**`, `~/vault/**`, other project dirs |
 | `Write` | `README.md`, job files in queue dirs, `.heartbeat-callback`, commit via git | Writes outside `{target_dir}` or queue root; any write to `~/.claude/settings*.json`, `~/.env*`, `~/.bashrc` |
 | `Edit` | Source files under `{target_dir}` only (Builder phase) | Edits outside `{target_dir}` |
-| `Agent` / `Skill` | `/self-healing-pipeline` and its Planner/Builder/Judge sub-agents; no other skills | Any other skill invocation, especially shell-adjacent ones |
+| `Agent` / `Skill` | `/self-healing-pipeline` and its Planner/Builder/Judge sub-agents; `pr-review-toolkit:code-reviewer` and `pr-review-toolkit:silent-failure-hunter` for Step 10.5 Ravage review | Any other skill or agent invocation, especially shell-adjacent ones |
 
 If the daemon starts issuing Bash calls you don't recognize, stop it
 immediately (`touch shutdown.flag` from a second terminal), read the
@@ -295,3 +312,7 @@ have to actually read it.
 - It does NOT escalate to humans via Telegram or other channels. Escalations
   are written to `FAILED_DIR` and picked up by Metroplex's existing
   postmortem/notification paths.
+- It does NOT retry on review rejection. Step 10.5 Ravage review is pass/fail
+  only. A `review_rejected` build goes straight to `FAILED_DIR`. The Builder
+  is not re-invoked with review feedback (future enhancement -- would require
+  a new retry trigger type in the self-healing-pipeline).
