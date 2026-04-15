@@ -1109,76 +1109,14 @@ class CycleOrchestrator:
             except Exception as e:
                 self.audit_logger.log_error("review", f"Review gate failed: {e}")
 
-        # Gate 4.25: Tyrest LLM QA review (on builds that passed ReviewGate)
-        if self.tyrest_gate is not None and review_count > 0:
-            try:
-                passed_reviews = [r for r in review_results if r.verdict == "pass"]
-                tyrest_count = 0
-                for review in passed_reviews:
-                    # Get spec path and project_dir for this build
-                    build = self.state_db.get_build_by_queue_job_id(review.queue_job_id)
-                    if not build:
-                        continue
-                    spec_path = build.get("spec_path", "")
-                    project_dir = build.get("project_dir", "")
-                    if not project_dir:
-                        continue
-
-                    spec_text = ""
-                    if spec_path and Path(spec_path).is_file():
-                        spec_text = Path(spec_path).read_text(encoding="utf-8")
-
-                    if dry_run:
-                        print(f"  [DRY RUN] Would Tyrest-review: {review.title}")
-                        tyrest_count += 1
-                        continue
-
-                    tyrest_result = self.tyrest_gate.review_build(
-                        Path(project_dir), spec_text, idea_title=review.title,
-                    )
-                    tyrest_count += 1
-
-                    if tyrest_result.rejected:
-                        # Downgrade review_status so publish gate skips it
-                        self.state_db.update_build_review_status(
-                            review.queue_job_id, "tyrest_rejected",
-                        )
-                        self.notifier.notify(
-                            f"Tyrest REJECTED: {review.title} — {tyrest_result.reasoning}",
-                            "warning",
-                        )
-                        # Resolve feasibility prediction for Tyrest rejection (L5 B2)
-                        resolve_prediction(self.state_db, review.queue_job_id, "tyrest_rejected")
-                        # Write tyrest_rejected outcome to IdeaForge (L5 B3)
-                        build = self.state_db.get_build_by_queue_job_id(review.queue_job_id)
-                        if build and str(build["idea_id"]).isdigit():
-                            self._write_ideaforge_outcome(int(build["idea_id"]), "tyrest_rejected")
-                        # Emit outcome for Tyrest rejection (Phase 14a)
-                        if self.outcome_emitter:
-                            build = self.state_db.get_build_by_queue_job_id(review.queue_job_id)
-                            self.outcome_emitter.emit(
-                                idea_id=int(build["idea_id"]) if build and str(build["idea_id"]).isdigit() else 0,
-                                idea_title=review.title,
-                                outcome="rejected",
-                                build_outcome=f"tyrest_rejected: {tyrest_result.reasoning}",
-                                tags=["tyrest"],
-                            )
-                    else:
-                        self.audit_logger.log_decision(
-                            gate="tyrest",
-                            action=tyrest_result.verdict.lower(),
-                            details={
-                                "queue_job_id": review.queue_job_id,
-                                "title": review.title,
-                                "overall": tyrest_result.overall,
-                                "confidence": tyrest_result.confidence,
-                            },
-                        )
-
-                if tyrest_count > 0:
-                    print(f"+ Gate 4.25 completed: {tyrest_count} Tyrest-reviewed")
-            except Exception as e:
-                self.audit_logger.log_error("tyrest", f"Tyrest gate failed: {e}")
+        # Gate 4.25 (Tyrest LLM QA review) — UNWIRED 2026-04-14.
+        # Audit (208 builds) showed 84% pure redundancy with ReviewGate, and the
+        # remaining 5 unique catches (2.4%) are already covered by the auto-tightened
+        # test_coverage_threshold (0.3453) and quality_threshold (47.2) ratchets.
+        # gates/tyrest.py left in tree for one-week soak; delete after 2026-04-21
+        # if no regressions surface. See conversation 2026-04-14.
+        if False and self.tyrest_gate is not None and review_count > 0:
+            pass  # disabled — see comment above
 
         # Quality scoring (Phase 14b) — score builds that passed review
         if review_count > 0:

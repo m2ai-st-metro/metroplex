@@ -39,7 +39,7 @@ class Config:
     yce_dir: str = field(default="/home/apexaipc/projects/yce-harness")
 
     # GitHub repo
-    academy_repo: str = field(default="m2ai-ultra-magnus-IF/st-agent-registry")
+    academy_repo: str = field(default="m2ai-st-metro/st-agent-registry")
 
     # Model settings
     build_model: str = field(default="opus")

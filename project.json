@@ -6,7 +6,7 @@
   "purpose": "L5 autonomy orchestrator for the ST Metro ecosystem. Runs a 6-gate pipeline (Triage, Build, Patch, Publish, Review, Tyrest) to autonomously evaluate ideas, generate software via YCE, apply persona patches, and publish to GitHub.",
   "owner": "matthew",
   "repo": {
-    "org": "m2ai-ultra-magnus-IF",
+    "org": "m2ai-st-metro",
     "name": "metroplex",
     "default_branch": "main",
     "visibility": "private"

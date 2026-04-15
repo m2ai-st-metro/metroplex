@@ -96,7 +96,7 @@ All settings via environment variables (prefix `METROPLEX_`). Set in `~/.env.sha
 | `METROPLEX_UM_DB` | `.../ultra-magnus/.../idea-factory.db` | Ultra-Magnus database path |
 | `METROPLEX_ST_RECORDS_DB` | `.../st-records/data/persona_metrics.db` | ST Records database path |
 | `METROPLEX_YCE_DIR` | `.../yce-harness` | YCE Harness directory |
-| `METROPLEX_ACADEMY_REPO` | `m2ai-ultra-magnus-IF/st-agent-registry` | GitHub repo for persona YAMLs |
+| `METROPLEX_ACADEMY_REPO` | `m2ai-st-metro/st-agent-registry` | GitHub repo for persona YAMLs |
 | `METROPLEX_BUILD_MODEL` | `opus` | Claude model for spec generation |
 | `METROPLEX_APPROVE_THRESHOLD` | `70` | Score threshold for approval (0-100) |
 | `METROPLEX_REJECT_THRESHOLD` | `40` | Score threshold for rejection (0-100) |

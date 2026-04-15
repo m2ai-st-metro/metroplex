@@ -60,7 +60,7 @@ class TestConfigDefaults:
 
     def test_default_academy_repo(self):
         config = Config()
-        assert config.academy_repo == "m2ai-ultra-magnus-IF/st-agent-registry"
+        assert config.academy_repo == "m2ai-st-metro/st-agent-registry"
 
 
 class TestConfigEnvOverrides:
