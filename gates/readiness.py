@@ -18,6 +18,7 @@ from config import Config
 from db import StateDB
 from audit import AuditLogger
 from models import PublishJob
+from gates._idea_context import load_idea_context
 
 logger = logging.getLogger(__name__)
 
@@ -54,17 +55,39 @@ SOFTWARE.
 """
 
 TOPICS_SYSTEM_PROMPT = "You generate GitHub repository topics. Respond with ONLY a JSON array of lowercase topic strings."
-TOPICS_USER_PROMPT = """Given this README content, suggest 5-8 GitHub topics as a JSON array.
-Topics should be lowercase, hyphenated where needed, and relevant to the project's tech stack and purpose.
-Example: ["python", "cli-tool", "automation", "devops"]
+TOPICS_USER_PROMPT = """Given this README content, suggest 8-12 GitHub topics as a JSON array.
+
+Topics must be lowercase, hyphenated where needed (max 50 chars each, no spaces).
+
+Mix two categories:
+1. TECHNICAL (5-7 topics): language, framework, domain, primary capability.
+   Examples: "python", "cli", "fastapi", "knowledge-management", "embeddings"
+2. AUDIENCE / USE-CASE (3-5 topics): who this is for and what they use it for.
+   Derive from the target audience below. These boost discoverability for
+   natural-language search (NLM-style queries, "tools for X" lists).
+   Examples: "researchers", "knowledge-workers", "second-brain", "students",
+   "indie-hackers", "personal-productivity"
+
+Example output: ["python", "cli", "knowledge-management", "embeddings", "search-tool", "researchers", "knowledge-workers", "second-brain", "personal-productivity"]
+
+Target audience (use this to derive the audience tags -- if empty, skip audience tags):
+{target_audience}
 
 README (first 2000 chars):
 {readme_excerpt}"""
 
 DESCRIPTION_SYSTEM_PROMPT = "You write concise GitHub repository descriptions. Respond with ONLY the description text, no quotes."
 DESCRIPTION_USER_PROMPT = """Write a one-sentence GitHub repo description (max 200 chars) as a value proposition.
-The repo is named "{repo_name}" and here is the README excerpt:
+The repo is named "{repo_name}".
 
+If a Problem statement is provided below, base the description primarily on the
+Problem (it captures plain-speak intent better than the README). Otherwise fall
+back to the README excerpt.
+
+Problem statement (may be empty):
+{problem_statement}
+
+README excerpt:
 {readme_excerpt}"""
 
 
@@ -302,7 +325,7 @@ class ReadinessGate:
             }
 
         # Apply fixes for failed checks
-        fixes_applied, fixes_failed = self._apply_fixes(repo_name, failed)
+        fixes_applied, fixes_failed = self._apply_fixes(repo_name, failed, build_job_id)
 
         # Determine final status
         if not fixes_failed:
@@ -489,12 +512,30 @@ class ReadinessGate:
 
     # --- Fix Methods ---
 
-    def _apply_fixes(self, repo_name: str, failed_checks: list[str]) -> tuple[list[str], list[str]]:
-        """Apply auto-fixes for failed checks. Returns (fixes_applied, fixes_failed)."""
+    def _apply_fixes(
+        self,
+        repo_name: str,
+        failed_checks: list[str],
+        build_job_id: str | None = None,
+    ) -> tuple[list[str], list[str]]:
+        """Apply auto-fixes for failed checks. Returns (fixes_applied, fixes_failed).
+
+        build_job_id is used to look up IdeaForge context (problem_statement,
+        target_audience) for the LLM-driven topics/description fixes. Optional
+        for back-compat with non-IdeaForge sources.
+        """
         org = self.config.github_org
         fixes_applied = []
         fixes_failed = []
         llm_calls = 0
+
+        # Resolve idea context once -- both LLM fixes consume it. None for
+        # non-IdeaForge sources or if lookup fails.
+        idea_ctx = None
+        if build_job_id:
+            idea_ctx = load_idea_context(
+                self.state_db, build_job_id, self.config.ideaforge_db
+            )
 
         for check in failed_checks:
             if check == "no_build_artifacts":
@@ -512,7 +553,7 @@ class ReadinessGate:
                     fixes_failed.append(check)
 
             elif check == "has_topics" and llm_calls < 2:
-                ok = self._fix_generate_topics(org, repo_name)
+                ok = self._fix_generate_topics(org, repo_name, idea_ctx)
                 if ok:
                     fixes_applied.append(check)
                     llm_calls += 1
@@ -520,7 +561,7 @@ class ReadinessGate:
                     fixes_failed.append(check)
 
             elif check == "has_description" and llm_calls < 2:
-                ok = self._fix_generate_description(org, repo_name)
+                ok = self._fix_generate_description(org, repo_name, idea_ctx)
                 if ok:
                     fixes_applied.append(check)
                     llm_calls += 1
@@ -591,23 +632,35 @@ class ReadinessGate:
         logger.info(f"Added MIT LICENSE to {repo_name}")
         return True
 
-    def _fix_generate_topics(self, org: str, repo_name: str) -> bool:
-        """Generate and set topics via LLM with retry on bad format."""
+    def _fix_generate_topics(
+        self,
+        org: str,
+        repo_name: str,
+        idea_ctx: dict | None = None,
+    ) -> bool:
+        """Generate and set topics via LLM with retry on bad format.
+
+        idea_ctx (optional) supplies target_audience for audience/use-case tags.
+        """
         if not self.client:
             logger.warning("No LLM client — cannot generate topics")
             return False
 
         readme_content = self._fetch_readme(org, repo_name)
         readme_excerpt = (readme_content or "")[:2000]
+        target_audience = (idea_ctx or {}).get("target_audience", "") or ""
 
-        prompt = TOPICS_USER_PROMPT.format(readme_excerpt=readme_excerpt)
+        prompt = TOPICS_USER_PROMPT.format(
+            readme_excerpt=readme_excerpt,
+            target_audience=target_audience or "(not provided -- skip audience tags)",
+        )
         messages = [
             {"role": "system", "content": TOPICS_SYSTEM_PROMPT},
             {"role": "user", "content": prompt},
         ]
 
         topics = None
-        for attempt in range(2):
+        for attempt in range(3):
             try:
                 response = self.client.chat.completions.create(
                     model=self.config.spec_llm_model,
@@ -615,16 +668,31 @@ class ReadinessGate:
                     max_tokens=256,
                 )
                 raw = response.choices[0].message.content or "[]"
-                match = re.search(r"\[.*\]", raw, re.DOTALL)
-                if match:
-                    topics = json.loads(match.group())
+                # Try all bracket spans; pick the longest that parses as a
+                # list of strings. Nemotron-3 CoT dumps often include small
+                # example arrays earlier in the text, so we can't just take
+                # the first match.
+                candidates = re.findall(r"\[[^\[\]]*\]", raw, re.DOTALL)
+                parsed: list[str] = []
+                for cand in candidates:
+                    try:
+                        val = json.loads(cand)
+                    except (json.JSONDecodeError, ValueError):
+                        continue
+                    if not isinstance(val, list):
+                        continue
+                    strs = [x for x in val if isinstance(x, str) and x.strip()]
+                    if len(strs) > len(parsed):
+                        parsed = strs
+                if len(parsed) >= 3:
+                    topics = parsed
                     break
-                if attempt == 0:
-                    logger.info(f"Topics attempt 1 for {repo_name}: no JSON array, retrying with correction")
+                if attempt < 2:
+                    logger.info(f"Topics attempt {attempt + 1} for {repo_name}: no usable JSON array (best={len(parsed)} strings), retrying with correction")
                     messages.append({"role": "assistant", "content": raw})
                     messages.append({"role": "user", "content": 'That was not a valid JSON array. Output ONLY a JSON array like ["python", "cli", "automation"]. Nothing else.'})
                 else:
-                    logger.warning(f"LLM returned no JSON array for topics after retry: {raw[:100]}")
+                    logger.warning(f"LLM returned no JSON array for topics after {attempt + 1} attempts: {raw[:100]}")
                     return False
             except Exception as e:
                 logger.warning(f"LLM topics generation failed: {e}")
@@ -633,12 +701,12 @@ class ReadinessGate:
         if topics is None:
             return False
 
-        # Enforce bounds: min 3, max 8
+        # Enforce bounds: min 3, max 12 (GitHub allows up to 20; cap at 12 to keep relevance high)
         topics = [t.lower().strip() for t in topics if isinstance(t, str) and t.strip()]
         if len(topics) < 3:
             logger.warning(f"LLM generated too few topics ({len(topics)})")
             return False
-        topics = topics[:8]
+        topics = topics[:12]
 
         # PUT topics
         put_data = json.dumps({"names": topics})
@@ -654,26 +722,43 @@ class ReadinessGate:
         logger.info(f"Set {len(topics)} topics for {repo_name}: {topics}")
         return True
 
-    def _fix_generate_description(self, org: str, repo_name: str) -> bool:
-        """Generate and set repo description via LLM with retry on bad format."""
+    def _fix_generate_description(
+        self,
+        org: str,
+        repo_name: str,
+        idea_ctx: dict | None = None,
+    ) -> bool:
+        """Generate and set repo description via LLM with retry on bad format.
+
+        idea_ctx (optional) supplies problem_statement as primary input -- the
+        original plain-speak framing is closer to a value prop than the
+        re-derived README.
+        """
         if not self.client:
             logger.warning("No LLM client — cannot generate description")
             return False
 
         readme_content = self._fetch_readme(org, repo_name)
         readme_excerpt = (readme_content or "")[:2000]
+        problem_statement = (idea_ctx or {}).get("problem_statement", "") or ""
 
         prompt = DESCRIPTION_USER_PROMPT.format(
             repo_name=repo_name,
             readme_excerpt=readme_excerpt,
+            problem_statement=problem_statement or "(not provided)",
         )
         messages = [
             {"role": "system", "content": DESCRIPTION_SYSTEM_PROMPT},
             {"role": "user", "content": prompt},
         ]
 
+        cot_prefixes = (
+            "okay", "we need", "the user", "let me", "i need", "sure",
+            "here", "based on", "the repo", "this repo", "this is",
+            "looking at", "from the", "the project", "i'll", "alright",
+        )
         description = None
-        for attempt in range(2):
+        for attempt in range(3):
             try:
                 response = self.client.chat.completions.create(
                     model=self.config.spec_llm_model,
@@ -681,23 +766,34 @@ class ReadinessGate:
                     max_tokens=256,
                 )
                 raw = (response.choices[0].message.content or "").strip().strip('"').strip("'")
-                # Check if it looks like thinking text (starts with common CoT patterns)
-                if raw and len(raw) <= 200 and not raw.lower().startswith(("okay", "we need", "the user", "let me", "i need")):
+                # Check if it looks like clean output (no CoT preamble, right length)
+                if raw and len(raw) <= 200 and not raw.lower().startswith(cot_prefixes):
                     description = raw
                     break
-                # Extract last sentence as fallback — often the actual description is at the end
+                # Nemotron-3 frequently dumps CoT but puts the actual
+                # description in quotes. Extract the longest quoted string
+                # that fits the length bounds as a high-confidence fallback.
+                quoted = re.findall(r'"([^"]{30,200})"', raw)
+                if quoted:
+                    # Pick the longest match -- shorter quotes are often
+                    # fragments from the CoT reasoning, not the final answer.
+                    best = max(quoted, key=len)
+                    if not best.lower().startswith(cot_prefixes):
+                        description = best
+                        break
+                # Extract last sentence as fallback -- often the actual description is at the end
                 sentences = [s.strip() for s in raw.split(".") if len(s.strip()) > 20]
                 if sentences and len(sentences[-1]) <= 200:
                     candidate = sentences[-1].strip().rstrip(".")
                     if len(candidate) >= 30:
                         description = candidate
                         break
-                if attempt == 0:
-                    logger.info(f"Description attempt 1 for {repo_name}: got thinking text, retrying")
+                if attempt < 2:
+                    logger.info(f"Description attempt {attempt + 1} for {repo_name}: got thinking text, retrying")
                     messages.append({"role": "assistant", "content": raw})
                     messages.append({"role": "user", "content": "That included extra text. Output ONLY one sentence (max 200 chars) describing this repo's value. No preamble, no thinking, just the sentence."})
                 else:
-                    logger.warning(f"LLM description failed after retry: {raw[:100]}")
+                    logger.warning(f"LLM description failed after {attempt + 1} attempts: {raw[:100]}")
                     return False
             except Exception as e:
                 logger.warning(f"LLM description generation failed: {e}")

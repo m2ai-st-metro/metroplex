@@ -16,6 +16,7 @@ from config import Config
 from db import StateDB
 from audit import AuditLogger
 from models import PublishJob
+from gates._idea_context import load_idea_context
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +36,14 @@ Generate a comprehensive, visually polished README.md for this project.
 
 **Title**: {title}
 
+**Plain-speak description** (use this verbatim as the one-line tagline in the
+banner block -- do NOT invent a new tagline):
+{plain_description}
+
+**Problem this solves** (use this verbatim, lightly edited only for grammar,
+in the dedicated "Problem" section described below):
+{problem_statement}
+
 **App Specification**:
 {spec_text}
 
@@ -51,7 +60,7 @@ Include these sections in this exact order. Output raw markdown only.
   <img src="assets/infographic.png" alt="{title}" width="800">
 </p>
 
-<h3 align="center">REPLACE THIS WITH A ONE-LINE DESCRIPTION (e.g. "Scan dependencies for vulnerabilities without leaving your terminal")</h3>
+<h3 align="center">USE THE PLAIN-SPEAK DESCRIPTION PROVIDED ABOVE -- DO NOT INVENT</h3>
 
 <p align="center">
   <a href="#quick-start">Quick Start</a> &bull;
@@ -69,22 +78,28 @@ $ command --flag input
 [show realistic output here]
 ```
 
-### 3. Features
+### 3. Problem
+Render the "Problem this solves" text provided above as a short prose block
+(2-4 sentences). You may lightly edit for grammar and flow but do not change
+its meaning, do not invent new pain points, and do not omit any concrete
+detail. If the provided problem statement is empty, omit this entire section.
+
+### 4. Features
 A markdown table with two columns: Feature | Description. 4-8 rows covering the
 key capabilities. Derive features from the source code and spec, not generic filler.
 
-### 4. Quick Start
+### 5. Quick Start
 Numbered steps to get running. Include clone, install, and first command. Use actual
 package/command names from the file tree and spec.
 
-### 5. Examples
+### 6. Examples
 2-3 concrete usage examples. Each example should have:
 - A bold title describing the use case
 - The command to run
 - Realistic sample output (not just "output here" placeholders)
 Make examples progressively more advanced.
 
-### 6. File Structure
+### 7. File Structure
 A clean file tree showing the project layout. Use the provided file tree but clean
 it up -- remove noise files, group logically, add inline comments for key files:
 ```
@@ -94,16 +109,16 @@ it up -- remove noise files, group logically, add inline comments for key files:
   ...
 ```
 
-### 7. Tech Stack
+### 8. Tech Stack
 A compact markdown table: Technology | Purpose. Only include what's actually used.
 
-### 8. Contributing
+### 9. Contributing
 Brief section: fork, edit, test, PR. 4 lines max.
 
-### 9. License
+### 10. License
 MIT
 
-### 10. Author
+### 11. Author
 ```
 Matthew Snow -- [M2AI](https://m2ai.co) | [@m2ai-portfolio](https://github.com/m2ai-portfolio)
 ```
@@ -268,6 +283,13 @@ class ReadmeGate:
         # 2. Build file tree
         file_tree = self._build_file_tree(project_path)
 
+        # 2b. Resolve original IdeaForge framing (plain-speak + problem). May be None.
+        idea_ctx = load_idea_context(
+            self.state_db, build_job_id, self.config.ideaforge_db
+        )
+        plain_description = (idea_ctx or {}).get("description", "") or ""
+        problem_statement = (idea_ctx or {}).get("problem_statement", "") or ""
+
         # 3. Generate README content via LLM
         if not self.client:
             error = "DEEPINFRA_API_KEY not set — cannot generate README"
@@ -279,15 +301,21 @@ class ReadmeGate:
             )
             return {"build_job_id": build_job_id, "status": "failed", "error": error}
 
-        readme_content = self._generate_readme_content(spec_text, file_tree, title)
+        readme_content = self._generate_readme_content(
+            spec_text, file_tree, title,
+            plain_description=plain_description,
+            problem_statement=problem_statement,
+        )
 
         # 4. Generate infographic via banana-maker
         assets_dir = project_path / "assets"
         assets_dir.mkdir(exist_ok=True)
         infographic_path = assets_dir / "infographic.png"
 
-        features = self._extract_features(readme_content)
-        infographic_ok = self._generate_infographic(title, features, infographic_path)
+        # Prefer the plain-speak description as the visual brief; fall back to
+        # problem statement, then to extracted features (legacy behavior).
+        value_prop = plain_description or problem_statement or self._extract_features(readme_content)
+        infographic_ok = self._generate_infographic(title, value_prop, infographic_path)
         if not infographic_ok:
             logger.warning(f"Infographic generation failed for {title} — continuing without it")
             # Remove the infographic reference from README if generation failed
@@ -378,7 +406,14 @@ class ReadmeGate:
         _walk(project_path, "", 0)
         return "\n".join(lines[:100])  # Cap at 100 lines
 
-    def _generate_readme_content(self, spec_text: str, file_tree: str, title: str) -> str:
+    def _generate_readme_content(
+        self,
+        spec_text: str,
+        file_tree: str,
+        title: str,
+        plain_description: str = "",
+        problem_statement: str = "",
+    ) -> str:
         """
         Generate README content using Nemotron-3 via DeepInfra.
 
@@ -386,6 +421,10 @@ class ReadmeGate:
             spec_text: The app specification text
             file_tree: Project file tree string
             title: Project title
+            plain_description: Plain-speak one-liner from IdeaForge (used verbatim
+                in banner). Empty string if not available.
+            problem_statement: Problem framing from IdeaForge (used verbatim in
+                Problem section). Empty string if not available.
 
         Returns:
             Generated README markdown content
@@ -394,6 +433,8 @@ class ReadmeGate:
             title=title,
             spec_text=spec_text,
             file_tree=file_tree,
+            plain_description=plain_description or "(not provided -- write a concise one-liner from the spec)",
+            problem_statement=problem_statement or "",
         )
 
         response = self.client.chat.completions.create(
@@ -436,13 +477,15 @@ class ReadmeGate:
 
         return ", ".join(features[:6]) if features else "developer tool, automation, CLI"
 
-    def _generate_infographic(self, title: str, features: str, output_path: Path) -> bool:
+    def _generate_infographic(self, title: str, value_prop: str, output_path: Path) -> bool:
         """
-        Generate an infographic using banana-maker.
+        Generate a hero image using banana-maker.
 
         Args:
             title: Project title
-            features: Comma-separated feature list
+            value_prop: One-line plain-speak description of what the project does
+                (used as the visual brief). May fall back to a feature list if no
+                IdeaForge context is available.
             output_path: Where to save the generated image
 
         Returns:
@@ -452,15 +495,19 @@ class ReadmeGate:
             logger.warning(f"banana-maker script not found at {BANANA_MAKER_SCRIPT}")
             return False
 
-        prompt = (
-            f"Create a clean, modern infographic for a developer tool called '{title}'. "
-            f"Show the key features: {features}. "
-            f"Use a dark theme with blue/purple accents. "
-            f"Minimalist style, no text-heavy elements."
-        )
+        prompt = self._build_infographic_prompt(title, value_prop)
 
         # Ensure parent dir exists
         output_path.parent.mkdir(parents=True, exist_ok=True)
+
+        # Remove stale images before generation so the .png/.jpg check below
+        # cannot be fooled by a leftover file from a previous run. banana-maker
+        # always writes .jpg regardless of the requested extension, so an old
+        # .png file would shadow the new output if not removed first.
+        for stale in (output_path, output_path.with_suffix(".jpg")):
+            if stale.is_file():
+                stale.unlink()
+                logger.info(f"Removed stale {stale.name} before regeneration")
 
         try:
             python_bin = str(BANANA_MAKER_PYTHON) if BANANA_MAKER_PYTHON.is_file() else "python3"
@@ -482,13 +529,14 @@ class ReadmeGate:
                 logger.error(f"banana-maker failed: {result.stderr.strip()}")
                 return False
 
-            # banana-maker may save as .jpg instead of .png
-            if output_path.is_file():
-                return True
+            # banana-maker saves as .jpg regardless of requested extension
             jpg_path = output_path.with_suffix(".jpg")
             if jpg_path.is_file():
                 jpg_path.rename(output_path)
                 return True
+            if output_path.is_file():
+                return True
+            logger.error("banana-maker produced no output file")
             return False
 
         except subprocess.TimeoutExpired:
@@ -576,24 +624,40 @@ class ReadmeGate:
         except Exception as e:
             return (False, f"git error: {str(e)}")
 
-    def build_infographic_command(self, title: str, features: str, output_path: str) -> list[str]:
+    def _build_infographic_prompt(self, title: str, value_prop: str) -> str:
+        """
+        Build the banana-maker prompt for a project hero image.
+
+        Style brief: vibrant magazine-cover, single visual metaphor, warm palette.
+        Explicit negatives keep banana-maker from defaulting to flat-vector
+        infographic clutter (per banana-maker prompt-pattern feedback).
+        """
+        brief = (value_prop or "a developer tool").strip().rstrip(".")
+        return (
+            f"Create a vibrant, warm hero image for a developer tool called '{title}'. "
+            f"Single central visual metaphor representing: {brief}. "
+            f"NO feature lists, NO bullet points, NO multiple panels, NO grids, "
+            f"NO icons-in-boxes, NO text labels beyond the project name. "
+            f"Think editorial magazine cover, not infographic. "
+            f"Warm vibrant palette: sunset oranges, magentas, gold and amber accents "
+            f"on a deep indigo or charcoal background. Cinematic lighting, modern "
+            f"editorial illustration style with rich color saturation. "
+            f"NOT flat vector, NOT clip-art, NOT a schematic diagram."
+        )
+
+    def build_infographic_command(self, title: str, value_prop: str, output_path: str) -> list[str]:
         """
         Build the banana-maker subprocess command (exposed for testing).
 
         Args:
             title: Project title
-            features: Comma-separated feature list
+            value_prop: One-line value proposition (visual brief)
             output_path: Output file path
 
         Returns:
             Command list for subprocess
         """
-        prompt = (
-            f"Create a clean, modern infographic for a developer tool called '{title}'. "
-            f"Show the key features: {features}. "
-            f"Use a dark theme with blue/purple accents. "
-            f"Minimalist style, no text-heavy elements."
-        )
+        prompt = self._build_infographic_prompt(title, value_prop)
         python_bin = str(BANANA_MAKER_PYTHON) if BANANA_MAKER_PYTHON.is_file() else "python3"
         return [
             python_bin,

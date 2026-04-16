@@ -139,7 +139,7 @@ class TestInfographicCommand:
         """Built command includes all required arguments."""
         cmd = readme_gate.build_infographic_command(
             title="Test Tool",
-            features="CLI, automation, fast",
+            value_prop="A CLI tool for automating dev workflows",
             output_path="/tmp/infographic.png",
         )
         assert "python3" in cmd[0]
@@ -151,17 +151,19 @@ class TestInfographicCommand:
         assert "--aspect-ratio" in cmd
         assert "16:9" in cmd
 
-    def test_prompt_includes_title_and_features(self, readme_gate):
-        """The prompt argument includes title and features."""
+    def test_prompt_includes_title_and_value_prop(self, readme_gate):
+        """The prompt argument includes title and the value prop brief."""
         cmd = readme_gate.build_infographic_command(
             title="My Tool",
-            features="feature-a, feature-b",
+            value_prop="search your notes from the terminal",
             output_path="/tmp/out.png",
         )
         # The prompt is cmd[2]
         assert "My Tool" in cmd[2]
-        assert "feature-a" in cmd[2]
-        assert "feature-b" in cmd[2]
+        assert "search your notes from the terminal" in cmd[2]
+        # New style guarantees: warm palette, magazine cover framing
+        assert "vibrant" in cmd[2].lower()
+        assert "magazine cover" in cmd[2].lower()
 
 
 class TestFileTree:
