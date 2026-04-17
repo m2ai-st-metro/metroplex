@@ -4,7 +4,8 @@
 # starts a fresh session, and verifies the heartbeat is renewed within 60 seconds.
 set -euo pipefail
 
-PROJ=/tmp/cmd-mt-181f025a
+# Project root resolved from this script's location: deploy/restart...sh -> ../
+PROJ="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
 QUEUE_ROOT="${PROJ}/data/self_healing_queue"
 IN_FLIGHT="${QUEUE_ROOT}/in_flight/worker-1"
 FAILED_DIR="${QUEUE_ROOT}/failed"
