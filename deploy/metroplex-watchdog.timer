@@ -1,9 +1,11 @@
 [Unit]
-Description=Run Metroplex watchdog every 15 minutes
+Description=Run Metroplex watchdog every 5 minutes
 
 [Timer]
 OnBootSec=5min
-OnUnitActiveSec=15min
+# Tightened from 15min to 5min (2026-04-17) to catch self-healing daemon outages sooner.
+# After deploying: systemctl --user daemon-reload && systemctl --user restart metroplex-watchdog.timer
+OnUnitActiveSec=5min
 Persistent=true
 
 [Install]

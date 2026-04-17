@@ -7,6 +7,7 @@ import logging
 import os
 import sqlite3
 import subprocess
+import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import IntEnum
@@ -290,6 +291,24 @@ def _check_orphan_processes(metroplex_pid: int | None = None) -> CheckResult:
     return CheckResult(name, HealthStatus.OK, "No orphan processes")
 
 
+def _check_self_healing_daemon(queue_root: Path) -> CheckResult:
+    """WARN at 15 min stale heartbeat, CRIT at 30 min or if file absent."""
+    name = "self_healing_daemon"
+    heartbeat = queue_root / "heartbeat-worker-1.txt"
+
+    if not heartbeat.exists():
+        return CheckResult(name, HealthStatus.CRIT, "Heartbeat file missing -- daemon is not running")
+
+    age_seconds = time.time() - heartbeat.stat().st_mtime
+    age_min = age_seconds / 60.0
+
+    if age_seconds > 1800:
+        return CheckResult(name, HealthStatus.CRIT, f"Heartbeat stale {age_min:.1f} min (>30 min) -- daemon likely dead")
+    if age_seconds > 900:
+        return CheckResult(name, HealthStatus.WARN, f"Heartbeat stale {age_min:.1f} min (>15 min) -- daemon may be stuck")
+    return CheckResult(name, HealthStatus.OK, f"Heartbeat fresh {age_min:.1f} min ago")
+
+
 def _detect_metroplex_pid() -> int:
     """Get the main Metroplex service PID from systemd. Returns 0 if not running."""
     try:
@@ -390,6 +409,7 @@ def run_health_checks(
     db_path: str,
     daily_cost_limit: float = 50.0,
     metroplex_pid: int | None = None,
+    queue_root: Path | None = None,
 ) -> HealthReport:
     """Run all pipeline health checks and return an aggregated report.
 
@@ -397,6 +417,7 @@ def run_health_checks(
         db_path: Path to metroplex.db (opened read-only).
         daily_cost_limit: Daily spending cap for budget check.
         metroplex_pid: PID of Metroplex service. None = auto-detect, 0 = skip orphan check.
+        queue_root: Path to self_healing_queue dir. None = default relative to db_path parent.
 
     Returns:
         HealthReport with per-check results and an overall status equal to
@@ -424,6 +445,11 @@ def run_health_checks(
 
     # Orphan process check (no DB needed)
     checks.append(_check_orphan_processes(metroplex_pid))
+
+    # Self-healing daemon heartbeat check
+    if queue_root is None:
+        queue_root = Path(db_path).parent / "self_healing_queue"
+    checks.append(_check_self_healing_daemon(queue_root))
 
     overall = HealthStatus(max(c.status for c in checks))
     return HealthReport(overall_status=overall, checks=checks)
