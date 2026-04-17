@@ -86,7 +86,7 @@ class Config:
 
     # Spec generation (LLM expansion)
     spec_use_llm: bool = field(default=True)
-    spec_llm_model: str = field(default="nvidia/NVIDIA-Nemotron-3-Super-120B-A12B")
+    spec_llm_model: str = field(default="Qwen/Qwen2.5-72B-Instruct")
     spec_llm_max_tokens: int = field(default=8192)
 
     # Dispatch (EA-Claude worker queue)

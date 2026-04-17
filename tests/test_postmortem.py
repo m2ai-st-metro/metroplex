@@ -195,6 +195,64 @@ class TestCapturePostmortem:
         assert row["idea_weighted_score"] == 7.5
         assert row["idea_artifact_type"] == "tool"
 
+    def test_capture_error_message_surfaces_signature(self, state_db):
+        """error_message is stored as error_signature when no log file is provided."""
+        msg = "ValueError: LLM spec rejected for idea 252 after 3 attempts: Template parroting"
+        result = capture_postmortem(
+            state_db=state_db,
+            queue_job_id="metroplex-ideaforge-252",
+            idea_id=252,
+            title="AgentTrace",
+            error_message=msg,
+        )
+        assert result is True
+
+        state_db.connect()
+        row = state_db.conn.execute(
+            "SELECT * FROM build_postmortems WHERE queue_job_id = ?",
+            ("metroplex-ideaforge-252",),
+        ).fetchone()
+        # The raw exception string should appear in error_signature
+        assert row["error_signature"] != ""
+        assert "252" in row["error_signature"] or "parroting" in row["error_signature"]
+
+    def test_capture_error_message_classifies_known_pattern(self, state_db):
+        """error_message containing a known pattern overrides spec_unclear."""
+        msg = "TimeoutError: Build exceeded 90 minute limit"
+        capture_postmortem(
+            state_db=state_db,
+            queue_job_id="metroplex-ideaforge-300",
+            idea_id=300,
+            title="Timeout Test",
+            error_message=msg,
+        )
+        state_db.connect()
+        row = state_db.conn.execute(
+            "SELECT * FROM build_postmortems WHERE queue_job_id = ?",
+            ("metroplex-ideaforge-300",),
+        ).fetchone()
+        assert row["failure_category"] == "timeout"
+
+    def test_capture_error_message_ignored_when_log_exists(self, state_db, tmp_path):
+        """error_message is not used when a real log file is present."""
+        log_file = tmp_path / "build.log"
+        log_file.write_text("SyntaxError: unexpected indent")
+        capture_postmortem(
+            state_db=state_db,
+            queue_job_id="metroplex-ideaforge-301",
+            idea_id=301,
+            title="Log wins",
+            log_path=str(log_file),
+            error_message="TimeoutError: this should be ignored",
+        )
+        state_db.connect()
+        row = state_db.conn.execute(
+            "SELECT * FROM build_postmortems WHERE queue_job_id = ?",
+            ("metroplex-ideaforge-301",),
+        ).fetchone()
+        # Log file content governs classification, not error_message
+        assert row["failure_category"] == "build_error"
+
 
 class TestGetFailurePatterns:
     """Test aggregation of failure patterns."""

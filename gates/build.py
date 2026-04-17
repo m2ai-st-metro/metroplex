@@ -1397,6 +1397,7 @@ class BuildOrchestrator:
                             title=idea.get("title", "Unknown"),
                             log_path=None,
                             spec_path=None,
+                            error_message=str(e),
                         )
 
             self.audit_logger.log_decision(

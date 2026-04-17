@@ -163,6 +163,7 @@ def capture_postmortem(
     retry_count: int | None = None,
     review_status: str | None = None,
     quality_score: float | None = None,
+    error_message: str | None = None,
 ) -> bool:
     """Capture a structured post-mortem for a failed build.
 
@@ -180,6 +181,7 @@ def capture_postmortem(
         retry_count: Retry attempt number (0 or None = first attempt)
         review_status: Build's review_status from build_jobs (optional)
         quality_score: Build's quality_score from build_jobs (optional)
+        error_message: Exception string from the caller (used when no log file exists)
 
     Returns:
         True if postmortem was captured, False if skipped or errored
@@ -200,9 +202,15 @@ def capture_postmortem(
             logger.debug("Postmortem already exists for %s, skipping", dedup_key)
             return False
 
-        # Read and classify from log text
+        # Read and classify from log text; fall back to caller-supplied error_message
         log_text = _read_log_file(log_path)
-        failure_category, failure_stage, error_signature = classify_failure(log_text)
+        if not log_text and error_message:
+            failure_category, failure_stage, error_signature = classify_failure(error_message)
+            # Even if the pattern still yields spec_unclear, store the raw message
+            if not error_signature:
+                error_signature = error_message[:500]
+        else:
+            failure_category, failure_stage, error_signature = classify_failure(log_text)
 
         # If log-based classification yielded spec_unclear, try gate-based classification
         if failure_category == "spec_unclear" and (review_status or quality_score is not None):

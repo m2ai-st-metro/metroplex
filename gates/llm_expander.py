@@ -342,7 +342,7 @@ class LLMSpecExpander:
 
     def __init__(
         self,
-        model: str = "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B",
+        model: str = "Qwen/Qwen2.5-72B-Instruct",
         max_tokens: int = 8192,
         api_key: Optional[str] = None,
         state_db=None,
