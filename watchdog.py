@@ -152,14 +152,42 @@ def _notify_galvatron(alert_message: str, level: str) -> bool:
     return galvatron_notifier.notify(alert_message, level=level)
 
 
+def _restart_self_healing_daemon() -> bool:
+    """Run the restart script for the self-healing daemon.
+
+    Only called when METROPLEX_AUTO_RESTART_SELF_HEALING=true and the
+    self_healing_daemon check is CRIT. Returns True if the script exited 0.
+    """
+    restart_script = Path(__file__).parent / "deploy" / "restart-self-healing-daemon.sh"
+    if not restart_script.exists():
+        logger.warning("Restart script not found at %s -- skipping auto-restart", restart_script)
+        return False
+    try:
+        result = subprocess.run(
+            [str(restart_script)],
+            timeout=120,
+            capture_output=False,
+        )
+        if result.returncode == 0:
+            logger.info("Auto-restart of self-healing daemon succeeded")
+            return True
+        logger.warning("Auto-restart script exited %d", result.returncode)
+        return False
+    except (subprocess.TimeoutExpired, OSError) as e:
+        logger.warning("Auto-restart script failed: %s", e)
+        return False
+
+
 def run_watchdog(dry_run: bool = False) -> int:
     """Run the watchdog cycle.
 
     1. Execute health checks against metroplex.db.
     2. If orphan processes at CRIT level, kill them (self-healing).
-    3. If CRIT or WARN, send Telegram alert to both Metroplex and Galvatron.
-    4. If CRIT or WARN, dispatch a diagnostic mission to Galvatron via Mission Control.
-    5. If OK, stay silent (no notification).
+    3. If self_healing_daemon CRIT and METROPLEX_AUTO_RESTART_SELF_HEALING=true,
+       run the restart script before alerting.
+    4. If CRIT or WARN, send Telegram alert to both Metroplex and Galvatron.
+    5. If CRIT or WARN, dispatch a diagnostic mission to Galvatron via Mission Control.
+    6. If OK, stay silent (no notification).
 
     Args:
         dry_run: If True, print the report to stdout instead of sending Telegram.
@@ -186,6 +214,13 @@ def run_watchdog(dry_run: bool = False) -> int:
         if mpid > 0:
             killed = kill_orphan_processes(mpid)
             logger.info("Self-healed: killed %d orphan processes", len(killed))
+
+    # Auto-restart self-healing daemon on CRIT (feature-flagged, default OFF)
+    daemon_check = next((c for c in report.checks if c.name == "self_healing_daemon"), None)
+    auto_restart = os.environ.get("METROPLEX_AUTO_RESTART_SELF_HEALING", "").lower() == "true"
+    if daemon_check and daemon_check.status == HealthStatus.CRIT and auto_restart and not dry_run:
+        logger.warning("self_healing_daemon CRIT -- attempting auto-restart (METROPLEX_AUTO_RESTART_SELF_HEALING=true)")
+        _restart_self_healing_daemon()
 
     if dry_run:
         print(formatted)
