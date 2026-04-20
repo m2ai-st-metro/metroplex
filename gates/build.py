@@ -1033,6 +1033,12 @@ class BuildOrchestrator:
         queued_jobs = []
 
         for _ in range(dispatch_limit):
+            # Tracks the job appended by *this* iteration. Used by the bottom-of-loop
+            # audit log and item-status update. Never read jobs[-1] here — early-exit
+            # continues skip the audit, and a future code path that reaches the audit
+            # without appending would silently reference the PREVIOUS iteration's job.
+            current_job: BuildJob | None = None
+
             if dry_run:
                 item = state_db.get_next_pending(sources=buildable_sources)
             else:
@@ -1229,6 +1235,7 @@ class BuildOrchestrator:
                 )
                 self.state_db.record_build_job(job)
                 jobs.append(job)
+                current_job = job
             else:
                 # Local build: generate spec → Tyrest review → queue YCE
                 try:
@@ -1307,6 +1314,7 @@ class BuildOrchestrator:
                             )
                             self.state_db.record_build_job(job)
                             jobs.append(job)
+                            current_job = job
                             # Capture postmortem for Tyrest pre-build rejection
                             if not dry_run:
                                 capture_postmortem(
@@ -1371,6 +1379,7 @@ class BuildOrchestrator:
                             except Exception as e:
                                 logger.warning("Failed to store feasibility score: %s", e)
                         jobs.append(job)
+                        current_job = job
                         if job.status == "queued":
                             queued_jobs.append(job)
 
@@ -1388,6 +1397,7 @@ class BuildOrchestrator:
                     )
                     self.state_db.record_build_job(job)
                     jobs.append(job)
+                    current_job = job
                     # Capture postmortem for pre-build failures
                     if not dry_run:
                         capture_postmortem(
@@ -1407,7 +1417,7 @@ class BuildOrchestrator:
                     "idea_id": idea["id"],
                     "job_id": job_id,
                     "title": idea["title"],
-                    "status": jobs[-1].status if jobs else "unknown",
+                    "status": current_job.status if current_job is not None else "unknown",
                     "route": "oz-cloud" if oz_run_id else "yce-local",
                 },
             )
@@ -1415,7 +1425,7 @@ class BuildOrchestrator:
             # Item was already atomically claimed as 'dispatched' by claim_next_pending().
             # Only update if the build dispatch actually failed.
             if not dry_run and item.id:
-                last_status = jobs[-1].status if jobs else "failed"
+                last_status = current_job.status if current_job is not None else "failed"
                 if last_status != "queued":
                     state_db.update_item_status(item.id, "failed", "completed_at")
 
