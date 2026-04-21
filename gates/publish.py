@@ -276,32 +276,37 @@ class PublishGate:
                 # Repo exists -- just set remote and push (handles re-runs)
                 return self._push_existing(project_dir, full_name, repo_url)
 
-            # Create new repo
+            # Create new repo via the org-scoped API endpoint.
+            # NOTE: `gh repo create <org>/<name>` probes /users/<owner> to resolve
+            # owner type before creating, which 404s for orgs under classic-PAT
+            # auth (observed on gh v2.88.1). Calling POST /orgs/<org>/repos
+            # directly bypasses the probe.
+            private = self.config.publish_visibility != "public"
             create_result = subprocess.run(
                 [
-                    "gh", "repo", "create", full_name,
-                    f"--{self.config.publish_visibility}",
-                    "--description", title[:255],
-                    "--source", str(project_dir),
-                    "--push",
+                    "gh", "api",
+                    f"orgs/{self.config.github_org}/repos",
+                    "-f", f"name={repo_name}",
+                    "-F", f"private={str(private).lower()}",
+                    "-f", f"description={title[:255]}",
                 ],
                 capture_output=True,
                 text=True,
-                timeout=120,
-                cwd=str(project_dir),
+                timeout=60,
             )
 
             if create_result.returncode != 0:
                 stderr = create_result.stderr.strip()
-                # If "already exists", try push_existing
-                if "already exists" in stderr:
+                # If "already exists" (422), fall through to push_existing
+                if "already exists" in stderr or "name already exists" in stderr:
                     return self._push_existing(project_dir, full_name, repo_url)
-                return ("failed", None, f"gh repo create failed: {stderr}")
+                return ("failed", None, f"gh api create failed: {stderr}")
 
-            return ("published", repo_url, None)
+            # Repo created -- now set remote and push
+            return self._push_existing(project_dir, full_name, repo_url)
 
         except subprocess.TimeoutExpired:
-            return ("failed", None, "gh command timed out (120s)")
+            return ("failed", None, "gh command timed out (60s)")
         except Exception as e:
             return ("failed", None, f"unexpected error: {str(e)}")
 

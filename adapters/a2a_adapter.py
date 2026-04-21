@@ -100,7 +100,7 @@ class A2AAdapter:
                     self.event_emitter.emit("a2a_dispatch_failed", {
                         "job_id": job_id, "error": error_msg,
                         "error_code": error_code,
-                    })
+                    }, correlation_id=job_id)
                 return BuildAdapterResult(
                     job_id=job_id, status="failed", runtime=self.runtime,
                     error=f"A2A server error (code={error_code}): {error_msg}",
@@ -135,7 +135,7 @@ class A2AAdapter:
             if self.event_emitter:
                 self.event_emitter.emit("a2a_dispatch_failed", {
                     "job_id": job_id, "error": error_msg,
-                })
+                }, correlation_id=job_id)
             return BuildAdapterResult(
                 job_id=job_id, status="failed", runtime=self.runtime, error=error_msg,
             )
@@ -182,7 +182,7 @@ class A2AAdapter:
                         "task_id": task_id,
                         "old_state": old_state,
                         "new_state": a2a_state,
-                    })
+                    }, correlation_id=job_id)
                 self._last_states[task_id] = a2a_state
 
                 job_info = {"job_id": job_id, "status": metroplex_status, "a2a_task_id": task_id}

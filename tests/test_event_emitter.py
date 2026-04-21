@@ -11,9 +11,30 @@ def test_emit_creates_json_file(tmp_path):
     assert result.exists()
     data = json.loads(result.read_text())
     assert data["event_type"] == "build_failed"
+    # Portfolio-wide event correlation schema: source_repo is canonical,
+    # source is a deprecated alias kept equal to source_repo.
+    assert data["source_repo"] == "metroplex"
     assert data["source"] == "metroplex"
+    # correlation_id is a top-level field; default is None.
+    assert "correlation_id" in data
+    assert data["correlation_id"] is None
     assert data["details"]["job_id"] == "test-1"
     assert "timestamp" in data
+
+
+def test_emit_with_correlation_id(tmp_path):
+    """correlation_id passed to emit() lands as a top-level JSON field."""
+    emitter = EventEmitter(events_dir=tmp_path)
+    result = emitter.emit(
+        "build_failed",
+        {"job_id": "test-1"},
+        correlation_id="idea-42",
+    )
+    assert result is not None
+    data = json.loads(result.read_text())
+    assert data["correlation_id"] == "idea-42"
+    assert data["source_repo"] == "metroplex"
+    assert data["source"] == "metroplex"
 
 
 def test_emit_atomic_no_tmp_files(tmp_path):

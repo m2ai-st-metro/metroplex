@@ -248,7 +248,7 @@ def run_ego_cycle(
                         "experiment_id": experiment_id,
                         "improvement_pct": comparison.improvement_pct,
                         "reason": comparison.reason,
-                    })
+                    }, correlation_id=str(experiment_id))
         else:
             logger.info(
                 "EGO: winner found but AUTO_APPLY_ENABLED=False -- "
@@ -264,7 +264,7 @@ def run_ego_cycle(
             "improvement_pct": comparison.improvement_pct,
             "is_winner": comparison.is_winner,
             "reason": comparison.reason,
-        })
+        }, correlation_id=str(experiment_id))
 
     return comparison
 

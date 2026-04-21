@@ -221,7 +221,7 @@ class TestA2AAdapterPoll:
             "task_id": "task-3",
             "old_state": "submitted",
             "new_state": "working",
-        })
+        }, correlation_id="job-3")
 
 
 class TestA2AAdapterCircuitBreaker:

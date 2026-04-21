@@ -16,20 +16,46 @@ DEFAULT_EVENTS_DIR = Path.home() / ".local" / "share" / "skylynx-events"
 
 
 class EventEmitter:
-    """Emits pipeline events as JSON files for Sky-Lynx consumption."""
+    """Emits pipeline events as JSON files for Sky-Lynx consumption.
 
-    def __init__(self, events_dir: Path | None = None):
+    Events carry ``source_repo`` (the new portfolio-wide field) and keep
+    ``source`` as a deprecated alias for back-compat with existing Sky-Lynx
+    consumers. Both are always populated with the same value.
+    """
+
+    def __init__(
+        self,
+        events_dir: Path | None = None,
+        source_repo: str = "metroplex",
+    ):
         self.events_dir = events_dir or Path(
             os.environ.get("SKYLYNX_EVENTS_DIR", str(DEFAULT_EVENTS_DIR))
         )
+        self.source_repo = source_repo
         self.events_dir.mkdir(parents=True, exist_ok=True)
 
-    def emit(self, event_type: str, details: dict) -> Path | None:
-        """Write an event file atomically. Returns the path, or None on failure."""
+    def emit(
+        self,
+        event_type: str,
+        details: dict,
+        correlation_id: str | None = None,
+    ) -> Path | None:
+        """Write an event file atomically. Returns the path, or None on failure.
+
+        Args:
+            event_type: Logical event name (e.g. ``build_failed``).
+            details: Arbitrary JSON-serializable payload.
+            correlation_id: Optional ID tying events across gates
+                (e.g. idea_id, build_id, mission_id). Stored as a top-level
+                field so Sky-Lynx / CMD consumers can correlate without
+                digging into ``details``.
+        """
         event = {
             "event_type": event_type,
+            "source_repo": self.source_repo,
+            "correlation_id": correlation_id,
             "timestamp": datetime.now(timezone.utc).isoformat(),
-            "source": "metroplex",
+            "source": self.source_repo,  # deprecated alias, kept for back-compat
             "details": details,
         }
         filename = f"{time.time_ns()}.json"

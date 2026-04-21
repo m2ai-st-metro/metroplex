@@ -906,14 +906,14 @@ class CycleOrchestrator:
                             "job_id": job_id,
                             "title": build["title"] if build else job_id,
                             "quality_score": build.get("quality_score") if build else None,
-                        })
+                        }, correlation_id=job_id)
                     for job_id in failed:
                         build = self.state_db.get_build_by_queue_job_id(job_id)
                         self.event_emitter.emit("build_failed", {
                             "job_id": job_id,
                             "title": build["title"] if build else job_id,
                             "retry_count": build.get("retry_count") if build else None,
-                        })
+                        }, correlation_id=job_id)
         except Exception as e:
             # Non-fatal -- log and continue to publish gate
             self.audit_logger.log_error("build", f"Status poll failed: {e}")
