@@ -121,9 +121,6 @@ def _classify_from_gate_status(
     Returns:
         (failure_category, failure_stage, error_signature)
     """
-    if review_status == "tyrest_rejected":
-        sig = f"Tyrest QA rejected build (quality_score={quality_score})"
-        return ("quality_rejected", "review", sig)
     if review_status == "review_failed":
         sig = f"Automated review checks failed (quality_score={quality_score})"
         return ("review_failed", "review", sig)

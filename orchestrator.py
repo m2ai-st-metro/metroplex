@@ -24,7 +24,6 @@ from gates.publish import PublishGate
 from gates.readme import ReadmeGate
 from gates.readiness import ReadinessGate
 from gates.review import ReviewGate
-from gates.tyrest import TyrestGate
 from notifier import Notifier, LogNotifier
 from dispatcher import Dispatcher, LogDispatcher, route_to_worker, build_dispatch_prompt
 from readers.academy_reader import AcademyReader
@@ -65,7 +64,6 @@ class CycleOrchestrator:
         academy_reader: AcademyReader | None = None,
         publish_gate: PublishGate | None = None,
         review_gate: ReviewGate | None = None,
-        tyrest_gate: TyrestGate | None = None,
         dispatcher: Dispatcher | None = None,
         outcome_emitter: OutcomeEmitter | None = None,
         event_emitter: EventEmitter | None = None,
@@ -93,7 +91,6 @@ class CycleOrchestrator:
             academy_reader: AcademyReader instance (optional, enables Academy promotion intake)
             publish_gate: PublishGate instance (optional, enables Gate 4)
             review_gate: ReviewGate instance (optional, enables Gate 4.5 code review)
-            tyrest_gate: TyrestGate instance (optional, enables Gate 4.25 LLM QA review)
             dispatcher: Dispatcher for routing non-buildable items to ClaudeClaw workers
             outcome_emitter: OutcomeEmitter for writing terminal-state outcomes to ST Records
             event_emitter: EventEmitter for Sky-Lynx reactive triggers (Phase F)
@@ -106,7 +103,6 @@ class CycleOrchestrator:
         self.patch_gate = patch_gate
         self.publish_gate = publish_gate
         self.review_gate = review_gate
-        self.tyrest_gate = tyrest_gate
         self.circuit_breaker = circuit_breaker
         self.cycle_caps = cycle_caps
         self.shutdown_handler = shutdown_handler
@@ -1109,15 +1105,6 @@ class CycleOrchestrator:
             except Exception as e:
                 self.audit_logger.log_error("review", f"Review gate failed: {e}")
 
-        # Gate 4.25 (Tyrest LLM QA review) — UNWIRED 2026-04-14.
-        # Audit (208 builds) showed 84% pure redundancy with ReviewGate, and the
-        # remaining 5 unique catches (2.4%) are already covered by the auto-tightened
-        # test_coverage_threshold (0.3453) and quality_threshold (47.2) ratchets.
-        # gates/tyrest.py left in tree for one-week soak; delete after 2026-04-21
-        # if no regressions surface. See conversation 2026-04-14.
-        if False and self.tyrest_gate is not None and review_count > 0:
-            pass  # disabled — see comment above
-
         # Quality scoring (Phase 14b) — score builds that passed review
         if review_count > 0:
             try:
@@ -1132,15 +1119,7 @@ class CycleOrchestrator:
                     if not project_dir.is_dir():
                         continue
 
-                    # Use Tyrest overall score if this build was Tyrest-reviewed
-                    tyrest_overall = None
-                    if self.tyrest_gate is not None and build.get("review_status") not in ("tyrest_rejected",):
-                        # Check if we have a Tyrest result from this cycle
-                        # The tyrest_result is only available for the current iteration;
-                        # for already-reviewed builds, we don't re-score Tyrest
-                        pass  # Tyrest score will be None for now; 14c can enhance
-
-                    breakdown = score_project(project_dir, tyrest_overall=tyrest_overall)
+                    breakdown = score_project(project_dir)
                     if not dry_run:
                         self.state_db.update_build_quality_score(
                             r.queue_job_id, breakdown.total_score,

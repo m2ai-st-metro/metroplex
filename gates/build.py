@@ -213,7 +213,7 @@ class BuildOrchestrator:
     to the inline subprocess implementation for backward compatibility.
     """
 
-    def __init__(self, config: Config, state_db: StateDB, spec_generator: SpecGenerator, audit_logger: AuditLogger, tyrest_gate=None, ideaforge_reader: Optional[IdeaForgeReader] = None, adapter=None):
+    def __init__(self, config: Config, state_db: StateDB, spec_generator: SpecGenerator, audit_logger: AuditLogger, ideaforge_reader: Optional[IdeaForgeReader] = None, adapter=None):
         """
         Initialize Build Orchestrator.
 
@@ -222,7 +222,6 @@ class BuildOrchestrator:
             state_db: State database for recording build jobs
             spec_generator: Spec generator instance
             audit_logger: Audit logger for tracking decisions
-            tyrest_gate: Optional TyrestGate for pre-build spec review
             ideaforge_reader: Optional IdeaForgeReader for refreshing stale snapshot data
             adapter: Optional BuildAdapter for runtime-agnostic dispatch
         """
@@ -230,7 +229,6 @@ class BuildOrchestrator:
         self.state_db = state_db
         self.spec_generator = spec_generator
         self.audit_logger = audit_logger
-        self.tyrest_gate = tyrest_gate
         self.ideaforge_reader = ideaforge_reader
         self.adapter = adapter
         self.queue_runner_path = Path(config.yce_dir) / "queue_runner.py"
@@ -1237,120 +1235,10 @@ class BuildOrchestrator:
                 jobs.append(job)
                 current_job = job
             else:
-                # Local build: generate spec → Tyrest review → queue YCE
+                # Local build: generate spec → queue YCE
                 try:
                     output_dir = Path(__file__).parent.parent / "data" / "specs"
                     spec_path = self.spec_generator.generate_spec(idea, output_dir)
-
-                    # Tyrest pre-build review (Gate 2.5)
-                    if self.tyrest_gate is not None:
-                        spec_text = spec_path.read_text(encoding="utf-8")
-                        tyrest_result = self.tyrest_gate.review_spec(spec_text, idea_title=idea["title"])
-
-                        # Feedback loop: if rejected, try simplification once
-                        if tyrest_result.rejected and self.spec_generator.llm_expander is not None:
-                            logger.info(
-                                "Tyrest REJECTED spec for %s, attempting simplification feedback loop",
-                                idea["title"],
-                            )
-                            self.audit_logger.log_decision(
-                                gate="build",
-                                action="tyrest_rejected_attempting_simplify",
-                                details={
-                                    "idea_id": idea["id"],
-                                    "title": idea["title"],
-                                    "reasoning": tyrest_result.reasoning,
-                                    "overall": tyrest_result.overall,
-                                    "risk_flags": tyrest_result.risk_flags,
-                                },
-                            )
-
-                            try:
-                                simplified_spec = self.spec_generator.llm_expander.expand_simplified(
-                                    idea,
-                                    rejection_reasoning=tyrest_result.reasoning,
-                                    risk_flags=tyrest_result.risk_flags,
-                                    suggestions=tyrest_result.suggestions,
-                                )
-                                # Overwrite spec file with simplified version
-                                spec_path.write_text(simplified_spec, encoding="utf-8")
-                                logger.info(
-                                    "Simplified spec for %s: %d chars (was %d)",
-                                    idea["title"], len(simplified_spec), len(spec_text),
-                                )
-
-                                # Re-review the simplified spec
-                                tyrest_result = self.tyrest_gate.review_spec(
-                                    simplified_spec, idea_title=idea["title"]
-                                )
-                                self.audit_logger.log_decision(
-                                    gate="build",
-                                    action="tyrest_simplified_review",
-                                    details={
-                                        "idea_id": idea["id"],
-                                        "title": idea["title"],
-                                        "verdict": tyrest_result.verdict,
-                                        "overall": tyrest_result.overall,
-                                        "simplified": True,
-                                    },
-                                )
-                            except Exception as e:
-                                logger.warning(
-                                    "Simplification failed for %s: %s", idea["title"], e
-                                )
-
-                        if tyrest_result.rejected:
-                            logger.info(
-                                "Tyrest REJECTED spec for %s (final): %s",
-                                idea["title"], tyrest_result.reasoning,
-                            )
-                            job = BuildJob(
-                                idea_id=idea["id"],
-                                title=idea["title"],
-                                spec_path=str(spec_path),
-                                queue_job_id=job_id,
-                                status="failed",
-                                queued_at=queued_at,
-                            )
-                            self.state_db.record_build_job(job)
-                            jobs.append(job)
-                            current_job = job
-                            # Capture postmortem for Tyrest pre-build rejection
-                            if not dry_run:
-                                capture_postmortem(
-                                    state_db=self.state_db,
-                                    queue_job_id=job_id,
-                                    idea_id=idea["id"],
-                                    title=idea["title"],
-                                    log_path=None,
-                                    spec_path=str(spec_path),
-                                    review_status="tyrest_rejected",
-                                    quality_score=None,
-                                )
-                            self.audit_logger.log_decision(
-                                gate="build",
-                                action="tyrest_rejected",
-                                details={
-                                    "idea_id": idea["id"],
-                                    "title": idea["title"],
-                                    "reasoning": tyrest_result.reasoning,
-                                    "overall": tyrest_result.overall,
-                                    "risk_flags": tyrest_result.risk_flags,
-                                },
-                            )
-                            if not dry_run and item.id:
-                                state_db.update_item_status(item.id, "failed", "completed_at")
-                            continue
-
-                        self.audit_logger.log_decision(
-                            gate="build",
-                            action="tyrest_approved",
-                            details={
-                                "idea_id": idea["id"],
-                                "verdict": tyrest_result.verdict,
-                                "overall": tyrest_result.overall,
-                            },
-                        )
 
                     # Inject prior-attempt context for retries (Phase 15g)
                     if attempt > 0 and not dry_run:

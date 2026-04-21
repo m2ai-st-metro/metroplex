@@ -207,7 +207,7 @@ def evaluate_ratchet(state_db: StateDB, allow_recalibrate: bool = False) -> dict
         # published-but-review-failed builds were counted as failures)
         if r["pub_status"] == "published":
             published_scores.append(score)
-        elif r["review_status"] in ("review_failed", "tyrest_rejected"):
+        elif r["review_status"] == "review_failed":
             failed_scores.append(score)
         elif r["status"] == "failed":
             failed_scores.append(score)
