@@ -776,3 +776,34 @@ class TestStaleQueuedBuildRecovery:
         ids_filtered = {r["queue_job_id"] for r in stale_filtered}
         assert "metroplex-ideaforge-101" not in ids_filtered
         assert "metroplex-ideaforge-102" in ids_filtered
+
+
+class TestCostBySource:
+    """Test cost ledger aggregation grouped by source."""
+
+    def test_get_cost_by_source_orders_and_percentages(self, db):
+        db.record_cost(source="spec_expander", model="m", input_tokens=100, output_tokens=50, estimated_cost=0.05)
+        db.record_cost(source="spec_expander", model="m", input_tokens=150, output_tokens=75, estimated_cost=0.075)
+        db.record_cost(source="readme_generation", model="m", input_tokens=20, output_tokens=10, estimated_cost=0.01)
+        db.record_cost(source="readiness_topics", model="m", input_tokens=40, output_tokens=20, estimated_cost=0.02)
+
+        rows = db.get_cost_by_source(days=7)
+
+        # Three distinct sources
+        assert len(rows) == 3
+
+        # Ordered by total_cost DESC
+        sources = [r["source"] for r in rows]
+        assert sources == ["spec_expander", "readiness_topics", "readme_generation"]
+
+        # Totals correct (spec_expander aggregates two entries)
+        assert rows[0]["total_cost"] == pytest.approx(0.125)
+        assert rows[0]["entry_count"] == 2
+        assert rows[1]["total_cost"] == pytest.approx(0.02)
+        assert rows[2]["total_cost"] == pytest.approx(0.01)
+
+        # Percentages sum to ~100
+        assert sum(r["pct_of_total"] for r in rows) == pytest.approx(100.0, abs=0.2)
+
+    def test_get_cost_by_source_empty(self, db):
+        assert db.get_cost_by_source(days=7) == []

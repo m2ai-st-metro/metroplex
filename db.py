@@ -1662,6 +1662,31 @@ class StateDB:
         """, (start_date,))
         return [dict(row) for row in cursor.fetchall()]
 
+    def get_cost_by_source(self, days: int = 7) -> list[dict]:
+        """Aggregate cost_ledger entries by source over the last N days.
+
+        Returns list of dicts with keys: source, total_cost, entry_count, pct_of_total.
+        Ordered by total_cost DESC.
+        """
+        self.connect()
+        cursor = self.conn.cursor()
+        start_date = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
+        cursor.execute("""
+            SELECT
+                source,
+                SUM(estimated_cost) as total_cost,
+                COUNT(*) as entry_count
+            FROM cost_ledger
+            WHERE timestamp >= ?
+            GROUP BY source
+            ORDER BY total_cost DESC
+        """, (start_date,))
+        rows = [dict(row) for row in cursor.fetchall()]
+        grand_total = sum(r["total_cost"] for r in rows) or 1.0  # avoid div-by-zero
+        for r in rows:
+            r["pct_of_total"] = round(100.0 * r["total_cost"] / grand_total, 1)
+        return rows
+
     # --- Build Sessions (Paperclip session compaction) ---
 
     def record_session(
