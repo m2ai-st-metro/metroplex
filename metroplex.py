@@ -722,6 +722,12 @@ def cmd_cost(args, config: Config):
         else:
             print("No cost data recorded yet.")
 
+        by_source = state_db.get_cost_by_source(days=args.days)
+        if by_source:
+            print(f"\nSpend by source (last {args.days} days):")
+            for entry in by_source:
+                print(f"  {entry['source']:30s}  ${entry['total_cost']:7.2f}  ({entry['entry_count']:>3} entries, {entry['pct_of_total']:>5.1f}%)")
+
         return 0
     except Exception as e:
         print(f"ERROR: {e}")
