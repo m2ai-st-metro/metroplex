@@ -751,3 +751,56 @@ class TestConfig:
             config = Config()
             assert config.max_readiness_per_cycle == 10
             assert config.readiness_enabled is False
+
+
+# --- Cost Capture Tests ---
+
+def _make_response(content: str, prompt_tokens: int = 80, completion_tokens: int = 15):
+    """OpenAI chat completion mock with usage telemetry."""
+    choice = MagicMock()
+    choice.message.content = content
+    usage = MagicMock()
+    usage.prompt_tokens = prompt_tokens
+    usage.completion_tokens = completion_tokens
+    response = MagicMock()
+    response.choices = [choice]
+    response.usage = usage
+    return response
+
+
+class TestCostCapture:
+    """Gate 4.9 records LLM cost in the ledger after retry loops."""
+
+    @patch("gates.readiness.subprocess.run")
+    def test_description_records_cost_after_retries(self, mock_run, readiness_gate_with_llm, in_memory_db):
+        """Two invalid attempts then a valid description -- one ledger row with totals across all 3 calls."""
+        gate = readiness_gate_with_llm
+        readme_b64 = base64.b64encode(b"# Tool\nDoes useful things.").decode()
+
+        # Two CoT-style replies that get rejected (CoT prefix; no quoted span; no
+        # sentence longer than the 20-char fallback threshold), then a clean
+        # description on the third attempt.
+        bad = "Okay. Sure. Hmm."
+        good = "A comprehensive Python toolkit for automated code quality analysis and improvement workflows"
+        gate.client.chat.completions.create.side_effect = [
+            _make_response(bad),
+            _make_response(bad),
+            _make_response(good),
+        ]
+
+        mock_run.side_effect = [
+            _make_gh_result(stdout=json.dumps({"content": readme_b64})),  # fetch README
+            _make_gh_result(stdout="{}"),  # PATCH repo
+        ]
+
+        ok = gate._fix_generate_description("m2ai-portfolio", "test-repo")
+        assert ok is True
+        assert gate.client.chat.completions.create.call_count == 3
+
+        in_memory_db.connect()
+        rows = in_memory_db.conn.execute(
+            "SELECT source, input_tokens, output_tokens FROM cost_ledger WHERE source = 'readiness_description'"
+        ).fetchall()
+        assert len(rows) == 1
+        assert rows[0]["input_tokens"] == 240
+        assert rows[0]["output_tokens"] == 45

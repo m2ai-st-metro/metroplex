@@ -779,6 +779,7 @@ class ReadinessGate:
             "looking at", "from the", "the project", "i'll", "alright",
         )
         description = None
+        total_in, total_out = 0, 0
         for attempt in range(3):
             try:
                 response = self.client.chat.completions.create(
@@ -786,6 +787,9 @@ class ReadinessGate:
                     messages=messages,
                     max_tokens=256,
                 )
+                if getattr(response, "usage", None) is not None:
+                    total_in += getattr(response.usage, "prompt_tokens", 0) or 0
+                    total_out += getattr(response.usage, "completion_tokens", 0) or 0
                 raw = (response.choices[0].message.content or "").strip().strip('"').strip("'")
                 # Check if it looks like clean output (no CoT preamble, right length)
                 if raw and len(raw) <= 200 and not raw.lower().startswith(cot_prefixes):
@@ -815,10 +819,24 @@ class ReadinessGate:
                     messages.append({"role": "user", "content": "That included extra text. Output ONLY one sentence (max 200 chars) describing this repo's value. No preamble, no thinking, just the sentence."})
                 else:
                     logger.warning(f"LLM description failed after {attempt + 1} attempts: {raw[:100]}")
-                    return False
+                    break
             except Exception as e:
                 logger.warning(f"LLM description generation failed: {e}")
-                return False
+                break
+
+        if self.state_db is not None and (total_in or total_out):
+            try:
+                from cost_rates import estimate_cost
+                cost = estimate_cost(self.config.spec_llm_model, total_in, total_out)
+                self.state_db.record_cost(
+                    source="readiness_description",
+                    model=self.config.spec_llm_model,
+                    input_tokens=total_in,
+                    output_tokens=total_out,
+                    estimated_cost=cost,
+                )
+            except Exception as e:
+                logger.warning("Failed to record readiness_description cost: %s", e)
 
         if description is None:
             return False
