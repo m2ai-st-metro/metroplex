@@ -297,3 +297,67 @@ class TestProcessOneFailsGracefully:
         )
         assert result["status"] == "failed"
         assert "DEEPINFRA_API_KEY" in result["error"]
+
+
+class TestCostCapture:
+    """Test that LLM cost is recorded to the cost ledger after README generation."""
+
+    def _mock_response(self, prompt_tokens: int = 100, completion_tokens: int = 50):
+        mock_response = MagicMock()
+        mock_response.choices = [MagicMock()]
+        mock_response.choices[0].message.content = "# Title\n\nGenerated README content."
+        mock_response.usage = MagicMock()
+        mock_response.usage.prompt_tokens = prompt_tokens
+        mock_response.usage.completion_tokens = completion_tokens
+        return mock_response
+
+    def test_records_cost_after_generation(self, readme_gate, in_memory_db):
+        """After _generate_readme_content runs, a cost_ledger row is recorded."""
+        # Use a model with known rates so estimated_cost > 0
+        readme_gate.config.spec_llm_model = "sonnet"
+        readme_gate.client = MagicMock()
+        readme_gate.client.chat.completions.create.return_value = self._mock_response(100, 50)
+
+        readme_gate._generate_readme_content(
+            spec_text="spec", file_tree="tree", title="Test",
+        )
+
+        in_memory_db.connect()
+        cur = in_memory_db.conn.cursor()
+        cur.execute(
+            "SELECT source, model, input_tokens, output_tokens, estimated_cost "
+            "FROM cost_ledger ORDER BY id DESC LIMIT 1"
+        )
+        row = cur.fetchone()
+        assert row is not None, "expected one cost ledger row after readme generation"
+        source, model, in_toks, out_toks, est_cost = row
+        assert source == "readme_generation"
+        assert model == "sonnet"
+        assert in_toks == 100
+        assert out_toks == 50
+        assert est_cost > 0
+
+    def test_no_cost_recorded_when_state_db_none(self, readme_gate):
+        """If state_db is None the call should still succeed (no exception)."""
+        readme_gate.state_db = None
+        readme_gate.client = MagicMock()
+        readme_gate.client.chat.completions.create.return_value = self._mock_response()
+        # Should not raise
+        result = readme_gate._generate_readme_content(
+            spec_text="spec", file_tree="tree", title="Test",
+        )
+        assert "# Title" in result
+
+    def test_cost_recording_failure_does_not_break_gate(self, readme_gate, in_memory_db):
+        """If record_cost raises, the gate still returns the README content."""
+        readme_gate.config.spec_llm_model = "sonnet"
+        readme_gate.client = MagicMock()
+        readme_gate.client.chat.completions.create.return_value = self._mock_response()
+        # Force record_cost to blow up
+        readme_gate.state_db.record_cost = MagicMock(side_effect=RuntimeError("boom"))
+
+        result = readme_gate._generate_readme_content(
+            spec_text="spec", file_tree="tree", title="Test",
+        )
+        # Content still returned despite failed cost capture
+        assert "# Title" in result
