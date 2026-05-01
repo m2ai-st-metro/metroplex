@@ -642,12 +642,26 @@ class CycleOrchestrator:
 
             if state == "SUCCEEDED":
                 self.state_db.update_build_job_status(job["queue_job_id"], "completed")
+                try:
+                    self.state_db.update_build_actual_cost(job["queue_job_id"])
+                except Exception as e:
+                    logger.warning(
+                        "Failed to aggregate actual_cost_usd for %s: %s",
+                        job["queue_job_id"], e,
+                    )
                 result["completed"].append(job["queue_job_id"])
                 self.notifier.notify(
                     f"Oz cloud build completed: {job['title']}",
                 )
             elif state == "FAILED":
                 self.state_db.update_build_job_status(job["queue_job_id"], "failed")
+                try:
+                    self.state_db.update_build_actual_cost(job["queue_job_id"])
+                except Exception as e:
+                    logger.warning(
+                        "Failed to aggregate actual_cost_usd for %s: %s",
+                        job["queue_job_id"], e,
+                    )
                 result["failed"].append(job["queue_job_id"])
                 self.notifier.notify(
                     f"Oz cloud build FAILED: {job['title']}",

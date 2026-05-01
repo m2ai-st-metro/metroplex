@@ -76,7 +76,12 @@ class SpecGenerator:
                     "LLM spec expansion unavailable, using Jinja2 fallback: %s", e
                 )
 
-    def generate_spec(self, idea: dict, output_dir: Path) -> Path:
+    def generate_spec(
+        self,
+        idea: dict,
+        output_dir: Path,
+        queue_job_id: str | None = None,
+    ) -> Path:
         """
         Generate app spec file from idea data.
 
@@ -92,6 +97,8 @@ class SpecGenerator:
                 - target_audience (str): Target audience
                 - artifact_type (str): Artifact type (tool, agent, product)
             output_dir: Directory to write generated spec
+            queue_job_id: Optional build job ID to attribute LLM cost ledger
+                entries to (Phase G — per-build cost tracking).
 
         Returns:
             Path to generated spec file
@@ -137,7 +144,11 @@ class SpecGenerator:
         last_rejection = ""
         for spec_attempt in range(max_spec_attempts):
             try:
-                rendered_spec = self.llm_expander.expand(idea, failure_patterns=failure_patterns)
+                rendered_spec = self.llm_expander.expand(
+                    idea,
+                    failure_patterns=failure_patterns,
+                    queue_job_id=queue_job_id,
+                )
             except Exception as e:
                 raise RuntimeError(
                     f"LLM expansion failed for idea {idea['id']} ({idea['title']}): {e}"
@@ -721,6 +732,8 @@ class BuildOrchestrator:
                         self._extract_build_log(job_id)
                         # Record build cost in ledger
                         self._record_build_cost(job_id, job_data)
+                        # Aggregate per-build cost onto build_jobs (Phase G)
+                        self._aggregate_build_actual_cost(job_id)
                         # Record session snapshot for retry context (Phase 15g)
                         if project_dir:
                             self._record_build_session(job_id, project_dir)
@@ -743,6 +756,8 @@ class BuildOrchestrator:
                         self._extract_build_log(job_id)
                         # Record build cost even for failed builds (tokens were still consumed)
                         self._record_build_cost(job_id, job_data)
+                        # Aggregate per-build cost onto build_jobs (Phase G)
+                        self._aggregate_build_actual_cost(job_id)
                         # Record session snapshot for retry context (Phase 15g)
                         if project_dir:
                             self._record_build_session(job_id, project_dir)
@@ -944,6 +959,17 @@ class BuildOrchestrator:
         except Exception as e:
             logger.warning("Failed to record build cost for %s: %s", job_id, e)
 
+    def _aggregate_build_actual_cost(self, job_id: str) -> None:
+        """Sum cost_ledger entries for this build into build_jobs.actual_cost_usd.
+
+        Best-effort: a failure here must never block the status transition.
+        """
+        try:
+            total = self.state_db.update_build_actual_cost(job_id)
+            logger.info("Aggregated actual_cost_usd for %s: $%.4f", job_id, total)
+        except Exception as e:
+            logger.warning("Failed to aggregate actual_cost_usd for %s: %s", job_id, e)
+
     @staticmethod
     def _has_source_code(project_dir: Path) -> bool:
         """Check if a generation directory contains actual source code (not just scaffolding).
@@ -980,7 +1006,11 @@ class BuildOrchestrator:
         for idea in approved_ideas:
             try:
                 output_dir = Path(__file__).parent.parent / "data" / "specs"
-                spec_path = self.spec_generator.generate_spec(idea, output_dir)
+                source = idea.get("_source", "ideaforge")
+                pre_dispatch_job_id = f"metroplex-{source}-{idea.get('id', 0)}"
+                spec_path = self.spec_generator.generate_spec(
+                    idea, output_dir, queue_job_id=pre_dispatch_job_id,
+                )
                 job = self.queue_build(idea, spec_path, dry_run=dry_run)
                 if job:
                     jobs.append(job)
@@ -1238,7 +1268,9 @@ class BuildOrchestrator:
                 # Local build: generate spec → queue YCE
                 try:
                     output_dir = Path(__file__).parent.parent / "data" / "specs"
-                    spec_path = self.spec_generator.generate_spec(idea, output_dir)
+                    spec_path = self.spec_generator.generate_spec(
+                        idea, output_dir, queue_job_id=job_id,
+                    )
 
                     # Inject prior-attempt context for retries (Phase 15g)
                     if attempt > 0 and not dry_run:

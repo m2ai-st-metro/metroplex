@@ -622,6 +622,7 @@ def cmd_builds(args, config: Config):
         # Get unique builds (deduplicated by queue_job_id, latest entry)
         cursor.execute("""
             SELECT b.queue_job_id, b.idea_id, b.title, b.status, b.project_dir,
+                   b.actual_cost_usd,
                    p.repo_url, p.status as pub_status
             FROM build_jobs b
             LEFT JOIN publish_jobs p ON p.build_job_id = b.queue_job_id AND p.status = 'published'
@@ -640,9 +641,11 @@ def cmd_builds(args, config: Config):
             status_icon = "+" if r["status"] == "completed" else "x"
             pub_icon = "-> " + r["repo_url"] if r["repo_url"] else "   (not published)"
             proj = r["project_dir"] or "(no project dir)"
+            actual_cost = r["actual_cost_usd"]
+            cost_str = f"${actual_cost:.2f}" if actual_cost is not None else "--"
 
             print(f"  {status_icon} [{r['status']:>9}] {r['title']}")
-            print(f"    ID: {r['queue_job_id']}  Idea: {r['idea_id']}")
+            print(f"    ID: {r['queue_job_id']}  Idea: {r['idea_id']}  Cost: {cost_str}")
             print(f"    Dir: {proj}")
             print(f"    {pub_icon}")
             print()
