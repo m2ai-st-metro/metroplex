@@ -437,8 +437,9 @@ class ReadmeGate:
             problem_statement=problem_statement or "",
         )
 
+        model = self.config.spec_llm_model
         response = self.client.chat.completions.create(
-            model=self.config.spec_llm_model,
+            model=model,
             messages=[
                 {"role": "system", "content": README_SYSTEM_PROMPT},
                 {"role": "user", "content": prompt},
@@ -447,6 +448,23 @@ class ReadmeGate:
         )
 
         content = response.choices[0].message.content or ""
+
+        # Record cost if state_db is available (tolerates state_db=None for tests)
+        if self.state_db is not None:
+            try:
+                from cost_rates import estimate_cost
+                input_tokens = response.usage.prompt_tokens
+                output_tokens = response.usage.completion_tokens
+                cost = estimate_cost(model, input_tokens, output_tokens)
+                self.state_db.record_cost(
+                    source="readme_generation",
+                    model=model,
+                    input_tokens=input_tokens,
+                    output_tokens=output_tokens,
+                    estimated_cost=cost,
+                )
+            except Exception as e:
+                logger.warning("Failed to record readme generation cost: %s", e)
 
         # Strip wrapping code fence if the LLM added one
         if content.startswith("```markdown"):
