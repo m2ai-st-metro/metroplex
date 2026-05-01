@@ -196,6 +196,7 @@ def run_ego_cycle(
         build_stats=build_stats,
         failure_breakdown=failure_breakdown,
         error_samples=error_samples,
+        state_db=state_db,
     )
 
     if variant_mapping == baseline_mapping:

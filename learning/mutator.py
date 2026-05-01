@@ -92,6 +92,7 @@ def generate_variant(
     failure_breakdown: list[dict],
     error_samples: list[str],
     api_key: Optional[str] = None,
+    state_db=None,
 ) -> dict[str, str]:
     """Generate a variant constraint mapping using LLM judge.
 
@@ -101,6 +102,7 @@ def generate_variant(
         failure_breakdown: List of dicts with category, count keys.
         error_samples: List of recent error signature strings.
         api_key: Optional DeepInfra API key override.
+        state_db: Optional StateDB for cost ledger capture (no-ops when None).
 
     Returns:
         New mapping dict, or the original mapping if generation fails.
@@ -143,6 +145,23 @@ def generate_variant(
             messages=[{"role": "user", "content": prompt}],
         )
         raw = response.choices[0].message.content or ""
+
+        # Record cost (EGO is pre-build experiment time, no queue_job_id)
+        if state_db is not None:
+            try:
+                from cost_rates import estimate_cost
+                input_tokens = response.usage.prompt_tokens
+                output_tokens = response.usage.completion_tokens
+                cost = estimate_cost(EGO_MODEL, input_tokens, output_tokens)
+                state_db.record_cost(
+                    source="ego_mutator",
+                    model=EGO_MODEL,
+                    input_tokens=input_tokens,
+                    output_tokens=output_tokens,
+                    estimated_cost=cost,
+                )
+            except Exception as e:
+                logger.warning("Failed to record ego_mutator cost: %s", e)
 
         # Strip markdown fencing if present
         raw = raw.strip()

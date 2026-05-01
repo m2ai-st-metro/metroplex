@@ -218,6 +218,54 @@ class TestMutator:
             )
         assert result == sample_mapping
 
+    @patch("learning.mutator.OpenAI")
+    def test_generate_variant_records_cost(
+        self, mock_openai_cls, sample_mapping, sample_breakdown, sample_error_samples,
+    ):
+        """Cost ledger receives one row tagged source='ego_mutator' per LLM call."""
+        from db import StateDB
+        from learning.config import EGO_MODEL
+
+        variant_data = {
+            "spec_unclear": "New constraint for spec_unclear",
+            "dependency_error": "New constraint for deps",
+            "timeout": "New timeout constraint",
+            "test_failure": "New test failure constraint",
+            "build_error": "New build error constraint",
+        }
+        mock_response = MagicMock()
+        mock_response.choices = [MagicMock()]
+        mock_response.choices[0].message.content = json.dumps(variant_data)
+        mock_response.usage.prompt_tokens = 1234
+        mock_response.usage.completion_tokens = 567
+        mock_openai_cls.return_value.chat.completions.create.return_value = mock_response
+
+        db = StateDB(":memory:")
+        db.init_db()
+        try:
+            generate_variant(
+                current_mapping=sample_mapping,
+                build_stats={"total": 50, "successful": 25, "failed": 25, "success_rate": 0.5},
+                failure_breakdown=sample_breakdown,
+                error_samples=sample_error_samples,
+                api_key="test-key",
+                state_db=db,
+            )
+
+            db.connect()
+            row = db.conn.execute(
+                "SELECT source, model, input_tokens, output_tokens, queue_job_id "
+                "FROM cost_ledger WHERE source = 'ego_mutator'"
+            ).fetchone()
+            assert row is not None
+            assert row["source"] == "ego_mutator"
+            assert row["model"] == EGO_MODEL
+            assert row["input_tokens"] == 1234
+            assert row["output_tokens"] == 567
+            assert row["queue_job_id"] is None
+        finally:
+            db.close()
+
 
 # ---------------------------------------------------------------------------
 # Evaluator Tests
