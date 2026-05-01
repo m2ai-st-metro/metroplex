@@ -68,6 +68,7 @@ One row per build job queued by Gate 2.
 | `next_retry_at` | TEXT | nullable | ISO 8601 datetime for next retry (exponential backoff) |
 | `quality_score` | REAL | nullable | Structural quality score (0-100) from Phase 14b scorer |
 | `estimated_cost` | REAL | nullable | Estimated API cost in USD |
+| `actual_cost_usd` | REAL | nullable | Actual cost in USD — sum of `cost_ledger.estimated_cost` entries with matching `queue_job_id`. Populated by orchestrator on build completion. NULL until the build reaches a terminal status (`completed` or `failed`). |
 | `feasibility_score` | REAL | DEFAULT NULL | Pre-build feasibility score from L5 B2 predictor |
 | `test_ratio` | REAL | DEFAULT NULL | Test file count / source file count (L5 D2 coverage enforcement) |
 | `base_job_id` | TEXT | DEFAULT NULL | Groups retry attempts — matches `queue_job_id` of the first attempt |
@@ -140,6 +141,25 @@ One row per LLM API call cost record.
 | `details` | TEXT | DEFAULT '{}' | JSON blob for extra metadata |
 
 **Index**: `idx_cost_ledger_timestamp` on `timestamp`
+
+### Cost ledger source naming convention
+
+The `cost_ledger.source` column identifies which gate or component incurred the cost. Canonical sources currently emitted:
+
+| Source | Component | Per-build attribution? |
+|--------|-----------|------------------------|
+| `spec_expander` | `gates/llm_expander.py:expand()` — initial spec generation | YES (passes queue_job_id) |
+| `spec_simplifier` | `gates/llm_expander.py:expand_simplified()` — Tyrest-rejection retry | YES |
+| `readme_generation` | `gates/readme.py` — Gate 4.7 README/infographic prompt | YES |
+| `readiness_topics` | `gates/readiness.py:_fix_generate_topics` — Gate 4.9 (3-attempt retry loop, recorded as totals) | YES |
+| `readiness_description` | `gates/readiness.py:_fix_generate_description` — Gate 4.9 (3-attempt retry loop, recorded as totals) | YES |
+| `ego_mutator` | `learning/mutator.py` — EGO constraint variant generation | NO (pre-build experimentation) |
+| `ego_evaluator` | `learning/evaluator.py` — EGO judge | NO (pre-build experimentation) |
+| `yce_build` | Post-completion estimate from build subprocess (legacy) | YES |
+
+**Per-build attribution rule**: Any `record_cost(...)` call inside a per-build code path (a path that has a `queue_job_id` in scope) MUST pass `queue_job_id=...` so `update_build_actual_cost(queue_job_id)` can roll the totals onto `build_jobs.actual_cost_usd`. Pre-build code (EGO learning, scheduled jobs, etc.) leaves `queue_job_id=None` — those costs still appear in daily totals but are not attributed to any specific build.
+
+When adding a new source, append a row to this table and choose a snake_case `<gate>_<action>` name. Sources should be stable identifiers (used in dashboards) — never rename without coordinating with downstream consumers.
 
 #### `build_postmortems`
 
