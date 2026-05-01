@@ -367,6 +367,49 @@ class TestFixes:
         assert ok is False
 
     @patch("gates.readiness.subprocess.run")
+    def test_fix_generate_topics_records_cost_across_retries(self, mock_run, readiness_gate_with_llm):
+        """Records ONE aggregated cost-ledger row summing tokens across all retry attempts."""
+        gate = readiness_gate_with_llm
+        readme_b64 = base64.b64encode(b"# Tool\nDoes things.").decode()
+
+        def _make_resp(content: str):
+            choice = MagicMock()
+            choice.message.content = content
+            usage = MagicMock()
+            usage.prompt_tokens = 50
+            usage.completion_tokens = 20
+            return MagicMock(choices=[choice], usage=usage)
+
+        # Two invalid attempts then one valid array.
+        gate.client.chat.completions.create.side_effect = [
+            _make_resp("not json at all"),
+            _make_resp("still nope"),
+            _make_resp('["a", "b", "c"]'),
+        ]
+        mock_run.side_effect = [
+            _make_gh_result(stdout=json.dumps({"content": readme_b64})),  # README fetch
+            _make_gh_result(stdout="{}"),  # PUT topics
+        ]
+
+        ok = gate._fix_generate_topics("m2ai-portfolio", "test-repo")
+        assert ok is True
+        assert gate.client.chat.completions.create.call_count == 3
+
+        cursor = gate.state_db.conn.cursor()
+        cursor.execute(
+            "SELECT source, input_tokens, output_tokens, COUNT(*) "
+            "FROM cost_ledger WHERE source = ? GROUP BY source, input_tokens, output_tokens",
+            ("readiness_topics",),
+        )
+        rows = cursor.fetchall()
+        assert len(rows) == 1
+        source, in_tok, out_tok, count = rows[0]
+        assert source == "readiness_topics"
+        assert in_tok == 150  # 50 * 3 attempts
+        assert out_tok == 60  # 20 * 3 attempts
+        assert count == 1
+
+    @patch("gates.readiness.subprocess.run")
     def test_fix_generate_description(self, mock_run, readiness_gate_with_llm):
         """Generates and sets description via LLM."""
         gate = readiness_gate_with_llm

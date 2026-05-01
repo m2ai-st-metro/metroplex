@@ -660,46 +660,67 @@ class ReadinessGate:
         ]
 
         topics = None
-        for attempt in range(3):
-            try:
-                response = self.client.chat.completions.create(
-                    model=self.config.spec_llm_model,
-                    messages=messages,
-                    max_tokens=256,
-                )
-                raw = response.choices[0].message.content or "[]"
-                # Try all bracket spans; pick the longest that parses as a
-                # list of strings. Nemotron-3 CoT dumps often include small
-                # example arrays earlier in the text, so we can't just take
-                # the first match.
-                candidates = re.findall(r"\[[^\[\]]*\]", raw, re.DOTALL)
-                parsed: list[str] = []
-                for cand in candidates:
+        total_in, total_out = 0, 0
+        try:
+            for attempt in range(3):
+                try:
+                    response = self.client.chat.completions.create(
+                        model=self.config.spec_llm_model,
+                        messages=messages,
+                        max_tokens=256,
+                    )
                     try:
-                        val = json.loads(cand)
-                    except (json.JSONDecodeError, ValueError):
-                        continue
-                    if not isinstance(val, list):
-                        continue
-                    strs = [x for x in val if isinstance(x, str) and x.strip()]
-                    if len(strs) > len(parsed):
-                        parsed = strs
-                if len(parsed) >= 3:
-                    topics = parsed
-                    break
-                if attempt < 2:
-                    logger.info(f"Topics attempt {attempt + 1} for {repo_name}: no usable JSON array (best={len(parsed)} strings), retrying with correction")
-                    messages.append({"role": "assistant", "content": raw})
-                    messages.append({"role": "user", "content": 'That was not a valid JSON array. Output ONLY a JSON array like ["python", "cli", "automation"]. Nothing else.'})
-                else:
-                    logger.warning(f"LLM returned no JSON array for topics after {attempt + 1} attempts: {raw[:100]}")
+                        total_in += response.usage.prompt_tokens
+                        total_out += response.usage.completion_tokens
+                    except AttributeError:
+                        pass
+                    raw = response.choices[0].message.content or "[]"
+                    # Try all bracket spans; pick the longest that parses as a
+                    # list of strings. Nemotron-3 CoT dumps often include small
+                    # example arrays earlier in the text, so we can't just take
+                    # the first match.
+                    candidates = re.findall(r"\[[^\[\]]*\]", raw, re.DOTALL)
+                    parsed: list[str] = []
+                    for cand in candidates:
+                        try:
+                            val = json.loads(cand)
+                        except (json.JSONDecodeError, ValueError):
+                            continue
+                        if not isinstance(val, list):
+                            continue
+                        strs = [x for x in val if isinstance(x, str) and x.strip()]
+                        if len(strs) > len(parsed):
+                            parsed = strs
+                    if len(parsed) >= 3:
+                        topics = parsed
+                        break
+                    if attempt < 2:
+                        logger.info(f"Topics attempt {attempt + 1} for {repo_name}: no usable JSON array (best={len(parsed)} strings), retrying with correction")
+                        messages.append({"role": "assistant", "content": raw})
+                        messages.append({"role": "user", "content": 'That was not a valid JSON array. Output ONLY a JSON array like ["python", "cli", "automation"]. Nothing else.'})
+                    else:
+                        logger.warning(f"LLM returned no JSON array for topics after {attempt + 1} attempts: {raw[:100]}")
+                        return False
+                except Exception as e:
+                    logger.warning(f"LLM topics generation failed: {e}")
                     return False
-            except Exception as e:
-                logger.warning(f"LLM topics generation failed: {e}")
-                return False
 
-        if topics is None:
-            return False
+            if topics is None:
+                return False
+        finally:
+            if self.state_db is not None and (total_in or total_out):
+                try:
+                    from cost_rates import estimate_cost
+                    cost = estimate_cost(self.config.spec_llm_model, total_in, total_out)
+                    self.state_db.record_cost(
+                        source="readiness_topics",
+                        model=self.config.spec_llm_model,
+                        input_tokens=total_in,
+                        output_tokens=total_out,
+                        estimated_cost=cost,
+                    )
+                except Exception as e:
+                    logger.warning("Failed to record readiness_topics cost: %s", e)
 
         # Enforce bounds: min 3, max 12 (GitHub allows up to 20; cap at 12 to keep relevance high)
         topics = [t.lower().strip() for t in topics if isinstance(t, str) and t.strip()]
