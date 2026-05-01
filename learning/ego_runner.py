@@ -209,6 +209,7 @@ def run_ego_cycle(
         variant_mapping=variant_mapping,
         failure_breakdown=failure_breakdown,
         error_samples=error_samples,
+        state_db=state_db,
     )
 
     # Log to ledger

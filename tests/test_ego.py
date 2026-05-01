@@ -283,6 +283,66 @@ class TestEvaluator:
             )
         assert not result.is_valid
 
+    @patch("learning.evaluator.OpenAI")
+    def test_evaluate_records_cost(
+        self, mock_openai_cls, in_memory_db, sample_mapping, sample_breakdown, sample_error_samples
+    ):
+        """When state_db is provided, evaluate() records a cost ledger row."""
+        mock_response = MagicMock()
+        mock_response.choices = [MagicMock()]
+        mock_response.choices[0].message.content = json.dumps(
+            {"score_a": 60, "score_b": 70, "reasoning": "ok"}
+        )
+        mock_response.usage.prompt_tokens = 1234
+        mock_response.usage.completion_tokens = 567
+        mock_openai_cls.return_value.chat.completions.create.return_value = mock_response
+
+        result = evaluate(
+            baseline_mapping=sample_mapping,
+            variant_mapping=sample_mapping,
+            failure_breakdown=sample_breakdown,
+            error_samples=sample_error_samples,
+            api_key="test-key",
+            state_db=in_memory_db,
+        )
+        assert result.is_valid
+
+        in_memory_db.connect()
+        rows = in_memory_db.conn.execute(
+            "SELECT source, input_tokens, output_tokens, queue_job_id FROM cost_ledger"
+        ).fetchall()
+        assert len(rows) == 1
+        assert rows[0]["source"] == "ego_evaluator"
+        assert rows[0]["input_tokens"] == 1234
+        assert rows[0]["output_tokens"] == 567
+        assert rows[0]["queue_job_id"] is None
+
+    @patch("learning.evaluator.OpenAI")
+    def test_evaluate_without_state_db_does_not_record(
+        self, mock_openai_cls, in_memory_db, sample_mapping, sample_breakdown, sample_error_samples
+    ):
+        """No state_db -> no ledger row."""
+        mock_response = MagicMock()
+        mock_response.choices = [MagicMock()]
+        mock_response.choices[0].message.content = json.dumps(
+            {"score_a": 60, "score_b": 70, "reasoning": "ok"}
+        )
+        mock_response.usage.prompt_tokens = 1234
+        mock_response.usage.completion_tokens = 567
+        mock_openai_cls.return_value.chat.completions.create.return_value = mock_response
+
+        evaluate(
+            baseline_mapping=sample_mapping,
+            variant_mapping=sample_mapping,
+            failure_breakdown=sample_breakdown,
+            error_samples=sample_error_samples,
+            api_key="test-key",
+        )
+
+        in_memory_db.connect()
+        rows = in_memory_db.conn.execute("SELECT COUNT(*) AS c FROM cost_ledger").fetchone()
+        assert rows["c"] == 0
+
 
 # ---------------------------------------------------------------------------
 # Applier Tests

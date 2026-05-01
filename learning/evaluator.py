@@ -71,10 +71,15 @@ def evaluate(
     failure_breakdown: list[dict],
     error_samples: list[str],
     api_key: Optional[str] = None,
+    state_db=None,
 ) -> Comparison:
     """Use LLM judge to compare baseline vs variant constraint mappings.
 
     Returns a Comparison with scores and winner determination.
+
+    If state_db is provided, the API call's token usage is recorded to the
+    cost ledger under source='ego_evaluator'. queue_job_id is left None --
+    EGO is pre-build experiment work, not tied to a specific build job.
     """
     resolved_key = api_key or os.environ.get("DEEPINFRA_API_KEY")
     if not resolved_key:
@@ -115,6 +120,22 @@ def evaluate(
             messages=[{"role": "user", "content": prompt}],
         )
         raw = response.choices[0].message.content or ""
+
+        if state_db is not None:
+            try:
+                from cost_rates import estimate_cost
+                input_tokens = response.usage.prompt_tokens
+                output_tokens = response.usage.completion_tokens
+                cost = estimate_cost(EGO_MODEL, input_tokens, output_tokens)
+                state_db.record_cost(
+                    source="ego_evaluator",
+                    model=EGO_MODEL,
+                    input_tokens=input_tokens,
+                    output_tokens=output_tokens,
+                    estimated_cost=cost,
+                )
+            except Exception as e:
+                logger.warning("Failed to record ego_evaluator cost: %s", e)
 
         # Strip markdown fencing
         raw = raw.strip()
