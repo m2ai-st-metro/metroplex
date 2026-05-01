@@ -329,6 +329,13 @@ class StateDB:
             except sqlite3.OperationalError:
                 pass  # Column already exists
 
+        # Migrate: add actual_cost_usd to build_jobs (Phase G — per-build cost tracking)
+        if "actual_cost_usd" not in bj_columns_b2:
+            try:
+                cursor.execute("ALTER TABLE build_jobs ADD COLUMN actual_cost_usd REAL DEFAULT NULL")
+            except sqlite3.OperationalError:
+                pass  # Column already exists
+
         # Readme jobs table (Gate 4.7 — enhanced README generation tracking)
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS readme_jobs (
@@ -1745,6 +1752,31 @@ class StateDB:
         )
         self.conn.commit()
         return cursor.rowcount > 0
+
+    def get_build_actual_cost(self, queue_job_id: str) -> float:
+        """Sum cost_ledger.estimated_cost for all entries linked to this build."""
+        self.connect()
+        cursor = self.conn.cursor()
+        cursor.execute(
+            "SELECT COALESCE(SUM(estimated_cost), 0.0) FROM cost_ledger WHERE queue_job_id = ?",
+            (queue_job_id,),
+        )
+        return cursor.fetchone()[0]
+
+    def update_build_actual_cost(self, queue_job_id: str) -> float:
+        """Aggregate cost_ledger and write the total to build_jobs.actual_cost_usd.
+
+        Returns the aggregated cost. Idempotent — safe to call multiple times.
+        """
+        total = self.get_build_actual_cost(queue_job_id)
+        self.connect()
+        cursor = self.conn.cursor()
+        cursor.execute(
+            "UPDATE build_jobs SET actual_cost_usd = ? WHERE queue_job_id = ?",
+            (total, queue_job_id),
+        )
+        self.conn.commit()
+        return total
 
     def update_build_test_ratio(self, queue_job_id: str, ratio: float) -> bool:
         """Set test_ratio on a build job (Phase D2 — test coverage enforcement)."""

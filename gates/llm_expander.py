@@ -371,7 +371,12 @@ class LLMSpecExpander:
             base_url="https://api.deepinfra.com/v1/openai",
         )
 
-    def expand(self, idea: dict, failure_patterns: list[dict] | None = None) -> str:
+    def expand(
+        self,
+        idea: dict,
+        failure_patterns: list[dict] | None = None,
+        queue_job_id: str | None = None,
+    ) -> str:
         """
         Expand an idea dict into a full app specification using Claude.
 
@@ -381,6 +386,8 @@ class LLMSpecExpander:
             failure_patterns: Optional list of failure pattern dicts from
                   postmortem.get_failure_patterns(). When provided, injects
                   past failure lessons as constraints in the prompt.
+            queue_job_id: Optional build job ID to attribute the cost ledger
+                  entry to (Phase G — per-build cost tracking).
 
         Returns:
             Markdown string containing the full app specification.
@@ -442,13 +449,21 @@ class LLMSpecExpander:
                     input_tokens=input_tokens,
                     output_tokens=output_tokens,
                     estimated_cost=cost,
+                    queue_job_id=queue_job_id,
                 )
             except Exception as e:
                 logger.warning("Failed to record spec expansion cost: %s", e)
 
         return spec_text
 
-    def expand_simplified(self, idea: dict, rejection_reasoning: str, risk_flags: list[str], suggestions: list[str]) -> str:
+    def expand_simplified(
+        self,
+        idea: dict,
+        rejection_reasoning: str,
+        risk_flags: list[str],
+        suggestions: list[str],
+        queue_job_id: str | None = None,
+    ) -> str:
         """
         Generate a simplified spec using Tyrest rejection feedback.
 
@@ -460,6 +475,8 @@ class LLMSpecExpander:
             rejection_reasoning: Tyrest's rejection explanation
             risk_flags: List of risk flags from Tyrest
             suggestions: List of improvement suggestions from Tyrest
+            queue_job_id: Optional build job ID to attribute the cost ledger
+                entry to (Phase G — per-build cost tracking).
 
         Returns:
             Markdown string containing the simplified app specification.
@@ -508,6 +525,7 @@ class LLMSpecExpander:
                     input_tokens=input_tokens,
                     output_tokens=output_tokens,
                     estimated_cost=cost,
+                    queue_job_id=queue_job_id,
                 )
             except Exception as e:
                 logger.warning("Failed to record spec simplification cost: %s", e)

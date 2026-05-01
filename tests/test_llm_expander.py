@@ -251,6 +251,46 @@ class TestLLMSpecExpander:
             with pytest.raises(Exception, match="API rate limit"):
                 expander.expand(tool_idea)
 
+    def test_expand_threads_queue_job_id_into_record_cost(self, tool_idea):
+        """Phase G: queue_job_id passed to expand() is forwarded to record_cost."""
+        mock_response = _mock_openai_response("# Spec\n\n## Overview\n...")
+        mock_state_db = MagicMock()
+
+        with patch("gates.llm_expander.OpenAI") as MockClient:
+            mock_client = MockClient.return_value
+            mock_client.chat.completions.create.return_value = mock_response
+
+            expander = LLMSpecExpander(api_key="test-key", state_db=mock_state_db)
+            expander.expand(tool_idea, queue_job_id="metroplex-ideaforge-42")
+
+            mock_state_db.record_cost.assert_called_once()
+            kwargs = mock_state_db.record_cost.call_args.kwargs
+            assert kwargs["queue_job_id"] == "metroplex-ideaforge-42"
+            assert kwargs["source"] == "spec_expander"
+
+    def test_expand_simplified_threads_queue_job_id_into_record_cost(self, tool_idea):
+        """Phase G: queue_job_id passed to expand_simplified() is forwarded."""
+        mock_response = _mock_openai_response("# Simplified Spec\n\n## Overview\n...")
+        mock_state_db = MagicMock()
+
+        with patch("gates.llm_expander.OpenAI") as MockClient:
+            mock_client = MockClient.return_value
+            mock_client.chat.completions.create.return_value = mock_response
+
+            expander = LLMSpecExpander(api_key="test-key", state_db=mock_state_db)
+            expander.expand_simplified(
+                tool_idea,
+                rejection_reasoning="too complex",
+                risk_flags=["external_apis"],
+                suggestions=["use local files"],
+                queue_job_id="metroplex-ideaforge-42-r1",
+            )
+
+            mock_state_db.record_cost.assert_called_once()
+            kwargs = mock_state_db.record_cost.call_args.kwargs
+            assert kwargs["queue_job_id"] == "metroplex-ideaforge-42-r1"
+            assert kwargs["source"] == "spec_simplifier"
+
     def test_prompt_template_contains_required_sections(self):
         """Verify the prompt template asks for all YCE-required sections."""
         required_sections = [
@@ -369,7 +409,9 @@ class TestSpecGeneratorLLMIntegration:
             assert path.exists()
             content = path.read_text()
             assert "LLM-generated content" in content
-            mock_instance.expand.assert_called_once_with(tool_idea, failure_patterns=[])
+            mock_instance.expand.assert_called_once_with(
+                tool_idea, failure_patterns=[], queue_job_id=None,
+            )
 
     def test_llm_failure_raises_runtime_error(self, template_dir, output_dir, tool_idea):
         """Test that LLM failure raises RuntimeError (no Jinja2 fallback)."""

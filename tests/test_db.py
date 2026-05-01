@@ -76,6 +76,99 @@ class TestStateDBInit:
         state_db.close()
 
 
+class TestActualCostMigration:
+    """Phase G: actual_cost_usd column on build_jobs."""
+
+    def test_migration_adds_actual_cost_column(self, db):
+        cursor = db.conn.cursor()
+        cursor.execute("PRAGMA table_info(build_jobs)")
+        columns = {row["name"] for row in cursor.fetchall()}
+        assert "actual_cost_usd" in columns
+
+    def test_actual_cost_column_defaults_to_null(self, db):
+        job = BuildJob(
+            idea_id=1,
+            title="Test",
+            spec_path="/tmp/s.txt",
+            queue_job_id="metroplex-ideaforge-100",
+            status="queued",
+            queued_at=datetime.now(),
+        )
+        db.record_build_job(job)
+        cursor = db.conn.cursor()
+        cursor.execute(
+            "SELECT actual_cost_usd FROM build_jobs WHERE queue_job_id = ?",
+            ("metroplex-ideaforge-100",),
+        )
+        assert cursor.fetchone()["actual_cost_usd"] is None
+
+
+class TestBuildActualCostHelpers:
+    """Phase G: get_build_actual_cost / update_build_actual_cost."""
+
+    def _make_build(self, db, queue_job_id: str) -> None:
+        job = BuildJob(
+            idea_id=1,
+            title="Test",
+            spec_path="/tmp/s.txt",
+            queue_job_id=queue_job_id,
+            status="completed",
+            queued_at=datetime.now(),
+        )
+        db.record_build_job(job)
+
+    def test_get_actual_cost_no_entries_returns_zero(self, db):
+        self._make_build(db, "metroplex-ideaforge-200")
+        assert db.get_build_actual_cost("metroplex-ideaforge-200") == 0.0
+
+    def test_get_actual_cost_aggregates_across_entries(self, db):
+        self._make_build(db, "metroplex-ideaforge-201")
+        db.record_cost("spec_expander", "qwen", 100, 50, 0.05, queue_job_id="metroplex-ideaforge-201")
+        db.record_cost("spec_simplifier", "qwen", 200, 100, 0.10, queue_job_id="metroplex-ideaforge-201")
+        db.record_cost("yce_build", "opus", 5000, 2000, 1.20, queue_job_id="metroplex-ideaforge-201")
+        total = db.get_build_actual_cost("metroplex-ideaforge-201")
+        assert abs(total - 1.35) < 0.0001
+
+    def test_get_actual_cost_ignores_other_jobs_and_null(self, db):
+        self._make_build(db, "metroplex-ideaforge-202")
+        self._make_build(db, "metroplex-ideaforge-203")
+        db.record_cost("spec_expander", "qwen", 100, 50, 0.05, queue_job_id="metroplex-ideaforge-202")
+        db.record_cost("spec_expander", "qwen", 999, 999, 99.99, queue_job_id="metroplex-ideaforge-203")
+        db.record_cost("ad_hoc", "qwen", 100, 50, 7.77, queue_job_id=None)
+        assert abs(db.get_build_actual_cost("metroplex-ideaforge-202") - 0.05) < 0.0001
+
+    def test_update_build_actual_cost_writes_aggregate(self, db):
+        self._make_build(db, "metroplex-ideaforge-204")
+        db.record_cost("spec_expander", "qwen", 100, 50, 0.05, queue_job_id="metroplex-ideaforge-204")
+        db.record_cost("yce_build", "opus", 5000, 2000, 1.50, queue_job_id="metroplex-ideaforge-204")
+        total = db.update_build_actual_cost("metroplex-ideaforge-204")
+        assert abs(total - 1.55) < 0.0001
+        cursor = db.conn.cursor()
+        cursor.execute(
+            "SELECT actual_cost_usd FROM build_jobs WHERE queue_job_id = ?",
+            ("metroplex-ideaforge-204",),
+        )
+        assert abs(cursor.fetchone()["actual_cost_usd"] - 1.55) < 0.0001
+
+    def test_update_build_actual_cost_idempotent(self, db):
+        self._make_build(db, "metroplex-ideaforge-205")
+        db.record_cost("spec_expander", "qwen", 100, 50, 0.42, queue_job_id="metroplex-ideaforge-205")
+        first = db.update_build_actual_cost("metroplex-ideaforge-205")
+        second = db.update_build_actual_cost("metroplex-ideaforge-205")
+        assert first == second == 0.42
+
+    def test_update_build_actual_cost_with_no_entries_writes_zero(self, db):
+        self._make_build(db, "metroplex-ideaforge-206")
+        total = db.update_build_actual_cost("metroplex-ideaforge-206")
+        assert total == 0.0
+        cursor = db.conn.cursor()
+        cursor.execute(
+            "SELECT actual_cost_usd FROM build_jobs WHERE queue_job_id = ?",
+            ("metroplex-ideaforge-206",),
+        )
+        assert cursor.fetchone()["actual_cost_usd"] == 0.0
+
+
 class TestTriageDecisionRecords:
     """Test triage decision recording."""
 
