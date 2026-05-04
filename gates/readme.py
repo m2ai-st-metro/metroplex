@@ -120,7 +120,7 @@ MIT
 
 ### 11. Author
 ```
-Matthew Snow -- [M2AI](https://m2ai.co) | [@m2ai-portfolio](https://github.com/m2ai-portfolio)
+{author_line}
 ```
 
 ## Quality Rules
@@ -435,6 +435,7 @@ class ReadmeGate:
             file_tree=file_tree,
             plain_description=plain_description or "(not provided -- write a concise one-liner from the spec)",
             problem_statement=problem_statement or "",
+            author_line=self._build_author_line(),
         )
 
         model = self.config.spec_llm_model
@@ -477,6 +478,19 @@ class ReadmeGate:
             content = content[:-3].strip()
 
         return content
+
+    def _build_author_line(self) -> str:
+        """Generate the README footer author line from configured publish targets."""
+        links = ["[M2AI](https://m2ai.co)"]
+        for target in self.config.publish_targets:
+            if target == "github":
+                links.append(f"[@{self.config.github_org}](https://github.com/{self.config.github_org})")
+            elif target == "gitlab":
+                links.append(
+                    f"[{self.config.gitlab_host}/{self.config.gitlab_namespace}]"
+                    f"(https://{self.config.gitlab_host}/{self.config.gitlab_namespace})"
+                )
+        return "Matthew Snow -- " + " | ".join(links)
 
     def _extract_features(self, readme_content: str) -> str:
         """Extract feature names from generated README for infographic prompt."""

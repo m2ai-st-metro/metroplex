@@ -1,10 +1,16 @@
 """
 Publish Gate - Gate 4
-Creates GitHub repos for completed YCE builds and pushes code to m2ai-portfolio org.
-This is the L5 "last mile" -- turning generated code into visible GitHub repos.
+Creates repos for completed YCE builds and pushes code to one or more git hosts
+(GitHub m2ai-portfolio org and/or GitLab m2ai-portfolio group). Configurable via
+config.publish_targets — first entry is primary (its URL becomes repo_url and
+its failure fails the job); subsequent entries are mirrors (failures recorded
+in targets_status but do not fail the job).
 """
+import json
+import os
 import re
 import subprocess
+import urllib.parse
 from datetime import datetime
 from pathlib import Path
 
@@ -15,7 +21,7 @@ from audit import AuditLogger
 
 
 class PublishGate:
-    """Gate 4: Publish -- Push completed builds to GitHub."""
+    """Gate 4: Publish -- Push completed builds to configured git hosts."""
 
     def __init__(
         self,
@@ -23,39 +29,12 @@ class PublishGate:
         state_db: StateDB,
         audit_logger: AuditLogger,
     ):
-        """
-        Initialize Publish Gate.
-
-        Args:
-            config: Metroplex configuration
-            state_db: State database manager
-            audit_logger: Audit logger
-        """
         self.config = config
         self.state_db = state_db
         self.audit_logger = audit_logger
 
     def run(self, dry_run: bool = False) -> list[PublishJob]:
-        """
-        Run publish gate on completed but unpublished builds.
-
-        Process flow:
-        1. Query build_jobs for completed builds not in publish_jobs
-        2. For each unpublished build:
-           a. Resolve project directory from generations/<queue_job_id>/
-           b. Derive repo name from title (kebab-case)
-           c. Check if repo exists in org (skip if so, or update)
-           d. Create GitHub repo via gh CLI
-           e. Set git remote and push
-           f. Record publish_jobs entry
-        3. Enforce max_publish_per_cycle cap
-
-        Args:
-            dry_run: If True, print what would happen but don't create repos
-
-        Returns:
-            List of PublishJob objects
-        """
+        """Run publish gate on completed but unpublished builds."""
         unpublished = self.state_db.get_unpublished_builds(
             require_review=self.config.require_review
         )
@@ -63,7 +42,6 @@ class PublishGate:
         if not unpublished:
             return []
 
-        # Enforce per-cycle cap
         max_pub = self.config.max_publish_per_cycle
         if len(unpublished) > max_pub:
             unpublished = unpublished[:max_pub]
@@ -76,7 +54,6 @@ class PublishGate:
             title = build["title"]
             stored_dir = build.get("project_dir")
 
-            # Resolve project directory
             project_dir = self._resolve_project_dir(queue_job_id, title, stored_dir)
             if not project_dir:
                 job = PublishJob(
@@ -101,14 +78,17 @@ class PublishGate:
                     break
                 continue
 
-            # Derive repo name
             repo_name = self._derive_repo_name(title)
+            targets = self.config.publish_targets
 
             if dry_run:
                 print(f"[DRY RUN] Would publish: {queue_job_id}")
-                print(f"  Title: {title}")
-                print(f"  Repo:  {self.config.github_org}/{repo_name}")
-                print(f"  Dir:   {project_dir}")
+                print(f"  Title:   {title}")
+                print(f"  Repo:    {repo_name}")
+                print(f"  Targets: {targets} (primary={targets[0]})")
+                for t in targets:
+                    print(f"    - {self._target_repo_url(t, repo_name)}")
+                print(f"  Dir:        {project_dir}")
                 print(f"  Visibility: {self.config.publish_visibility}")
                 job = PublishJob(
                     build_job_id=queue_job_id,
@@ -120,129 +100,174 @@ class PublishGate:
                 results.append(job)
                 continue
 
-            # Actually publish
-            status, repo_url, error = self._publish_to_github(
-                project_dir, repo_name, title
-            )
-
-            job = PublishJob(
-                build_job_id=queue_job_id,
-                title=title,
-                repo_name=repo_name,
-                repo_url=repo_url,
-                status=status,
-                error=error,
-                project_dir=str(project_dir),
-                published_at=datetime.now() if status == "published" else None,
-            )
+            job = self._publish_with_mirrors(project_dir, repo_name, title, queue_job_id, targets)
             results.append(job)
             self.state_db.record_publish_job(job)
 
             self.audit_logger.log_decision(
                 gate="publish",
-                action=status,
+                action=job.status,
                 details={
                     "queue_job_id": queue_job_id,
                     "repo_name": repo_name,
-                    "repo_url": repo_url,
-                    "error": error,
+                    "repo_url": job.repo_url,
+                    "mirror_urls": job.mirror_urls,
+                    "targets_status": job.targets_status,
+                    "error": job.error,
                 },
             )
 
-            if status == "published":
+            if job.status == "published":
                 consecutive_failures = 0
-                print(f"+ Published: {self.config.github_org}/{repo_name}")
+                summary = ", ".join(f"{t}={s}" for t, s in job.targets_status.items())
+                print(f"+ Published: {repo_name} [{summary}]")
+                if job.error:
+                    # Mirror partial-failure warning
+                    print(f"  ! warning: {job.error}")
             else:
                 consecutive_failures += 1
-                print(f"x Failed to publish {queue_job_id}: {error}")
+                print(f"x Failed to publish {queue_job_id}: {job.error}")
                 if consecutive_failures >= 3:
                     print("! Publish gate: 3 consecutive failures, halting remaining")
                     break
 
         return results
 
-    def _resolve_project_dir(
-        self, queue_job_id: str, title: str = "", stored_dir: str | None = None
-    ) -> Path | None:
-        """
-        Resolve the generation directory for a build job.
+    def _publish_with_mirrors(
+        self,
+        project_dir: Path,
+        repo_name: str,
+        title: str,
+        queue_job_id: str,
+        targets: list[str],
+    ) -> PublishJob:
+        """Publish to primary target, then to each mirror. Primary failure fails the job."""
+        if not targets:
+            return PublishJob(
+                build_job_id=queue_job_id,
+                title=title,
+                repo_name=repo_name,
+                status="failed",
+                error="no publish targets configured",
+                project_dir=str(project_dir),
+            )
 
-        Resolution order:
-        1. Stored project_dir from build_jobs (set by UM bridge writeback)
-        2. generations/<queue_job_id>/ (direct queue_runner builds)
-        3. Scan um-* directories for matching UM idea UUID prefix
+        primary = targets[0]
+        mirrors = targets[1:]
+        targets_status: dict[str, str] = {}
+        mirror_urls: list[str] = []
 
-        Args:
-            queue_job_id: The build job queue ID
-            title: Project title (unused, kept for interface compat)
-            stored_dir: Pre-resolved path from build_jobs.project_dir
+        primary_status, primary_url, primary_error = self._publish_to_target(
+            primary, project_dir, repo_name, title, remote_name="origin"
+        )
+        targets_status[primary] = primary_status if primary_status == "published" else f"failed: {primary_error}"
 
-        Returns:
-            Path to the project directory, or None if not found
-        """
-        # 1. Stored path from UM bridge writeback
-        if stored_dir:
-            stored = Path(stored_dir)
-            if stored.is_dir() and (stored / ".git").is_dir():
-                return stored
+        if primary_status != "published":
+            return PublishJob(
+                build_job_id=queue_job_id,
+                title=title,
+                repo_name=repo_name,
+                repo_url=None,
+                status="failed",
+                error=f"{primary} (primary): {primary_error}",
+                project_dir=str(project_dir),
+                targets_status=targets_status,
+                mirror_urls=[],
+            )
 
-        # 2. Direct match (queue_runner builds)
-        generations_dir = Path(self.config.yce_dir) / "generations"
-        project_dir = generations_dir / queue_job_id
-        if project_dir.is_dir() and (project_dir / ".git").is_dir():
-            return project_dir
+        mirror_errors: list[str] = []
+        for m in mirrors:
+            m_status, m_url, m_error = self._publish_to_target(
+                m, project_dir, repo_name, title, remote_name=m
+            )
+            targets_status[m] = m_status if m_status == "published" else f"failed: {m_error}"
+            if m_status == "published" and m_url:
+                mirror_urls.append(m_url)
+            else:
+                mirror_errors.append(f"{m}: {m_error}")
 
-        return None
+        return PublishJob(
+            build_job_id=queue_job_id,
+            title=title,
+            repo_name=repo_name,
+            repo_url=primary_url,
+            status="published",
+            error=("mirror failures: " + "; ".join(mirror_errors)) if mirror_errors else None,
+            project_dir=str(project_dir),
+            published_at=datetime.now(),
+            targets_status=targets_status,
+            mirror_urls=mirror_urls,
+        )
 
-    def _derive_repo_name(self, title: str) -> str:
-        """
-        Derive a GitHub repo name from a project title.
+    def _publish_to_target(
+        self,
+        target: str,
+        project_dir: Path,
+        repo_name: str,
+        title: str,
+        remote_name: str,
+    ) -> tuple[str, str | None, str | None]:
+        """Dispatch to the per-host publisher. Returns (status, repo_url, error)."""
+        if target == "github":
+            return self._publish_github(project_dir, repo_name, title, remote_name)
+        if target == "gitlab":
+            return self._publish_gitlab(project_dir, repo_name, title, remote_name)
+        return ("failed", None, f"unknown publish target: {target}")
 
-        Rules:
-        - Lowercase
-        - Strip everything after first colon
-        - Replace non-alphanumeric with hyphens
-        - Collapse multiple hyphens
-        - Truncate to 100 chars
-        - Strip leading/trailing hyphens
+    # --- target URL helpers --------------------------------------------------
 
-        Args:
-            title: Project title
+    def _target_repo_url(self, target: str, repo_name: str) -> str:
+        if target == "github":
+            return f"https://github.com/{self.config.github_org}/{repo_name}"
+        if target == "gitlab":
+            return f"https://{self.config.gitlab_host}/{self.config.gitlab_namespace}/{repo_name}"
+        return ""
 
-        Returns:
-            Kebab-case repo name
-        """
-        # Take text before colon if present
-        name = title.split(":")[0].strip()
+    def _target_git_url(self, target: str, repo_name: str) -> str:
+        if target == "github":
+            return f"https://github.com/{self.config.github_org}/{repo_name}.git"
+        if target == "gitlab":
+            return f"git@{self.config.gitlab_host}:{self.config.gitlab_namespace}/{repo_name}.git"
+        return ""
 
-        # Lowercase
-        name = name.lower()
+    # --- GitHub publisher ---------------------------------------------------
 
-        # Replace non-alphanumeric (except hyphens) with hyphens
-        name = re.sub(r"[^a-z0-9-]", "-", name)
+    def _publish_github(
+        self, project_dir: Path, repo_name: str, title: str, remote_name: str
+    ) -> tuple[str, str | None, str | None]:
+        full_name = f"{self.config.github_org}/{repo_name}"
+        repo_url = self._target_repo_url("github", repo_name)
+        git_url = self._target_git_url("github", repo_name)
 
-        # Collapse multiple hyphens
-        name = re.sub(r"-+", "-", name)
+        try:
+            if not self._github_repo_exists(repo_name):
+                private = self.config.publish_visibility != "public"
+                # Use org-scoped POST to bypass `gh repo create` owner-probe (404 under classic PAT)
+                create_result = subprocess.run(
+                    [
+                        "gh", "api",
+                        f"orgs/{self.config.github_org}/repos",
+                        "-f", f"name={repo_name}",
+                        "-F", f"private={str(private).lower()}",
+                        "-f", f"description={title[:255]}",
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=60,
+                )
+                if create_result.returncode != 0:
+                    stderr = create_result.stderr.strip()
+                    if "already exists" not in stderr and "name already exists" not in stderr:
+                        return ("failed", None, f"gh api create failed: {stderr}")
 
-        # Strip leading/trailing hyphens
-        name = name.strip("-")
+            return self._push_to_remote(project_dir, remote_name, git_url, repo_url)
 
-        # Truncate
-        if len(name) > 100:
-            name = name[:100].rstrip("-")
+        except subprocess.TimeoutExpired:
+            return ("failed", None, "gh command timed out (60s)")
+        except Exception as e:
+            return ("failed", None, f"unexpected error: {e}")
 
-        return name or "unnamed-project"
-
-    def _repo_exists(self, repo_name: str) -> bool:
-        """
-        Check if a repo already exists in the GitHub org.
-
-        Args:
-            repo_name: Repository name (without org prefix)
-
-        Returns:
-            True if repo exists
-        """
+    def _github_repo_exists(self, repo_name: str) -> bool:
         full_name = f"{self.config.github_org}/{repo_name}"
         result = subprocess.run(
             ["gh", "repo", "view", full_name, "--json", "name"],
@@ -252,139 +277,146 @@ class PublishGate:
         )
         return result.returncode == 0
 
-    def _publish_to_github(
-        self, project_dir: Path, repo_name: str, title: str
+    # --- GitLab publisher ---------------------------------------------------
+
+    def _publish_gitlab(
+        self, project_dir: Path, repo_name: str, title: str, remote_name: str
     ) -> tuple[str, str | None, str | None]:
-        """
-        Create a GitHub repo and push code.
+        token = os.environ.get("GITLAB_TOKEN", "").strip()
+        if not token:
+            return ("failed", None, "GITLAB_TOKEN not set in environment")
 
-        Args:
-            project_dir: Local path to the project
-            repo_name: Desired repo name
-            title: Project title (used as repo description)
-
-        Returns:
-            Tuple of (status, repo_url, error)
-            status is 'published' or 'failed'
-        """
-        full_name = f"{self.config.github_org}/{repo_name}"
-        repo_url = f"https://github.com/{full_name}"
+        repo_url = self._target_repo_url("gitlab", repo_name)
+        git_url = self._target_git_url("gitlab", repo_name)
+        api_base = f"https://{self.config.gitlab_host}/api/v4"
 
         try:
-            # Check if repo already exists
-            if self._repo_exists(repo_name):
-                # Repo exists -- just set remote and push (handles re-runs)
-                return self._push_existing(project_dir, full_name, repo_url)
+            if not self._gitlab_project_exists(repo_name, token, api_base):
+                visibility = "public" if self.config.publish_visibility == "public" else "private"
+                create_result = subprocess.run(
+                    [
+                        "curl", "-sS", "--max-time", "60",
+                        "-o", "/dev/null", "-w", "%{http_code}",
+                        "-X", "POST",
+                        "-H", f"PRIVATE-TOKEN: {token}",
+                        "-H", "Content-Type: application/json",
+                        f"{api_base}/projects",
+                        "-d", json.dumps({
+                            "name": repo_name,
+                            "path": repo_name,
+                            "namespace_id": self.config.gitlab_namespace_id,
+                            "visibility": visibility,
+                            "description": title[:255],
+                            "initialize_with_readme": False,
+                        }),
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=70,
+                )
+                http_code = create_result.stdout.strip()
+                # 201 = created, 400 with "has already been taken" handled separately
+                if http_code != "201":
+                    if not self._gitlab_project_exists(repo_name, token, api_base):
+                        return ("failed", None, f"gitlab create failed: HTTP {http_code} {create_result.stderr.strip()}")
 
-            # Create new repo via the org-scoped API endpoint.
-            # NOTE: `gh repo create <org>/<name>` probes /users/<owner> to resolve
-            # owner type before creating, which 404s for orgs under classic-PAT
-            # auth (observed on gh v2.88.1). Calling POST /orgs/<org>/repos
-            # directly bypasses the probe.
-            private = self.config.publish_visibility != "public"
-            create_result = subprocess.run(
-                [
-                    "gh", "api",
-                    f"orgs/{self.config.github_org}/repos",
-                    "-f", f"name={repo_name}",
-                    "-F", f"private={str(private).lower()}",
-                    "-f", f"description={title[:255]}",
-                ],
-                capture_output=True,
-                text=True,
-                timeout=60,
-            )
-
-            if create_result.returncode != 0:
-                stderr = create_result.stderr.strip()
-                # If "already exists" (422), fall through to push_existing
-                if "already exists" in stderr or "name already exists" in stderr:
-                    return self._push_existing(project_dir, full_name, repo_url)
-                return ("failed", None, f"gh api create failed: {stderr}")
-
-            # Repo created -- now set remote and push
-            return self._push_existing(project_dir, full_name, repo_url)
+            return self._push_to_remote(project_dir, remote_name, git_url, repo_url)
 
         except subprocess.TimeoutExpired:
-            return ("failed", None, "gh command timed out (60s)")
+            return ("failed", None, "gitlab api timed out")
         except Exception as e:
-            return ("failed", None, f"unexpected error: {str(e)}")
+            return ("failed", None, f"unexpected error: {e}")
 
-    def _push_existing(
-        self, project_dir: Path, full_name: str, repo_url: str
+    def _gitlab_project_exists(self, repo_name: str, token: str, api_base: str) -> bool:
+        path = urllib.parse.quote(f"{self.config.gitlab_namespace}/{repo_name}", safe="")
+        result = subprocess.run(
+            [
+                "curl", "-sS", "--max-time", "30",
+                "-o", "/dev/null", "-w", "%{http_code}",
+                "-H", f"PRIVATE-TOKEN: {token}",
+                f"{api_base}/projects/{path}",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=35,
+        )
+        return result.stdout.strip() == "200"
+
+    # --- shared git push -----------------------------------------------------
+
+    def _push_to_remote(
+        self, project_dir: Path, remote_name: str, git_url: str, repo_url: str
     ) -> tuple[str, str | None, str | None]:
-        """
-        Push to an existing repo (set remote origin and push).
-
-        Args:
-            project_dir: Local project directory
-            full_name: Full repo name (org/repo)
-            repo_url: GitHub URL
-
-        Returns:
-            Tuple of (status, repo_url, error)
-        """
-        git_url = f"https://github.com/{full_name}.git"
-
+        """Set or update a named git remote and push the current branch to it."""
         try:
-            # Check if remote 'origin' exists
-            remote_result = subprocess.run(
-                ["git", "-C", str(project_dir), "remote", "get-url", "origin"],
+            existing = subprocess.run(
+                ["git", "-C", str(project_dir), "remote", "get-url", remote_name],
                 capture_output=True,
                 text=True,
                 timeout=10,
             )
-
-            if remote_result.returncode == 0:
-                # Remote exists -- update it
+            if existing.returncode == 0:
                 subprocess.run(
-                    ["git", "-C", str(project_dir), "remote", "set-url", "origin", git_url],
+                    ["git", "-C", str(project_dir), "remote", "set-url", remote_name, git_url],
                     capture_output=True,
                     text=True,
                     timeout=10,
                 )
             else:
-                # Add remote
                 subprocess.run(
-                    ["git", "-C", str(project_dir), "remote", "add", "origin", git_url],
+                    ["git", "-C", str(project_dir), "remote", "add", remote_name, git_url],
                     capture_output=True,
                     text=True,
                     timeout=10,
                 )
 
-            # Push
+            branch_result = subprocess.run(
+                ["git", "-C", str(project_dir), "branch", "--show-current"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            branch = branch_result.stdout.strip() or "main"
+
             push_result = subprocess.run(
-                ["git", "-C", str(project_dir), "push", "-u", "origin", "main"],
+                ["git", "-C", str(project_dir), "push", "-u", remote_name, branch],
                 capture_output=True,
                 text=True,
                 timeout=120,
             )
-
             if push_result.returncode != 0:
-                stderr = push_result.stderr.strip()
-                # Try pushing whatever the current branch is
-                branch_result = subprocess.run(
-                    ["git", "-C", str(project_dir), "branch", "--show-current"],
-                    capture_output=True,
-                    text=True,
-                    timeout=10,
-                )
-                branch = branch_result.stdout.strip() or "main"
-                if branch != "main":
-                    push_result = subprocess.run(
-                        ["git", "-C", str(project_dir), "push", "-u", "origin", branch],
-                        capture_output=True,
-                        text=True,
-                        timeout=120,
-                    )
-                    if push_result.returncode != 0:
-                        return ("failed", None, f"git push failed: {push_result.stderr.strip()}")
-                else:
-                    return ("failed", None, f"git push failed: {stderr}")
+                return ("failed", None, f"git push to {remote_name} failed: {push_result.stderr.strip()}")
 
             return ("published", repo_url, None)
 
         except subprocess.TimeoutExpired:
-            return ("failed", None, "git push timed out (120s)")
+            return ("failed", None, f"git push to {remote_name} timed out (120s)")
         except Exception as e:
-            return ("failed", None, f"push error: {str(e)}")
+            return ("failed", None, f"push error: {e}")
+
+    # --- project dir + name helpers (unchanged from original) ----------------
+
+    def _resolve_project_dir(
+        self, queue_job_id: str, title: str = "", stored_dir: str | None = None
+    ) -> Path | None:
+        if stored_dir:
+            stored = Path(stored_dir)
+            if stored.is_dir() and (stored / ".git").is_dir():
+                return stored
+
+        generations_dir = Path(self.config.yce_dir) / "generations"
+        project_dir = generations_dir / queue_job_id
+        if project_dir.is_dir() and (project_dir / ".git").is_dir():
+            return project_dir
+
+        return None
+
+    def _derive_repo_name(self, title: str) -> str:
+        name = title.split(":")[0].strip()
+        name = name.lower()
+        name = re.sub(r"[^a-z0-9-]", "-", name)
+        name = re.sub(r"-+", "-", name)
+        name = name.strip("-")
+        if len(name) > 100:
+            name = name[:100].rstrip("-")
+        return name or "unnamed-project"

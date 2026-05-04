@@ -79,7 +79,7 @@ Service unit: `deploy/metroplex.service` — runs `run-all --cycles 0` with `Res
 | 1 Triage | `gates/triage.py` | Score IdeaForge ideas against thresholds, approve/reject/defer |
 | 2 Build | `gates/build.py` | Generate spec via LLM, dispatch to YCE Harness |
 | 3 Patch | `gates/patcher.py` | Apply ST Records persona YAML patches via git clone/commit/push |
-| 4 Publish | `gates/publish.py` | Create GitHub repo in m2ai-portfolio org, push completed builds |
+| 4 Publish | `gates/publish.py` | Create repos on configured hosts (GitHub `m2ai-portfolio` org and/or GitLab `m2ai-portfolio` group), push completed builds. First entry in `publish_targets` is primary; subsequent entries are mirrors (their URLs go in `publish_jobs.mirror_urls`, per-target outcome in `targets_status`). |
 | 4.5 Review | `gates/review.py` | Automated quality checks before publish (source code, README, no secrets, no large files) |
 
 ### Readers (Upstream DBs)
@@ -169,9 +169,16 @@ Non-buildable items routed to EA-Claude workers via `WORKER_ROUTES` dict. Writes
 - `METROPLEX_CYCLE_SLEEP_SECONDS` (60)
 - `METROPLEX_CIRCUIT_BREAKER_THRESHOLD` (3)
 
-### GitHub
-- `METROPLEX_GITHUB_ORG` (m2ai-portfolio)
-- `METROPLEX_PUBLISH_VISIBILITY` (private)
+### Publish targets
+- `METROPLEX_PUBLISH_TARGETS` (`github,gitlab`) — comma-sep, first is primary, rest are mirrors. Valid values: `github`, `gitlab`. Primary failure fails the publish job; mirror failure leaves status=`published` with the failure recorded in `targets_status` and surfaced in `error`.
+- `METROPLEX_GITHUB_ORG` (`m2ai-portfolio`)
+- `METROPLEX_GITLAB_HOST` (`gitlab.com`)
+- `METROPLEX_GITLAB_NAMESPACE` (`m2ai-portfolio`)
+- `METROPLEX_GITLAB_NAMESPACE_ID` (`130681062`) — numeric group id; required by GitLab project-create API
+- `METROPLEX_PUBLISH_VISIBILITY` (`private`)
+- `GITLAB_TOKEN` — GitLab personal access token, sourced from `~/.env.shared`. Required when `gitlab` is in `publish_targets`.
+
+After changing any of these, restart the metroplex service (`systemctl --user restart metroplex`) so the running daemon picks up the new env.
 
 ## Design Decisions
 

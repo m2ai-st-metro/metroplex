@@ -73,7 +73,7 @@ class GateStatus(BaseModel):
 
 
 class PublishJob(BaseModel):
-    """Publish job for pushing completed builds to GitHub."""
+    """Publish job for pushing completed builds to one or more git hosts."""
     build_job_id: str
     title: str
     repo_name: str
@@ -83,6 +83,8 @@ class PublishJob(BaseModel):
     project_dir: str
     created_at: datetime = Field(default_factory=datetime.now)
     published_at: datetime | None = None
+    targets_status: dict[str, str] = Field(default_factory=dict)
+    mirror_urls: list[str] = Field(default_factory=list)
 
 
 class PriorityItem(BaseModel):

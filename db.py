@@ -247,6 +247,14 @@ class StateDB:
             )
         """)
 
+        # Migrate: per-target publish state for multi-host mirroring
+        cursor.execute("PRAGMA table_info(publish_jobs)")
+        pj_columns = {row[1] for row in cursor.fetchall()}
+        if "targets_status" not in pj_columns:
+            cursor.execute("ALTER TABLE publish_jobs ADD COLUMN targets_status TEXT")
+        if "mirror_urls" not in pj_columns:
+            cursor.execute("ALTER TABLE publish_jobs ADD COLUMN mirror_urls TEXT")
+
         # Migrate: add estimated_cost to build_jobs
         cursor.execute("PRAGMA table_info(build_jobs)")
         bj_columns_refresh = {row[1] for row in cursor.fetchall()}
@@ -1535,13 +1543,15 @@ class StateDB:
 
     def record_publish_job(self, job: PublishJob):
         """Record a publish job. Uses INSERT OR REPLACE to handle retries of failed jobs."""
+        import json
         self.connect()
         cursor = self.conn.cursor()
 
         cursor.execute("""
             INSERT OR REPLACE INTO publish_jobs
-                (build_job_id, title, repo_name, repo_url, status, error, project_dir, created_at, published_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                (build_job_id, title, repo_name, repo_url, status, error, project_dir,
+                 created_at, published_at, targets_status, mirror_urls)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             job.build_job_id,
             job.title,
@@ -1552,6 +1562,8 @@ class StateDB:
             job.project_dir,
             job.created_at.isoformat(),
             job.published_at.isoformat() if job.published_at else None,
+            json.dumps(job.targets_status) if job.targets_status else None,
+            json.dumps(job.mirror_urls) if job.mirror_urls else None,
         ))
 
         self.conn.commit()
@@ -1571,15 +1583,23 @@ class StateDB:
 
     def get_all_publish_jobs(self) -> list[dict]:
         """Get all publish jobs for display."""
+        import json
         self.connect()
         cursor = self.conn.cursor()
 
         cursor.execute("""
-            SELECT build_job_id, title, repo_name, repo_url, status, error, project_dir, created_at, published_at
+            SELECT build_job_id, title, repo_name, repo_url, status, error, project_dir,
+                   created_at, published_at, targets_status, mirror_urls
             FROM publish_jobs
             ORDER BY created_at DESC
         """)
-        return [dict(row) for row in cursor.fetchall()]
+        rows = []
+        for row in cursor.fetchall():
+            d = dict(row)
+            d["targets_status"] = json.loads(d["targets_status"]) if d.get("targets_status") else {}
+            d["mirror_urls"] = json.loads(d["mirror_urls"]) if d.get("mirror_urls") else []
+            rows.append(d)
+        return rows
 
     # --- Cost Ledger (Phase 13e) ---
 
