@@ -18,10 +18,10 @@ MODEL_RATES: dict[str, dict[str, float]] = {
     "sonnet": {"input": 3.0, "output": 15.0},
     "haiku": {"input": 0.80, "output": 4.0},
     # DeepInfra (spec_expander, ego_evaluator, readme, readiness)
-    # VERIFY rates against the DeepInfra dashboard — pricing API returns empty
-    # block, so these defaults are last-known public rates. Override via
+    # Verified against the DeepInfra dashboard 2026-05-04. Pricing API returns
+    # an empty block, so values are kept literal here. Override via
     # METROPLEX_COST_RATES_JSON when DeepInfra adjusts.
-    "Qwen/Qwen2.5-72B-Instruct": {"input": 0.23, "output": 0.40},
+    "Qwen/Qwen2.5-72B-Instruct": {"input": 0.36, "output": 0.40},
 }
 
 
