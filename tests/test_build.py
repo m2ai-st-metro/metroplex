@@ -1281,4 +1281,46 @@ class TestSelfHealingLivenessGuard:
 
         assert jobs == []
 
+    def test_run_from_queue_releases_claim_when_backoff_active(
+        self, mock_state_db, mock_spec_generator, mock_audit_logger,
+    ):
+        """When a build is skipped due to active backoff, Gate 2 must release
+        the priority_queue claim. Otherwise the row stays atomically claimed
+        and the orchestrator's auto-retry path mis-reads it as
+        'Gate 2 never consumed', marking the build retry_stuck_abandoned and
+        permanently stranding the idea.
+        """
+        from build_adapter import BuildAdapter
+        adapter = MagicMock(spec=BuildAdapter)
+        adapter.is_active.return_value = True
+        orch = self._make_orchestrator(
+            "self_healing", mock_state_db, mock_spec_generator, mock_audit_logger, adapter,
+        )
+
+        # Simulate retry scenario: prior failed attempt + active backoff timer
+        mock_state_db.count_failed_builds = Mock(return_value=1)
+        mock_state_db.is_backoff_active = Mock(return_value=True)
+
+        item = Mock(
+            id=99, source="ideaforge", source_id=42, title="Backoff Active",
+            description="A CLI tool that exists primarily to test backoff handling",
+            idea_data=json.dumps({
+                "id": 42, "title": "Backoff Active",
+                "description": "A CLI tool that exists primarily to test backoff handling",
+                "problem_statement": "P", "target_audience": "T",
+                "artifact_type": "tool",
+            }),
+        )
+        mock_state_db.claim_next_pending = Mock(side_effect=[item, None])
+
+        with patch.object(orch, 'start_queue_background'):
+            jobs = orch.run_from_queue(mock_state_db, dry_run=False)
+
+        # KEY assertion: the claim must be released so the row returns to pending
+        mock_state_db.release_claim.assert_called_once_with(99)
+        # No build was dispatched
+        adapter.queue.assert_not_called()
+        mock_state_db.record_build_job.assert_not_called()
+        assert jobs == []
+
 
