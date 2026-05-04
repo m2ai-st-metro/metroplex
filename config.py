@@ -94,7 +94,11 @@ class Config:
     dispatch_chat_id: str = field(default="")
 
     # Publish gate (Gate 4)
+    publish_targets: list[str] = field(default_factory=lambda: ["github", "gitlab"])
     github_org: str = field(default="m2ai-portfolio")
+    gitlab_host: str = field(default="gitlab.com")
+    gitlab_namespace: str = field(default="m2ai-portfolio")
+    gitlab_namespace_id: int = field(default=130681062)
     publish_visibility: str = field(default="private")
     max_publish_per_cycle: int = field(default=3)
     require_review: bool = field(default=True)
@@ -247,7 +251,19 @@ class Config:
             pass
 
         # Publish gate
+        targets_env = os.environ.get("METROPLEX_PUBLISH_TARGETS")
+        if targets_env:
+            parsed = [t.strip().lower() for t in targets_env.split(",") if t.strip()]
+            valid = [t for t in parsed if t in ("github", "gitlab")]
+            if valid:
+                self.publish_targets = valid
         self.github_org = os.environ.get("METROPLEX_GITHUB_ORG", self.github_org)
+        self.gitlab_host = os.environ.get("METROPLEX_GITLAB_HOST", self.gitlab_host)
+        self.gitlab_namespace = os.environ.get("METROPLEX_GITLAB_NAMESPACE", self.gitlab_namespace)
+        try:
+            self.gitlab_namespace_id = int(os.environ.get("METROPLEX_GITLAB_NAMESPACE_ID", self.gitlab_namespace_id))
+        except ValueError:
+            pass
         self.publish_visibility = os.environ.get("METROPLEX_PUBLISH_VISIBILITY", self.publish_visibility)
         self.require_review = os.environ.get("METROPLEX_REQUIRE_REVIEW", "").lower() not in ("0", "false", "no")
         try:
