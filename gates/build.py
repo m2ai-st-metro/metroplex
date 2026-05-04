@@ -1166,11 +1166,19 @@ class BuildOrchestrator:
             # lives on build_jobs.next_retry_at. Without this check, every
             # cycle (~60s) re-dispatches the build, bypassing the 5/20/60
             # minute backoff schedule.
+            #
+            # When skipping, release the priority_queue claim so the row
+            # returns to 'pending' / claimed_by=NULL. Otherwise the row
+            # stays atomically claimed by this process and the orchestrator's
+            # auto-retry path mis-reads it as "Gate 2 never consumed",
+            # marking the build abandoned (orchestrator.py retry_stuck_abandoned).
             if attempt > 0 and state_db.is_backoff_active(base_job_id):
                 logger.info(
                     "Skipping %s — backoff timer still active (attempt %d)",
                     base_job_id, attempt,
                 )
+                if not dry_run and item.id:
+                    state_db.release_claim(item.id)
                 continue
 
             job_id = f"{base_job_id}-r{attempt}" if attempt > 0 else base_job_id
