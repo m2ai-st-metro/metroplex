@@ -112,7 +112,16 @@ class TestPollStatusMapping:
             ("planning", "running"),
             ("building", "running"),
             ("judging", "running"),
-            ("passed", "completed"),
+            # NOTE: ("passed", "completed") was removed from this parametric
+            # set after the publish-vs-Ravage race fix (2026-05-04). `_map_status`
+            # is now the simple-cases-only mapping; the "passed" branch in
+            # `_job_status` routes through `_resolve_metroplex_status` because
+            # it must consult `review_verdict`. Bare "passed" still returns
+            # "completed" from `_map_status` for backward compat, but the
+            # contract that matters is the (loop_status, review_verdict) one
+            # exercised end-to-end via `adapter.poll()` in
+            # `test_self_healing_publish_ravage_race.py`.
+            ("review_rejected", "failed"),
             ("escalated", "failed"),
             ("unknown_future_state", "pending"),
             (None, "pending"),
@@ -122,6 +131,39 @@ class TestPollStatusMapping:
         assert (
             SelfHealingAdapter._map_status(self_healing_status)
             == expected_metroplex_status
+        )
+
+    @pytest.mark.parametrize(
+        "loop_status,review_verdict,expected",
+        [
+            # R3 regression guard (happy path): passed + approved → completed.
+            # Dropped from red commit per "drop accidentally-passing tests" rule
+            # (would have passed against the unmodified adapter); kept here as
+            # the anchor that future regressions don't break the publishing path.
+            ("passed", "approved", "completed"),
+            # Race window — Ravage hasn't run yet
+            ("passed", None, "running"),
+            # Defense in depth — verdict written before status flipped
+            ("passed", "rejected", "failed"),
+            # Unknown verdict on passed: conservative — keep as running
+            ("passed", "needs_revision", "running"),
+            # Non-passed branches ignore review_verdict
+            ("planning", None, "running"),
+            ("building", None, "running"),
+            ("judging", None, "running"),
+            ("review_rejected", "rejected", "failed"),
+            ("escalated", None, "failed"),
+            (None, None, "pending"),
+        ],
+    )
+    def test_resolve_metroplex_status(
+        self, loop_status, review_verdict, expected
+    ):
+        assert (
+            SelfHealingAdapter._resolve_metroplex_status(
+                loop_status, review_verdict
+            )
+            == expected
         )
 
     def test_poll_empty_when_no_jobs(self, adapter):
@@ -175,19 +217,47 @@ class TestPollStatusMapping:
     def test_poll_completed_on_passed(self, adapter, tmp_path):
         target = tmp_path / "job-pass"
         target.mkdir()
+        # Post publish-vs-Ravage-race fix: status="passed" alone is not enough.
+        # The daemon's Step 10.5 Ravage review must have written
+        # review_verdict="approved" before the adapter reports "completed".
         _write_state(
             target,
             {
                 "status": "passed",
                 "attempt": 1,
                 "judge_verdict": "pass",
+                "review_verdict": "approved",
             },
         )
         adapter._jobs["job-pass"] = target
         job = adapter.poll()["jobs"][0]
         assert job["status"] == "completed"
         assert job["judge_verdict"] == "pass"
+        assert job["review_verdict"] == "approved"
         assert job["project_dir"] == str(target)
+
+    def test_poll_running_when_passed_without_review_verdict(
+        self, adapter, tmp_path
+    ):
+        """Backward compat: pre-Step-10.5 state.json files (no review_verdict)
+        map to running, not completed. Metroplex's 90-min watchdog will
+        eventually time them out — better than re-introducing the race.
+        """
+        target = tmp_path / "job-old"
+        target.mkdir()
+        _write_state(
+            target,
+            {
+                "status": "passed",
+                "attempt": 1,
+                "judge_verdict": "pass",
+                # review_verdict deliberately absent — old schema
+            },
+        )
+        adapter._jobs["job-old"] = target
+        job = adapter.poll()["jobs"][0]
+        assert job["status"] == "running"
+        assert job["review_verdict"] is None
 
     def test_poll_failed_on_escalated(self, adapter, tmp_path):
         target = tmp_path / "job-esc"
@@ -209,14 +279,23 @@ class TestPollStatusMapping:
 
 class TestPollMultipleJobs:
     def test_poll_returns_all_tracked_jobs(self, adapter, tmp_path):
-        for jid, status in [
-            ("j-plan", "planning"),
-            ("j-pass", "passed"),
-            ("j-esc", "escalated"),
+        # Post publish-vs-Ravage-race fix: "passed" requires review_verdict
+        # to be reported as "completed". Each job_state is a full state dict.
+        for jid, job_state in [
+            ("j-plan", {"status": "planning", "attempt": 1}),
+            (
+                "j-pass",
+                {
+                    "status": "passed",
+                    "attempt": 1,
+                    "review_verdict": "approved",
+                },
+            ),
+            ("j-esc", {"status": "escalated", "attempt": 1}),
         ]:
             target = tmp_path / jid
             target.mkdir()
-            _write_state(target, {"status": status, "attempt": 1})
+            _write_state(target, job_state)
             adapter._jobs[jid] = target
 
         result = adapter.poll()
@@ -233,15 +312,24 @@ class TestPhaseAStateFileReplay:
     These fixtures are the actual state files written by the validated P/B/J
     loop on real Metroplex failing specs. If the adapter's mapping breaks,
     these tests fail before any live build is attempted.
+
+    NOTE (2026-05-04, publish-vs-Ravage-race fix): Phase A state.json files
+    predate the daemon's Step 10.5 Ravage review and lack `review_verdict`.
+    Under the fixed mapping, `status="passed"` + `review_verdict=None` maps
+    to `"running"` (conservative — the publish gate will not pick them up).
+    This is the intentional backward-compat behavior; Metroplex's 90-min
+    watchdog (`METROPLEX_BUILD_TIMEOUT_SECONDS`) will eventually fail any
+    legacy workspace that lacks a verdict. Better than re-introducing the
+    build-352 race.
     """
 
     SANDBOX_RUNS = [
-        ("self-healing-test-199", "passed", "completed"),
-        ("self-healing-test-208", "passed", "completed"),
-        ("self-healing-test-73", "passed", "completed"),
-        ("self-healing-test-73-retry", "passed", "completed"),
-        ("self-healing-test-38", "passed", "completed"),
-        ("self-healing-test-tsmcp", "passed", "completed"),
+        ("self-healing-test-199", "passed", "running"),
+        ("self-healing-test-208", "passed", "running"),
+        ("self-healing-test-73", "passed", "running"),
+        ("self-healing-test-73-retry", "passed", "running"),
+        ("self-healing-test-38", "passed", "running"),
+        ("self-healing-test-tsmcp", "passed", "running"),
     ]
 
     @pytest.mark.parametrize("sandbox_dir,loop_status,expected", SANDBOX_RUNS)
