@@ -109,7 +109,7 @@ Repeat until `SHUTDOWN_FLAG` is present:
    After six iterations (~60s elapsed) fall through and continue the main loop. Do not add commentary during idle iterations -- keep the conversation lean.
 5. **Claim oldest job**:
    a. Read the oldest pending job file.
-   b. Move it atomically from `PENDING_DIR/<job_id>.json` to `IN_FLIGHT_DIR/<job_id>.json` via `mv` (Bash tool, absolute paths).
+   b. Move it atomically from `PENDING_DIR/<job_id>.json` to `IN_FLIGHT_DIR/<job_id>.json` via `mv` (Bash tool, absolute paths). Then **`touch` the in_flight file** to refresh its mtime to claim-time -- `mv` preserves the original queued_at mtime, which causes the daemon health monitor's `oldest_in_flight_age` (which reads file mtime, `scripts/monitor_daemon.sh:33-44`) to fire spurious STUCK warnings whenever a queue backlog exists (confirmed 2026-05-04 build 365: queued at 15:28:26, monitor reported 2195s "stuck" at 16:05:02 -- which is exactly 2196s since queue write, despite the daemon having only just claimed it). The touch makes mtime mean "time since claim", which is the signal the monitor actually wants.
    c. **Write heartbeat callback**: write `{target_dir}/.heartbeat-callback` containing the single line `HEARTBEAT` (absolute path, no trailing newline-only content). The `/self-healing-pipeline` skill reads this file and touches the path between Planner/Builder/Judge phase transitions so the adapter's `is_active()` stays green during long Builder runs. Without this file, heartbeat ages while the Builder is working and the adapter will mark the daemon stale (see "Heartbeat semantics during active builds" below).
    d. Print `"Processing job {job_id}: spec={spec_path}, target={target_dir}"`.
 6. **Dispatch**: invoke `/self-healing-pipeline` with this task description:
@@ -132,6 +132,12 @@ Repeat until `SHUTDOWN_FLAG` is present:
 10.5. **Ravage review** (only on `status == "passed"`):
     After workspace prep, run two code-quality review agents against the build output. These catch bugs, silent failures, and security issues that the Judge's test-based pass/fail cannot see. The daemon session has Agent tool access, so it can spawn sub-agents directly.
     a. Touch `HEARTBEAT`.
+    a-bis. **Start heartbeat keep-alive for the parallel Agent block.** The two Agent tool calls in 10.5b run for 2-5 minutes during which the daemon's session is blocked waiting for results and cannot touch `HEARTBEAT` itself. Without keep-alive, the monitor sees stale heartbeat and flaps DEAD/RECOVERED (confirmed 2026-05-04: three flaps inside 30 minutes -- builds 322, 352, 365 -- because Step 10.5a's touch only buys ~120s before Ravage agents push past the threshold). Spawn a detached bash loop that touches `HEARTBEAT` every 60s, save its PID for the kill in 10.5h. Run via Bash tool with absolute paths:
+       ```bash
+       nohup bash -c 'while sleep 60; do touch /home/apexaipc/projects/metroplex/data/self_healing_queue/heartbeat-worker-1.txt; done' > /dev/null 2>&1 &
+       echo $! > /home/apexaipc/projects/metroplex/data/self_healing_queue/.ravage_keepalive.pid
+       ```
+       This is option (b) from the diagnostic at `~/diagnostics/daemon-flapping-2026-05-04.md` -- option (a) (touches between Agent dispatch and return) is not possible because Claude Code dispatches tools in parallel within a single turn; the daemon's session is blocked during waits. The trade-off is that a hung daemon session would still appear alive via the keep-alive; this is acceptable because the realistic failure mode here is "session healthily waiting on Agent" not "session crashed."
     b. Spawn **both** review agents in parallel using the Agent tool (two Agent calls in a single response). For each agent, the prompt must specify the absolute `{target_dir}` path and instruct the agent to review all source files there (not a git diff -- this is a freshly generated project, so all files are "new"). Exclude `.git/`, `.self-healing-pipeline/`, `node_modules/`, `__pycache__/`, `venv/`, and `*.lock` files from review scope.
        - **Agent 1 -- code-reviewer** (`subagent_type: "pr-review-toolkit:code-reviewer"`): review for bugs, security vulnerabilities, and code quality issues. Ask it to report issues with confidence >= 80 only, grouped by Critical (90-100) and Important (80-89). Tell it the project has no CLAUDE.md guidelines -- judge purely on correctness and security.
        - **Agent 2 -- silent-failure-hunter** (`subagent_type: "pr-review-toolkit:silent-failure-hunter"`): review for empty catch blocks, swallowed errors, silent fallbacks, and missing error propagation. Ask it to report issues with severity CRITICAL, HIGH, or MEDIUM.
@@ -143,7 +149,12 @@ Repeat until `SHUTDOWN_FLAG` is present:
        - `review_report_path`: absolute path to `review-report.md`
     f. If `review_verdict == "rejected"`: print `"Ravage review REJECTED: {N} critical issues found. See {review_report_path}"`. Override the routing status for Step 11 -- this build goes to `FAILED_DIR` even though the Judge passed it. Update `state.json` `status` to `"review_rejected"`.
     g. If `review_verdict == "approved"`: print `"Ravage review approved ({N} non-critical issues noted)"` where N is the total issue count minus critical.
-    h. Touch `HEARTBEAT`.
+    h. **Stop heartbeat keep-alive and refresh:**
+       ```bash
+       pid=$(cat /home/apexaipc/projects/metroplex/data/self_healing_queue/.ravage_keepalive.pid 2>/dev/null) && [ -n "$pid" ] && kill "$pid" 2>/dev/null
+       rm -f /home/apexaipc/projects/metroplex/data/self_healing_queue/.ravage_keepalive.pid
+       touch /home/apexaipc/projects/metroplex/data/self_healing_queue/heartbeat-worker-1.txt
+       ```
     On `escalated` status, skip the review entirely (same as workspace prep).
 11. **Route to terminal dir**:
     - If `status == "passed"`: move the in-flight job file to `COMPLETED_DIR/<job_id>.json`.
