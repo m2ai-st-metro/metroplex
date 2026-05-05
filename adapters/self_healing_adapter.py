@@ -26,9 +26,20 @@ touches each loop iteration.
 
 State mapping (self-healing → Metroplex):
   - planning, building, judging → "running"
-  - passed                      → "completed"
+  - passed + review_verdict=None       → "running" (Ravage hasn't finished)
+  - passed + review_verdict=approved   → "completed"
+  - passed + review_verdict=rejected   → "failed" (defense in depth — daemon
+                                          may not have flipped status yet)
+  - review_rejected             → "failed"
   - escalated                   → "failed"
   - (missing / corrupt state)   → "pending"
+
+The publish-vs-Ravage race (build 352, 2026-05-04): the pipeline Judge writes
+state.status="passed" before the daemon's Step 10.5 Ravage review runs. If
+the adapter mapped "passed" → "completed" unconditionally, Metroplex's
+publish gate could ship the artifact before Ravage rejected it. The
+`review_verdict` field is the right witness because it is set unconditionally
+at the end of Step 10.5 (approved or rejected) and is None before that.
 """
 from __future__ import annotations
 
@@ -227,14 +238,50 @@ class SelfHealingAdapter:
             )
             return base
 
-        base["status"] = self._map_status(state.get("status"))
-        base["self_healing_state"] = state.get("status")
+        loop_status = state.get("status")
+        review_verdict = state.get("review_verdict")
+        base["status"] = self._resolve_metroplex_status(loop_status, review_verdict)
+        base["self_healing_state"] = loop_status
         base["attempt"] = state.get("attempt")
         base["judge_verdict"] = state.get("judge_verdict")
         base["escalation_reason"] = state.get("escalation_reason")
-        base["review_verdict"] = state.get("review_verdict")
+        base["review_verdict"] = review_verdict
         base["review_critical_count"] = state.get("review_critical_count")
         return base
+
+    @staticmethod
+    def _resolve_metroplex_status(
+        loop_status: str | None, review_verdict: str | None
+    ) -> str:
+        """Translate (loop_status, review_verdict) to a Metroplex build-job status.
+
+        The `"passed"` case is special: pipeline Judge writes status="passed"
+        BEFORE the daemon's Step 10.5 Ravage review runs. Mapping "passed" to
+        "completed" unconditionally lets Metroplex's publish gate ship a build
+        before Ravage has reviewed it (the build 352 race, 2026-05-04). So:
+
+          - passed + review_verdict=None     → "running" (Ravage hasn't run)
+          - passed + review_verdict=approved → "completed"
+          - passed + review_verdict=rejected → "failed" (defense in depth: the
+              daemon writes review_verdict before flipping status to
+              "review_rejected" per Step 10.5(f); we MUST short-circuit here
+              to handle the window where verdict is set but status hasn't yet
+              been flipped)
+          - passed + any other truthy verdict → "running" (conservative —
+              unknown verdict means we don't yet know it's safe to publish)
+
+        For all other loop statuses, defer to `_map_status` (the simple
+        dict-based mapping unchanged from prior behavior).
+        """
+        if loop_status == "passed":
+            if review_verdict is None:
+                return "running"
+            if review_verdict == "approved":
+                return "completed"
+            if review_verdict == "rejected":
+                return "failed"
+            return "running"
+        return SelfHealingAdapter._map_status(loop_status)
 
     @staticmethod
     def _map_status(self_healing_status: str | None) -> str:
@@ -242,6 +289,14 @@ class SelfHealingAdapter:
 
         Unknown or missing statuses map to "pending" — this is conservative;
         the build gate treats pending as "still running, not yet synced."
+
+        NOTE: This pure-string mapping is preserved for the simple cases
+        (planning/building/judging/review_rejected/escalated/None). For
+        `"passed"`, it still returns `"completed"` for backward compatibility
+        with callers that don't have a verdict — but `_job_status` does NOT
+        use this path for "passed"; it routes through `_resolve_metroplex_status`
+        which consults `review_verdict`. See that method's docstring for the
+        publish-vs-Ravage race rationale.
         """
         if self_healing_status is None:
             return "pending"

@@ -163,10 +163,20 @@ def test_self_healing_happy_path_end_to_end(
     assert row["retry_count"] == 0
     assert row["completed_at"] is None
 
-    # 5. FAKE THE DAEMON — hand-write terminal state
+    # 5. FAKE THE DAEMON — hand-write terminal state.
+    # Post publish-vs-Ravage-race fix (2026-05-04): a "passed" status without
+    # a Ravage review_verdict now maps to "running", not "completed", because
+    # the pipeline Judge writes "passed" before the daemon's Step 10.5 review
+    # runs. We must emit review_verdict="approved" to simulate Ravage having
+    # finished its review.
     _write_state(
         target_dir,
-        {"status": "passed", "attempt": 1, "judge_verdict": "pass"},
+        {
+            "status": "passed",
+            "attempt": 1,
+            "judge_verdict": "pass",
+            "review_verdict": "approved",
+        },
     )
 
     # 6. First poll syncs the row
