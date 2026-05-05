@@ -260,7 +260,10 @@ class PublishGate:
                     if "already exists" not in stderr and "name already exists" not in stderr:
                         return ("failed", None, f"gh api create failed: {stderr}")
 
-            return self._push_to_remote(project_dir, remote_name, git_url, repo_url)
+            return self._push_to_remote(
+                project_dir, remote_name, git_url, repo_url,
+                target="github", repo_name=repo_name,
+            )
 
         except subprocess.TimeoutExpired:
             return ("failed", None, "gh command timed out (60s)")
@@ -320,7 +323,10 @@ class PublishGate:
                     if not self._gitlab_project_exists(repo_name, token, api_base):
                         return ("failed", None, f"gitlab create failed: HTTP {http_code} {create_result.stderr.strip()}")
 
-            return self._push_to_remote(project_dir, remote_name, git_url, repo_url)
+            return self._push_to_remote(
+                project_dir, remote_name, git_url, repo_url,
+                target="gitlab", repo_name=repo_name,
+            )
 
         except subprocess.TimeoutExpired:
             return ("failed", None, "gitlab api timed out")
@@ -345,9 +351,22 @@ class PublishGate:
     # --- shared git push -----------------------------------------------------
 
     def _push_to_remote(
-        self, project_dir: Path, remote_name: str, git_url: str, repo_url: str
+        self,
+        project_dir: Path,
+        remote_name: str,
+        git_url: str,
+        repo_url: str,
+        target: str = "github",
+        repo_name: str | None = None,
     ) -> tuple[str, str | None, str | None]:
-        """Set or update a named git remote and push the current branch to it."""
+        """Push local main (if present) + current feature branch to a named remote.
+
+        After pushing, ensure the host's default_branch is `main` via a PATCH
+        call (gh api for GitHub, glab api for GitLab). PATCH failures are
+        logged as warnings but do NOT fail the publish — the artifact is
+        already on the remote and default-branch can be repaired out-of-band.
+        Idempotent: re-running on an already-correct repo is a no-op.
+        """
         try:
             existing = subprocess.run(
                 ["git", "-C", str(project_dir), "remote", "get-url", remote_name],
@@ -376,16 +395,73 @@ class PublishGate:
                 text=True,
                 timeout=10,
             )
-            branch = branch_result.stdout.strip() or "main"
+            current_branch = branch_result.stdout.strip() or "main"
 
-            push_result = subprocess.run(
-                ["git", "-C", str(project_dir), "push", "-u", remote_name, branch],
+            # 1. Push local `main` first (if it exists), so GitHub auto-elects
+            #    main as default_branch on first push to a fresh repo. Idempotent
+            #    against existing remote main (push is a no-op if up-to-date).
+            local_main_exists = subprocess.run(
+                [
+                    "git", "-C", str(project_dir),
+                    "rev-parse", "--verify", "--quiet", "refs/heads/main",
+                ],
                 capture_output=True,
                 text=True,
-                timeout=120,
-            )
-            if push_result.returncode != 0:
-                return ("failed", None, f"git push to {remote_name} failed: {push_result.stderr.strip()}")
+                timeout=10,
+            ).returncode == 0
+
+            if local_main_exists:
+                push_main = subprocess.run(
+                    ["git", "-C", str(project_dir), "push", "-u", remote_name, "main"],
+                    capture_output=True,
+                    text=True,
+                    timeout=120,
+                )
+                if push_main.returncode != 0:
+                    return (
+                        "failed",
+                        None,
+                        f"git push main to {remote_name} failed: {push_main.stderr.strip()}",
+                    )
+
+            # 2. Push the currently checked-out branch (feature branch in the
+            #    self-healing-daemon path). Skip if it's the same as main —
+            #    we already pushed it above.
+            if current_branch and current_branch != "main":
+                push_result = subprocess.run(
+                    ["git", "-C", str(project_dir), "push", "-u", remote_name, current_branch],
+                    capture_output=True,
+                    text=True,
+                    timeout=120,
+                )
+                if push_result.returncode != 0:
+                    return (
+                        "failed",
+                        None,
+                        f"git push to {remote_name} failed: {push_result.stderr.strip()}",
+                    )
+            elif not local_main_exists:
+                # Edge case: no local main AND current branch is "main"-named or empty.
+                # Push current_branch (defaulting to "main") so we don't leave the repo empty.
+                push_result = subprocess.run(
+                    ["git", "-C", str(project_dir), "push", "-u", remote_name, current_branch],
+                    capture_output=True,
+                    text=True,
+                    timeout=120,
+                )
+                if push_result.returncode != 0:
+                    return (
+                        "failed",
+                        None,
+                        f"git push to {remote_name} failed: {push_result.stderr.strip()}",
+                    )
+
+            # 3. Defensively PATCH default_branch=main on the remote. Idempotent —
+            #    if main is already the default, GitHub/GitLab return 200 with no
+            #    change. If main does not yet exist on the remote (e.g. local
+            #    repo had no main and we only pushed a feature branch), the API
+            #    will reject the PATCH; we log a warning and continue.
+            self._ensure_default_branch_main(target, repo_name)
 
             return ("published", repo_url, None)
 
@@ -393,6 +469,66 @@ class PublishGate:
             return ("failed", None, f"git push to {remote_name} timed out (120s)")
         except Exception as e:
             return ("failed", None, f"push error: {e}")
+
+    def _ensure_default_branch_main(self, target: str, repo_name: str | None) -> None:
+        """Best-effort PATCH of default_branch=main on the remote host.
+
+        Errors here NEVER fail the publish — the artifact has already been
+        pushed by the time we reach this call. A failure means the repo's
+        default_branch may still be wrong, but that's recoverable out-of-band
+        and is strictly better than failing the whole publish over a
+        post-push fix-up.
+        """
+        if not repo_name:
+            return
+        try:
+            if target == "github":
+                full_name = f"{self.config.github_org}/{repo_name}"
+                result = subprocess.run(
+                    [
+                        "gh", "api",
+                        f"repos/{full_name}",
+                        "--method", "PATCH",
+                        "-f", "default_branch=main",
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                )
+                if result.returncode != 0:
+                    print(
+                        f"  ! warning: failed to set default_branch=main on github/{full_name}: "
+                        f"{result.stderr.strip()}"
+                    )
+            elif target == "gitlab":
+                # `glab api projects/:fullpath --method PUT -f default_branch=main`
+                # The GitLab API accepts URL-encoded "namespace%2Frepo" as the
+                # project identifier. glab handles URL-encoding via the
+                # `projects/<encoded>` form.
+                project_path = urllib.parse.quote(
+                    f"{self.config.gitlab_namespace}/{repo_name}", safe=""
+                )
+                result = subprocess.run(
+                    [
+                        "glab", "api",
+                        f"projects/{project_path}",
+                        "--method", "PUT",
+                        "-f", "default_branch=main",
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                )
+                if result.returncode != 0:
+                    print(
+                        f"  ! warning: failed to set default_branch=main on "
+                        f"gitlab/{self.config.gitlab_namespace}/{repo_name}: "
+                        f"{result.stderr.strip()}"
+                    )
+        except subprocess.TimeoutExpired:
+            print(f"  ! warning: default_branch PATCH on {target}/{repo_name} timed out")
+        except Exception as e:
+            print(f"  ! warning: default_branch PATCH on {target}/{repo_name} raised: {e}")
 
     # --- project dir + name helpers (unchanged from original) ----------------
 
