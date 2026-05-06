@@ -22,6 +22,9 @@ MODEL_RATES: dict[str, dict[str, float]] = {
     # an empty block, so values are kept literal here. Override via
     # METROPLEX_COST_RATES_JSON when DeepInfra adjusts.
     "Qwen/Qwen2.5-72B-Instruct": {"input": 0.36, "output": 0.40},
+    # Qwen3 generation on DeepInfra — rates from DeepInfra published pricing
+    "Qwen/Qwen3-235B-A22B-Instruct-2507": {"input": 0.18, "output": 0.54},
+    "Qwen/Qwen3-32B": {"input": 0.10, "output": 0.30},
 }
 
 

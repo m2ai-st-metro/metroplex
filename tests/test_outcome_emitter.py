@@ -20,6 +20,13 @@ from gates.patcher import PatchGate
 from orchestrator import CycleOrchestrator
 from notifier import LogNotifier
 
+# st-records contracts are imported via sys.path injection inside outcome_emitter.
+# In CI runners (or any env without st-records as a sibling project), contracts is
+# unavailable. Importing outcome_emitter triggers the sys.path injection; if the
+# contracts package still cannot be resolved, skip the whole module cleanly.
+import outcome_emitter  # noqa: F401 -- import triggers sys.path injection
+pytest.importorskip("contracts.store")
+
 
 # ---- OutcomeEmitter unit tests ----
 
