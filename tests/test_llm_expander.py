@@ -510,9 +510,9 @@ class TestConfigSpecSettings:
             assert config.spec_use_llm is False
 
     def test_spec_llm_model_default(self):
-        """Test default model is Qwen2.5-72B-Instruct."""
+        """Test default model is Mistral-Small-3.2 (set 2026-05-06; was Qwen2.5-72B)."""
         config = Config()
-        assert "qwen" in config.spec_llm_model.lower()
+        assert config.spec_llm_model == "mistralai/Mistral-Small-3.2-24B-Instruct-2506"
 
     def test_spec_llm_model_env_override(self):
         """Test model can be overridden via env var."""
