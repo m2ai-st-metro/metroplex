@@ -43,12 +43,22 @@ python metroplex.py retry --build-id <id>            # Retry a failed build
 python metroplex.py reset --gate triage              # Reset one circuit breaker
 python metroplex.py reset --gate all                 # Reset all circuit breakers
 python metroplex.py dispatch [--idea-id N] [--worker-type TYPE] --dry-run
+python metroplex.py cost                             # LLM cost breakdown by gate/model
+python metroplex.py health                           # Watchdog health check report
+python metroplex.py readiness [--idea-id N]          # Post-publish readiness check
+python metroplex.py readiness-fix [--idea-id N]      # Apply readiness fixes (topics/description)
+python metroplex.py ego                              # Pipeline ego report (quality ratchet state)
+python metroplex.py funnel                           # Idea funnel stats (triage -> build -> publish)
+python metroplex.py quality-digest                   # Quality score distribution over recent builds
+python metroplex.py score-builds                     # Rescore completed builds against rubric
+python metroplex.py postmortems                      # List build postmortems (failures + causes)
+python metroplex.py backfill-outcomes                # Backfill build_outcome from publish records
 ```
 
 ## Testing
 
 ```bash
-pytest tests/ -v                          # All 315 tests
+pytest tests/ -v                          # All ~840 (run `pytest --collect-only` for current count)
 pytest tests/test_orchestrator.py -v      # Orchestrator
 pytest tests/test_triage.py -v            # Triage gate
 pytest tests/test_build.py -v             # Build gate
@@ -81,6 +91,8 @@ Service unit: `deploy/metroplex.service` — runs `run-all --cycles 0` with `Res
 | 3 Patch | `gates/patcher.py` | Apply ST Records persona YAML patches via git clone/commit/push |
 | 4 Publish | `gates/publish.py` | Create repos on configured hosts (GitHub `m2ai-portfolio` org and/or GitLab `m2ai-portfolio` group), push completed builds. First entry in `publish_targets` is primary; subsequent entries are mirrors (their URLs go in `publish_jobs.mirror_urls`, per-target outcome in `targets_status`). |
 | 4.5 Review | `gates/review.py` | Automated quality checks before publish (source code, README, no secrets, no large files) |
+| 4.7 README | `gates/readme.py` | LLM-generated README + retry loop with cost capture |
+| 4.9 Readiness | `gates/readiness.py` | Post-publish health/topics/description fixes |
 
 ### Readers (Upstream DBs)
 
@@ -362,6 +374,10 @@ ls /home/apexaipc/projects/metroplex/data/self_healing_queue/failed/ | wc -l
 If the heartbeat is stale, `SelfHealingAdapter.is_active()` returns False and
 `start()` logs a clear warning instead of silently queuing. Metroplex's build
 gate will not dispatch new jobs until the daemon is running again.
+
+### Self-Healing Daemon — Step 10.5 Heartbeat Keep-Alive
+
+During the 2-5 min parallel pr-review-toolkit Agent block, the daemon spawns a detached `nohup bash` keep-alive loop that touches the heartbeat file every 60s. Without it, the watchdog monitor flapped DEAD/RECOVERED 3x in 30 min on builds 322/352/365. Also: `SelfHealingAdapter` now blocks status mapping `passed -> completed` until `review_verdict` is set in state.json (publish-vs-Ravage race fix from PR #13, build 352 incident 2026-05-04).
 
 **Smoke test:** validate the adapter<->daemon seam end-to-end with a trivial
 build. With the daemon running in a separate terminal, from the metroplex
