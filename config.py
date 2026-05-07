@@ -94,7 +94,9 @@ class Config:
     dispatch_chat_id: str = field(default="")
 
     # Publish gate (Gate 4)
-    publish_targets: list[str] = field(default_factory=lambda: ["github", "gitlab"])
+    # Default GL-only after GH m2ai-portfolio archive (2026-05-06). Override via
+    # METROPLEX_PUBLISH_TARGETS env var if a temporary GH push is needed.
+    publish_targets: list[str] = field(default_factory=lambda: ["gitlab"])
     github_org: str = field(default="m2ai-portfolio")
     gitlab_host: str = field(default="gitlab.com")
     gitlab_namespace: str = field(default="m2ai-portfolio")
@@ -104,8 +106,11 @@ class Config:
     require_review: bool = field(default=True)
 
     # Readiness gate (Gate 4.9)
+    # Disabled 2026-05-06: gate uses GitHub-only API calls (gh CLI for topics,
+    # description, license checks). After m2ai-portfolio archive, those calls
+    # fail. Re-enable once gate is rewritten to support GitLab.
     max_readiness_per_cycle: int = field(default=5)
-    readiness_enabled: bool = field(default=True)
+    readiness_enabled: bool = field(default=False)
 
     # Budget controls
     daily_cost_limit: float = field(default=50.0)

@@ -275,7 +275,10 @@ class PatchGate:
 
     def _ensure_registry_repo(self, registry_dir: Path) -> bool:
         """Ensure st-agent-registry repo is cloned and up to date."""
-        repo_url = f"https://github.com/{self.config.academy_repo}.git"
+        # 2026-05-06: switched from github.com to gitlab.com after Sprint 1
+        # migration. SSH form because apexaipc has an SSH key registered with
+        # matthew.snow2 for write access (gl_alias memory).
+        repo_url = f"git@gitlab.com:{self.config.academy_repo}.git"
 
         try:
             if registry_dir.exists() and (registry_dir / ".git").exists():

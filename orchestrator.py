@@ -1226,8 +1226,18 @@ class CycleOrchestrator:
                             build = self.state_db.get_build_by_queue_job_id(job.build_job_id)
                             if build and str(build["idea_id"]).isdigit():
                                 self._write_ideaforge_outcome(int(build["idea_id"]), "published")
+                            primary = (
+                                self.config.publish_targets[0]
+                                if self.config.publish_targets
+                                else "gitlab"
+                            )
+                            ns = (
+                                self.config.gitlab_namespace
+                                if primary == "gitlab"
+                                else self.config.github_org
+                            )
                             self.notifier.notify(
-                                f"Published: {self.config.github_org}/{job.repo_name} ({job.title})"
+                                f"Published: {ns}/{job.repo_name} ({job.title})"
                             )
                             # Emit outcome for published builds (Phase 14a)
                             if self.outcome_emitter:

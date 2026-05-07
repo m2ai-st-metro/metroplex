@@ -441,7 +441,9 @@ def cmd_publish(args, config: Config):
 
         for job in jobs:
             if job.status == "published":
-                print(f"  + {config.github_org}/{job.repo_name} -> {job.repo_url}")
+                primary = config.publish_targets[0] if config.publish_targets else "gitlab"
+                ns = config.gitlab_namespace if primary == "gitlab" else config.github_org
+                print(f"  + {ns}/{job.repo_name} -> {job.repo_url}")
             elif job.status == "failed":
                 print(f"  x {job.build_job_id}: {job.error}")
 
