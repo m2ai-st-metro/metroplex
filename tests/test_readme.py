@@ -151,19 +151,19 @@ class TestInfographicCommand:
         assert "--aspect-ratio" in cmd
         assert "16:9" in cmd
 
-    def test_prompt_includes_title_and_value_prop(self, readme_gate):
-        """The prompt argument includes title and the value prop brief."""
+    def test_prompt_includes_value_prop_as_life_scene(self, readme_gate):
+        """The prompt uses value prop as life-scene brief (story-driven style)."""
         cmd = readme_gate.build_infographic_command(
             title="My Tool",
             value_prop="search your notes from the terminal",
             output_path="/tmp/out.png",
         )
         # The prompt is cmd[2]
-        assert "My Tool" in cmd[2]
         assert "search your notes from the terminal" in cmd[2]
-        # New style guarantees: warm palette, magazine cover framing
-        assert "vibrant" in cmd[2].lower()
-        assert "magazine cover" in cmd[2].lower()
+        # Life-scene style guarantees: person, real setting, empathetic mood
+        assert "person" in cmd[2].lower()
+        assert "real setting" in cmd[2].lower()
+        assert "empathetic" in cmd[2].lower()
 
 
 class TestFileTree:

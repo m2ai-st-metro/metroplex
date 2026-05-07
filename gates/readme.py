@@ -1,8 +1,13 @@
 """
 Readme Gate - Gate 4.7
-Generates enhanced README files with infographics for newly published repos.
+Generates story-driven README files with life-scene hero images for published repos.
 Runs after PublishGate succeeds. Uses Nemotron-3 via DeepInfra for README content
-and banana-maker (Gemini) for infographic generation.
+and banana-maker (Gemini) for hero image generation.
+
+README structure: Scene (the struggle) -> Weight (the cost) -> Turn (the possibility)
+-> Solution (what the tool does) -> Quick Start (try it). Reads like a magazine
+article, not a product manual. Hero images depict real-life scenes of the problem
+being solved, not abstract tech illustrations.
 """
 import os
 import logging
@@ -24,15 +29,20 @@ BANANA_MAKER_SCRIPT = Path.home() / ".claude" / "skills" / "banana-maker" / "gen
 BANANA_MAKER_PYTHON = Path.home() / ".claude" / "skills" / "banana-maker" / "venv" / "bin" / "python3"
 
 README_SYSTEM_PROMPT = """\
-You are a technical writer creating polished, high-quality GitHub README.md files.
-These READMEs are the public face of open-source developer tools -- they must be
-visually appealing, informative, and demonstrate clear value within 30 seconds of scanning.
-Write clear, professional documentation with proper markdown formatting.
+You are a storyteller who writes compelling GitHub README.md files that lead with
+a human struggle and end with a technical solution. Your READMEs read like a short
+magazine article, not a product manual. The reader should feel the pain before they
+see the tool. By the time they reach the install command, they already want it.
+Write in clear, direct prose. No jargon in the opening sections. Technical details
+come only in the final sections for people who are already convinced.
 Do NOT wrap the output in a markdown code fence -- output raw markdown directly.
 Do NOT use em-dashes. Use commas, periods, or double-hyphens instead."""
 
 README_USER_PROMPT = """\
-Generate a comprehensive, visually polished README.md for this project.
+Generate a story-driven README.md for this project. The README should read like
+a short magazine article: open with the human struggle, build tension with real
+stakes, then reveal the tool as the resolution. By the time the reader hits
+"Quick Start," they should already want it.
 
 **Title**: {title}
 
@@ -40,9 +50,12 @@ Generate a comprehensive, visually polished README.md for this project.
 banner block -- do NOT invent a new tagline):
 {plain_description}
 
-**Problem this solves** (use this verbatim, lightly edited only for grammar,
-in the dedicated "Problem" section described below):
+**Problem this solves** (the human struggle -- use this as raw material for
+the opening scene, not as a section to paste verbatim):
 {problem_statement}
+
+**Target audience** (who lives this problem daily):
+{target_audience}
 
 **App Specification**:
 {spec_text}
@@ -63,72 +76,77 @@ Include these sections in this exact order. Output raw markdown only.
 <h3 align="center">USE THE PLAIN-SPEAK DESCRIPTION PROVIDED ABOVE -- DO NOT INVENT</h3>
 
 <p align="center">
+  <a href="#the-turn">How it helps</a> &bull;
   <a href="#quick-start">Quick Start</a> &bull;
-  <a href="#features">Features</a> &bull;
-  <a href="#examples">Examples</a> &bull;
-  <a href="#contributing">Contributing</a>
+  <a href="#how-it-works">How It Works</a>
 </p>
 ```
 
-### 2. What is this?
-2-3 sentences explaining what the tool does and who it's for. Include a short
-code block showing a realistic usage example with the command AND its output:
+### 2. The Scene (opening -- no heading, just prose)
+2-4 paragraphs of vivid, specific prose painting the daily reality of the person
+who lives this problem. No tech jargon. No feature lists. Think opening paragraph
+of an Atlantic or Wired article. Name the specific frustrations, the time sinks,
+the moments where things go wrong. Use second person ("You") to pull the reader in.
+
+Use the "Problem this solves" text above as raw material but transform it into a
+scene, not a statement. Do NOT just restate the problem -- dramatize it. If the
+problem statement is thin, invent concrete details that would resonate with the
+target audience. A parent juggling logistics. A developer context-switching between
+12 tabs. A consultant buried in manual reporting.
+
+### 3. The Weight
+One short section with a bold stat, a cost figure, or a time estimate that makes
+the problem feel measurable. Can be a real data point (if provided) or a reasonable
+estimate framed as "most people in this situation spend X hours per week on Y."
+This section lands the emotional setup with something concrete.
+
+Format as a centered blockquote:
 ```
-$ command --flag input
-[show realistic output here]
+> **X hours per week** -- that is what the average [persona] spends on [thing].
 ```
 
-### 3. Problem
-Render the "Problem this solves" text provided above as a short prose block
-(2-4 sentences). You may lightly edit for grammar and flow but do not change
-its meaning, do not invent new pain points, and do not omit any concrete
-detail. If the provided problem statement is empty, omit this entire section.
+### 4. The Turn
+2-3 sentences that pivot from problem to possibility. "What if [the painful thing]
+just... happened?" This is the hinge of the entire README. The reader should feel
+relief reading it. Do NOT name the tool yet -- keep it abstract for one beat.
 
-### 4. Features
-A markdown table with two columns: Feature | Description. 4-8 rows covering the
-key capabilities. Derive features from the source code and spec, not generic filler.
+### 5. What {title} Does
+Now introduce the tool. 3-5 bullet points, each one sentence, plain language.
+Connect each bullet back to a pain point from The Scene. Do not use technical
+terms the target audience would not know. Frame capabilities as outcomes, not
+features: "Stops you from missing the deadline" not "Automated scheduling engine."
 
-### 5. Quick Start
+### 6. Quick Start
 Numbered steps to get running. Include clone, install, and first command. Use actual
-package/command names from the file tree and spec.
+package/command names from the file tree and spec. Keep it to 4-6 steps max.
 
-### 6. Examples
-2-3 concrete usage examples. Each example should have:
-- A bold title describing the use case
-- The command to run
-- Realistic sample output (not just "output here" placeholders)
-Make examples progressively more advanced.
+### 7. See It In Action
+One concrete example showing a realistic usage scenario. Show the command AND its
+output. Frame it as a mini-story: "Say you have [situation]. You run [command].
+Here is what happens:" followed by a code block with realistic output.
 
-### 7. File Structure
-A clean file tree showing the project layout. Use the provided file tree but clean
-it up -- remove noise files, group logically, add inline comments for key files:
-```
-{title}/
-  src/          # Core source code
-  tests/        # Test suite
-  ...
-```
+### 8. How It Works
+A compact technical section for readers who are already convinced and want to
+understand the internals. Include:
+- A clean file tree (use the provided tree, cleaned up, with inline comments)
+- A compact tech stack table: Technology | Purpose
+Keep this section SHORT. The reader already wants the tool. This is reference, not pitch.
 
-### 8. Tech Stack
-A compact markdown table: Technology | Purpose. Only include what's actually used.
-
-### 9. Contributing
-Brief section: fork, edit, test, PR. 4 lines max.
-
-### 10. License
-MIT
-
-### 11. Author
+### 9. License & Author
+MIT license. Author line:
 ```
 {author_line}
 ```
 
 ## Quality Rules
-- Every example must show BOTH input AND output -- never leave output as a placeholder
-- Use realistic data in examples, not "foo/bar/example.txt"
-- Feature table rows must describe actual capabilities from the code, not marketing fluff
-- Keep total length between 150-250 lines
-- No em-dashes -- use commas, periods, or double-hyphens"""
+- The Scene must be vivid and specific -- no generic "many people struggle with..."
+- The Weight must include at least one concrete number (hours, dollars, percentage)
+- The Turn must NOT mention the tool by name -- it is a moment of imagination
+- Quick Start examples must show BOTH input AND output with realistic data
+- Keep total length between 120-200 lines
+- No em-dashes -- use commas, periods, or double-hyphens
+- No AI cliches: no "leverage", "streamline", "empower", "unlock", "supercharge"
+- Write like a journalist, not a marketer"""
 
 
 class ReadmeGate:
@@ -301,10 +319,13 @@ class ReadmeGate:
             )
             return {"build_job_id": build_job_id, "status": "failed", "error": error}
 
+        target_audience = (idea_ctx or {}).get("target_audience", "") or ""
+
         readme_content = self._generate_readme_content(
             spec_text, file_tree, title,
             plain_description=plain_description,
             problem_statement=problem_statement,
+            target_audience=target_audience,
         )
 
         # 4. Generate infographic via banana-maker
@@ -312,9 +333,10 @@ class ReadmeGate:
         assets_dir.mkdir(exist_ok=True)
         infographic_path = assets_dir / "infographic.png"
 
-        # Prefer the plain-speak description as the visual brief; fall back to
-        # problem statement, then to extracted features (legacy behavior).
-        value_prop = plain_description or problem_statement or self._extract_features(readme_content)
+        # For story-driven READMEs, prefer problem_statement as the visual brief
+        # (the image should depict the struggle, not the solution). Fall back to
+        # plain description, then to extracted features (legacy behavior).
+        value_prop = problem_statement or plain_description or self._extract_features(readme_content)
         infographic_ok = self._generate_infographic(title, value_prop, infographic_path)
         if not infographic_ok:
             logger.warning(f"Infographic generation failed for {title} — continuing without it")
@@ -413,6 +435,7 @@ class ReadmeGate:
         title: str,
         plain_description: str = "",
         problem_statement: str = "",
+        target_audience: str = "",
     ) -> str:
         """
         Generate README content using Nemotron-3 via DeepInfra.
@@ -423,8 +446,10 @@ class ReadmeGate:
             title: Project title
             plain_description: Plain-speak one-liner from IdeaForge (used verbatim
                 in banner). Empty string if not available.
-            problem_statement: Problem framing from IdeaForge (used verbatim in
-                Problem section). Empty string if not available.
+            problem_statement: Problem framing from IdeaForge (used as raw material
+                for The Scene opening). Empty string if not available.
+            target_audience: Who lives this problem daily (used for The Scene and
+                The Weight sections). Empty string if not available.
 
         Returns:
             Generated README markdown content
@@ -434,7 +459,8 @@ class ReadmeGate:
             spec_text=spec_text,
             file_tree=file_tree,
             plain_description=plain_description or "(not provided -- write a concise one-liner from the spec)",
-            problem_statement=problem_statement or "",
+            problem_statement=problem_statement or "(not provided -- invent a concrete daily struggle for the target audience)",
+            target_audience=target_audience or "(not provided -- infer from the spec who would use this daily)",
             author_line=self._build_author_line(),
         )
 
@@ -660,21 +686,26 @@ class ReadmeGate:
         """
         Build the banana-maker prompt for a project hero image.
 
-        Style brief: vibrant magazine-cover, single visual metaphor, warm palette.
-        Explicit negatives keep banana-maker from defaulting to flat-vector
-        infographic clutter (per banana-maker prompt-pattern feedback).
+        Style brief: realistic life scene depicting the daily struggle that the
+        tool solves. The viewer should see themselves in the image before they
+        know what the tool does. Think editorial photography, not tech illustration.
         """
-        brief = (value_prop or "a developer tool").strip().rstrip(".")
+        brief = (value_prop or "a person overwhelmed by daily tasks").strip().rstrip(".")
         return (
-            f"Create a vibrant, warm hero image for a developer tool called '{title}'. "
-            f"Single central visual metaphor representing: {brief}. "
-            f"NO feature lists, NO bullet points, NO multiple panels, NO grids, "
-            f"NO icons-in-boxes, NO text labels beyond the project name. "
-            f"Think editorial magazine cover, not infographic. "
-            f"Warm vibrant palette: sunset oranges, magentas, gold and amber accents "
-            f"on a deep indigo or charcoal background. Cinematic lighting, modern "
-            f"editorial illustration style with rich color saturation. "
-            f"NOT flat vector, NOT clip-art, NOT a schematic diagram."
+            f"Create a warm, cinematic photograph-style image depicting a real life "
+            f"moment of: {brief}. "
+            f"Show a PERSON in a REAL SETTING experiencing this situation. "
+            f"Kitchen counter with laptop open, kids' backpacks on the floor. "
+            f"Office desk with too many browser tabs reflected in glasses. "
+            f"A parent checking their phone while juggling groceries. "
+            f"The scene should feel relatable, slightly chaotic, deeply human. "
+            f"Warm golden-hour lighting, shallow depth of field, editorial photo style. "
+            f"Color palette: warm ambers, soft whites, natural tones with pops of "
+            f"blue from screens. "
+            f"NO text, NO UI mockups, NO abstract shapes, NO icons, NO logos. "
+            f"NO flat vector, NOT clip-art, NOT a diagram, NOT a schematic. "
+            f"Think New York Times feature photo, not stock photography. "
+            f"The mood is empathetic, not dramatic -- 'I know this feeling.'"
         )
 
     def build_infographic_command(self, title: str, value_prop: str, output_path: str) -> list[str]:

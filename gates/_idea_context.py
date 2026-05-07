@@ -62,4 +62,5 @@ def load_idea_context(
         "description": (idea.get("description") or "").strip(),
         "problem_statement": (idea.get("problem_statement") or "").strip(),
         "target_audience": (idea.get("target_audience") or "").strip(),
+        "struggling_user": (idea.get("struggling_user") or "").strip(),
     }
