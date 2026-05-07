@@ -172,6 +172,7 @@ class IdeaForgeReader:
                 description,
                 problem_statement,
                 target_audience,
+                struggling_user,
                 weighted_score,
                 opportunity_score,
                 problem_score,
