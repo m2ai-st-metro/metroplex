@@ -136,6 +136,19 @@ class Config:
     schedule_end: int = field(default=24)     # 24 = always on
     active_days: str = field(default="0,1,2,3,4,5,6")  # 0=Mon, 6=Sun
 
+    @staticmethod
+    def _env_bool(key: str, current: bool) -> bool:
+        """Read a bool flag from env, defaulting to the dataclass-provided value.
+
+        Returns ``current`` when the env var is unset (so dataclass default
+        wins). When set, accepts true/1/yes (case-insensitive) as truthy and
+        anything else as falsy.
+        """
+        raw = os.environ.get(key)
+        if raw is None:
+            return current
+        return raw.strip().lower() in ("true", "1", "yes")
+
     def __post_init__(self):
         """Load values from environment variables."""
         self.ideaforge_db = os.environ.get("METROPLEX_IDEAFORGE_DB", self.ideaforge_db)
@@ -146,7 +159,7 @@ class Config:
         self.build_model = os.environ.get("METROPLEX_BUILD_MODEL", self.build_model)
 
         # Parallel build settings
-        self.build_parallel = os.environ.get("METROPLEX_BUILD_PARALLEL", "").lower() in ("1", "true", "yes")
+        self.build_parallel = self._env_bool("METROPLEX_BUILD_PARALLEL", self.build_parallel)
         try:
             self.build_max_workers = int(os.environ.get("METROPLEX_BUILD_MAX_WORKERS", self.build_max_workers))
         except ValueError:
@@ -232,7 +245,7 @@ class Config:
         self.dispatch_chat_id = os.environ.get("METROPLEX_DISPATCH_CHAT_ID", self.dispatch_chat_id)
 
         # Tyrest QA gate
-        self.tyrest_enabled = os.environ.get("TYREST_ENABLED", "true").lower() in ("true", "1", "yes")
+        self.tyrest_enabled = self._env_bool("TYREST_ENABLED", self.tyrest_enabled)
         self.tyrest_model = os.environ.get("TYREST_MODEL", self.tyrest_model)
         try:
             self.tyrest_approve_confidence = float(os.environ.get("TYREST_APPROVE_MIN_CONFIDENCE", self.tyrest_approve_confidence))
@@ -249,7 +262,7 @@ class Config:
         self.notify_mode = os.environ.get("METROPLEX_NOTIFY_MODE", self.notify_mode)
 
         # Readiness gate (Gate 4.9)
-        self.readiness_enabled = os.environ.get("METROPLEX_READINESS_ENABLED", "true").lower() in ("true", "1", "yes")
+        self.readiness_enabled = self._env_bool("METROPLEX_READINESS_ENABLED", self.readiness_enabled)
         try:
             self.max_readiness_per_cycle = int(os.environ.get("METROPLEX_MAX_READINESS_PER_CYCLE", self.max_readiness_per_cycle))
         except ValueError:
@@ -293,7 +306,7 @@ class Config:
             self.build_cost_estimate = float(os.environ.get("METROPLEX_BUILD_COST_ESTIMATE", self.build_cost_estimate))
         except ValueError:
             pass
-        self.budget_hard_stop = os.environ.get("METROPLEX_BUDGET_HARD_STOP", "true").lower() in ("true", "1", "yes")
+        self.budget_hard_stop = self._env_bool("METROPLEX_BUDGET_HARD_STOP", self.budget_hard_stop)
         try:
             self.budget_grace_percent = float(os.environ.get("METROPLEX_BUDGET_GRACE_PERCENT", self.budget_grace_percent))
         except ValueError:
