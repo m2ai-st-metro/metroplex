@@ -67,20 +67,25 @@ the opening scene, not as a section to paste verbatim):
 
 Include these sections in this exact order. Output raw markdown only.
 
-### 1. Centered Banner Block (HTML)
-```html
+### 1. Centered Banner Block (raw HTML -- NOT inside a code fence)
+Output this EXACTLY as raw HTML (no ``` fences). If an infographic exists, include
+the img tag. If {has_infographic} is "no", omit the img tag entirely.
+
 <p align="center">
   <img src="assets/infographic.png" alt="{title}" width="800">
 </p>
 
-<h3 align="center">USE THE PLAIN-SPEAK DESCRIPTION PROVIDED ABOVE -- DO NOT INVENT</h3>
+The h3 tagline is PROVIDED below -- use it EXACTLY as shown, character for
+character. Do NOT modify, expand, paraphrase, or substitute. Just emit the
+line verbatim:
+
+<h3 align="center">{compressed_tagline}</h3>
 
 <p align="center">
   <a href="#the-turn">How it helps</a> &bull;
   <a href="#quick-start">Quick Start</a> &bull;
   <a href="#how-it-works">How It Works</a>
 </p>
-```
 
 ### 2. The Scene (opening -- no heading, just prose)
 2-4 paragraphs of vivid, specific prose painting the daily reality of the person
@@ -119,6 +124,11 @@ features: "Stops you from missing the deadline" not "Automated scheduling engine
 ### 6. Quick Start
 Numbered steps to get running. Include clone, install, and first command. Use actual
 package/command names from the file tree and spec. Keep it to 4-6 steps max.
+
+**Clone URL** (use this EXACT URL in the clone step -- do NOT invent one):
+```
+{clone_url}
+```
 
 ### 7. See It In Action
 One concrete example showing a realistic usage scenario. Show the command AND its
@@ -298,17 +308,21 @@ class ReadmeGate:
         # 1. Read the spec file
         spec_text = self._read_spec(build_job_id)
 
-        # 2. Build file tree
-        file_tree = self._build_file_tree(project_path)
-
         # 2b. Resolve original IdeaForge framing (plain-speak + problem). May be None.
+        #     Done before tree-building so we can derive the slug from repo_url.
         idea_ctx = load_idea_context(
             self.state_db, build_job_id, self.config.ideaforge_db
         )
         plain_description = (idea_ctx or {}).get("description", "") or ""
         problem_statement = (idea_ctx or {}).get("problem_statement", "") or ""
 
-        # 3. Generate README content via LLM
+        # 2. Build file tree -- use the repo slug as the root name so the
+        #    LLM never sees the queue-job-id directory name (which previously
+        #    leaked into hallucinated clone URLs).
+        slug = self._slug_from_repo_url(repo_url) or project_path.name
+        file_tree = self._build_file_tree(project_path, root_name=slug)
+
+        # 3. Check LLM client
         if not self.client:
             error = "DEEPINFRA_API_KEY not set — cannot generate README"
             self.state_db.record_readme_job(
@@ -321,39 +335,56 @@ class ReadmeGate:
 
         target_audience = (idea_ctx or {}).get("target_audience", "") or ""
 
-        readme_content = self._generate_readme_content(
-            spec_text, file_tree, title,
-            plain_description=plain_description,
-            problem_statement=problem_statement,
-            target_audience=target_audience,
-        )
-
-        # 4. Generate infographic via banana-maker
+        # 4. Generate infographic via banana-maker (do this BEFORE README so we
+        #    can tell the LLM whether to include the <img> tag)
         assets_dir = project_path / "assets"
         assets_dir.mkdir(exist_ok=True)
         infographic_path = assets_dir / "infographic.png"
 
         # For story-driven READMEs, prefer problem_statement as the visual brief
         # (the image should depict the struggle, not the solution). Fall back to
-        # plain description, then to extracted features (legacy behavior).
-        value_prop = problem_statement or plain_description or self._extract_features(readme_content)
+        # plain description, then to a generic prompt.
+        value_prop = problem_statement or plain_description or "a person overwhelmed by daily tasks"
         infographic_ok = self._generate_infographic(title, value_prop, infographic_path)
         if not infographic_ok:
             logger.warning(f"Infographic generation failed for {title} — continuing without it")
-            # Remove the infographic reference from README if generation failed
-            readme_content = readme_content.replace(
-                f"![{title} Overview](assets/infographic.png)\n", ""
-            )
-            readme_content = readme_content.replace(
-                f"![{title} Overview](assets/infographic.png)", ""
-            )
 
-        # 5. Write README.md
+        # 5. Build the clone URL for Quick Start from the repo_url
+        clone_url = repo_url
+        if clone_url and not clone_url.endswith(".git"):
+            clone_url = clone_url.rstrip("/") + ".git"
+
+        # 6. Generate README content via LLM
+        compressed_tagline = self._compress_tagline(plain_description)
+        readme_content = self._generate_readme_content(
+            spec_text, file_tree, title,
+            plain_description=plain_description,
+            problem_statement=problem_statement,
+            target_audience=target_audience,
+            clone_url=clone_url,
+            has_infographic=infographic_ok,
+            compressed_tagline=compressed_tagline,
+        )
+
+        # Post-process: strip any residual infographic references if generation
+        # failed (defense-in-depth — the prompt already says to omit it, but
+        # LLMs don't always comply).
+        if not infographic_ok:
+            readme_content = self._strip_infographic_refs(readme_content, title)
+
+        # Belt-and-suspenders for known LLM unreliability on specific slots.
+        # Even when the prompt provides exact values, Nemotron-3 sometimes
+        # ignores them; post-process to enforce the canonical content.
+        readme_content = self._normalize_h3_tagline(readme_content, compressed_tagline)
+        readme_content = self._normalize_clone_url(readme_content, clone_url)
+        readme_content = self._replace_file_tree_block(readme_content, file_tree)
+
+        # 7. Write README.md
         readme_path = project_path / "README.md"
         readme_path.write_text(readme_content)
         logger.info(f"Wrote README.md to {readme_path}")
 
-        # 6. Commit and push
+        # 8. Commit and push
         commit_ok, commit_error = self._commit_and_push(project_path, infographic_ok)
         if not commit_ok:
             self.state_db.record_readme_job(
@@ -368,7 +399,7 @@ class ReadmeGate:
                 "error": f"git push failed: {commit_error}",
             }
 
-        # 7. Record success
+        # 9. Record success
         self.state_db.record_readme_job(
             build_job_id=build_job_id,
             repo_url=repo_url,
@@ -394,15 +425,30 @@ class ReadmeGate:
 
         return "(spec not available)"
 
-    def _build_file_tree(self, project_path: Path, max_depth: int = 3) -> str:
+    def _build_file_tree(
+        self,
+        project_path: Path,
+        max_depth: int = 3,
+        root_name: str | None = None,
+    ) -> str:
         """
         Build a file tree string for the project directory.
-        Excludes common noise directories.
+        Excludes common noise directories and pipeline-internal artifacts.
+
+        If `root_name` is provided, it overrides `project_path.name` as the
+        displayed root. Use this to hide queue-job-id-style directory names
+        from the LLM (e.g. show "wellness-copilot" instead of
+        "metroplex-ideaforge-414").
         """
-        exclude_dirs = {
+        exclude_names = {
+            # Version control / caches
             ".git", "__pycache__", "node_modules", ".venv", "venv",
             ".mypy_cache", ".pytest_cache", ".ruff_cache", "dist", "build",
             ".egg-info", ".tox",
+            # Self-healing pipeline internals (not user-facing)
+            ".self-healing-pipeline", ".heartbeat-callback",
+            # Config files that don't belong in a high-level tree
+            ".gitignore", "pytest.ini",
         }
         lines = []
 
@@ -414,17 +460,19 @@ class ReadmeGate:
             except PermissionError:
                 return
 
-            for i, entry in enumerate(entries):
-                if entry.name in exclude_dirs:
-                    continue
-                is_last = i == len(entries) - 1
+            # Filter out excluded names before rendering connectors so
+            # the "last entry" connector (└──) is placed correctly.
+            visible = [e for e in entries if e.name not in exclude_names]
+
+            for i, entry in enumerate(visible):
+                is_last = i == len(visible) - 1
                 connector = "└── " if is_last else "├── "
                 lines.append(f"{prefix}{connector}{entry.name}")
                 if entry.is_dir():
                     extension = "    " if is_last else "│   "
                     _walk(entry, prefix + extension, depth + 1)
 
-        lines.append(project_path.name + "/")
+        lines.append((root_name or project_path.name) + "/")
         _walk(project_path, "", 0)
         return "\n".join(lines[:100])  # Cap at 100 lines
 
@@ -436,6 +484,9 @@ class ReadmeGate:
         plain_description: str = "",
         problem_statement: str = "",
         target_audience: str = "",
+        clone_url: str = "",
+        has_infographic: bool = True,
+        compressed_tagline: str = "",
     ) -> str:
         """
         Generate README content using Nemotron-3 via DeepInfra.
@@ -450,10 +501,17 @@ class ReadmeGate:
                 for The Scene opening). Empty string if not available.
             target_audience: Who lives this problem daily (used for The Scene and
                 The Weight sections). Empty string if not available.
+            clone_url: Git clone URL for the Quick Start section.
+            has_infographic: Whether an infographic image exists.
+            compressed_tagline: Pre-compressed single-sentence tagline for the
+                banner h3. If empty, derived from `plain_description`.
 
         Returns:
             Generated README markdown content
         """
+        if not compressed_tagline:
+            compressed_tagline = self._compress_tagline(plain_description)
+
         prompt = README_USER_PROMPT.format(
             title=title,
             spec_text=spec_text,
@@ -462,6 +520,9 @@ class ReadmeGate:
             problem_statement=problem_statement or "(not provided -- invent a concrete daily struggle for the target audience)",
             target_audience=target_audience or "(not provided -- infer from the spec who would use this daily)",
             author_line=self._build_author_line(),
+            clone_url=clone_url or "(clone URL not available -- use a placeholder)",
+            has_infographic="yes" if has_infographic else "no",
+            compressed_tagline=compressed_tagline or title,
         )
 
         model = self.config.spec_llm_model
@@ -493,17 +554,7 @@ class ReadmeGate:
             except Exception as e:
                 logger.warning("Failed to record readme generation cost: %s", e)
 
-        # Strip wrapping code fence if the LLM added one
-        if content.startswith("```markdown"):
-            content = content[len("```markdown"):].strip()
-        if content.startswith("```md"):
-            content = content[len("```md"):].strip()
-        if content.startswith("```"):
-            content = content[3:].strip()
-        if content.endswith("```"):
-            content = content[:-3].strip()
-
-        return content
+        return self._clean_llm_output(content)
 
     def _build_author_line(self) -> str:
         """Generate the README footer author line from configured publish targets."""
@@ -534,6 +585,181 @@ class ReadmeGate:
                     features.append(feature)
 
         return ", ".join(features[:6]) if features else "developer tool, automation, CLI"
+
+    @staticmethod
+    def _clean_llm_output(content: str) -> str:
+        """Strip code-fence wrappers and orphan language tokens from LLM output.
+
+        Handles common LLM output artifacts:
+        - Leading ```LANG fence (markdown / md / html / etc.)
+        - Orphan language token left when an earlier strip removed only ```
+        - Trailing ``` (only when the leading fence was a wrap-everything one)
+        - Stray standalone ``` left from a wrapped HTML banner block
+
+        The trailing-strip behavior is conditional: a wrap-everything fence
+        (```markdown, ```md, or bare ```) means the trailing ``` is unmatched
+        and should go. A wrap-banner fence (```html) leaves embedded code
+        blocks downstream that have their own legitimate closing fences --
+        we must NOT strip the trailing one in that case or we'll destroy them.
+        """
+        import re
+        if not content:
+            return content
+
+        # Strip leading code fence (capture the language to drive trailing-strip behavior)
+        leading_lang: str | None = None
+        m = re.match(r"^```([a-zA-Z]*)\s*\n", content)
+        if m:
+            leading_lang = m.group(1).lower()
+            content = content[m.end():]
+
+        # Strip leading orphan language token (when ``` was stripped but lang was not)
+        content = re.sub(r"^(html|markdown|md|HTML|MD)\s*\n", "", content, count=1)
+
+        # Strip trailing fence ONLY for wrap-everything cases. For ```html (wrap-banner),
+        # leaving the trailing alone preserves embedded code blocks downstream.
+        if leading_lang in ("", "markdown", "md"):
+            content = re.sub(r"\n```\s*$", "", content)
+
+        # If the document begins with a raw HTML banner block, strip the next
+        # standalone fence line in the first 30 lines. This handles the wrapped-
+        # banner artifact where the LLM emits ```html ... ``` around the banner.
+        # Match ``` with an optional language tag (some LLMs echo the lang on close).
+        if content.lstrip().startswith("<"):
+            lines = content.split("\n")
+            for i, line in enumerate(lines[:30]):
+                if re.match(r"^```[a-zA-Z]*\s*$", line.strip()):
+                    del lines[i]
+                    break
+            content = "\n".join(lines)
+
+        return content.strip()
+
+    @staticmethod
+    def _compress_tagline(plain_description: str, max_chars: int = 180) -> str:
+        """Compress a verbose plain-speak description into a single-sentence tagline.
+
+        Takes the first sentence (split on . ! ?), then caps at max_chars,
+        preferring a comma break in the back half. Returns "" for empty input.
+        """
+        if not plain_description:
+            return ""
+        desc = plain_description.strip()
+
+        # Find the first sentence terminator within a reasonable distance
+        cut = -1
+        for terminator in (". ", "! ", "? "):
+            idx = desc.find(terminator)
+            if idx > 0 and (cut == -1 or idx < cut):
+                cut = idx + 1  # include the punctuation
+        tagline = desc[:cut].strip() if cut > 0 else desc
+
+        if len(tagline) > max_chars:
+            comma = tagline.rfind(",", 0, max_chars)
+            if comma > max_chars * 0.6:
+                tagline = tagline[:comma].rstrip() + "."
+            else:
+                tagline = tagline[: max_chars - 3].rstrip() + "..."
+
+        return tagline
+
+    @staticmethod
+    def _slug_from_repo_url(repo_url: str) -> str:
+        """Extract the repo slug from a clone/web URL.
+
+        >>> ReadmeGate._slug_from_repo_url('https://gitlab.com/m2ai-portfolio/wellness-copilot.git')
+        'wellness-copilot'
+        >>> ReadmeGate._slug_from_repo_url('https://github.com/foo/bar/')
+        'bar'
+        """
+        if not repo_url:
+            return ""
+        s = repo_url.strip().rstrip("/")
+        if s.endswith(".git"):
+            s = s[: -len(".git")]
+        return s.rsplit("/", 1)[-1]
+
+    @staticmethod
+    def _normalize_h3_tagline(content: str, tagline: str) -> str:
+        """Replace the first <h3 align="center">...</h3> inner text with `tagline`.
+
+        No-op if `tagline` is empty or no matching h3 is found. Tolerant of
+        single/double quotes around 'center' and DOTALL contents.
+        """
+        if not tagline or not content:
+            return content
+        import re
+        return re.sub(
+            r'<h3\s+align=(["\'])center\1\s*>.*?</h3>',
+            f'<h3 align="center">{tagline}</h3>',
+            content,
+            count=1,
+            flags=re.DOTALL,
+        )
+
+    @staticmethod
+    def _normalize_clone_url(content: str, canonical_url: str) -> str:
+        """Replace the first `git clone <URL>` URL with the canonical one.
+
+        No-op if `canonical_url` is empty or no clone command is present.
+        """
+        if not canonical_url or not content:
+            return content
+        import re
+        return re.sub(
+            r"(git clone\s+)https?://\S+",
+            lambda m: m.group(1) + canonical_url,
+            content,
+            count=1,
+        )
+
+    @staticmethod
+    def _replace_file_tree_block(content: str, tree: str) -> str:
+        """Replace a fenced file-tree block with the canonical tree.
+
+        Heuristic: finds the first triple-backtick fenced block whose inner
+        content contains tree-drawing characters (├ │ └ ─), and swaps in
+        `tree`. No-op if no such block is found.
+
+        Allows optional indentation before the closing fence so that
+        indented code blocks (e.g. inside numbered lists) are matched as
+        single units rather than spanning across the next block.
+        """
+        if not tree or not content:
+            return content
+        import re
+        pattern = re.compile(r"```[a-zA-Z]*\s*\n([\s\S]*?)\n[ \t]*```")
+        for m in pattern.finditer(content):
+            inner = m.group(1)
+            if any(ch in inner for ch in "├│└─"):
+                return content[: m.start()] + f"```\n{tree}\n```" + content[m.end():]
+        return content
+
+    @staticmethod
+    def _strip_infographic_refs(content: str, title: str) -> str:
+        """Remove all infographic image references from README content.
+
+        Handles both markdown image syntax and HTML <img> tags pointing at
+        assets/infographic.png. Called when infographic generation fails so
+        the README doesn't reference a missing image.
+        """
+        import re
+
+        # Markdown image: ![anything](assets/infographic.png)
+        content = re.sub(
+            r"!\[[^\]]*\]\(assets/infographic\.png\)\n?", "", content
+        )
+        # HTML img tag: <img src="assets/infographic.png" ...>
+        content = re.sub(
+            r'<img\s+[^>]*src=["\']assets/infographic\.png["\'][^>]*/?\s*>\n?',
+            "",
+            content,
+        )
+        # If the <p align="center"> wrapper is now empty, remove it too
+        content = re.sub(
+            r'<p\s+align="center">\s*</p>\n?', "", content
+        )
+        return content
 
     def _generate_infographic(self, title: str, value_prop: str, output_path: Path) -> bool:
         """
