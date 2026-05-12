@@ -23,8 +23,8 @@ from gates.llm_expander import (
     validate_agent_spec,
     AGENT_PARROT_MARKERS,
     AGENT_SPEC_EXPANSION_PROMPT,
-    MIN_AGENT_SPEC_LINES,
-    MAX_AGENT_SPEC_LINES,
+    MIN_AGENT_SPEC_CHARS,
+    MAX_AGENT_SPEC_CHARS,
 )
 
 
@@ -55,10 +55,10 @@ class TestGoldenFixture:
         assert FIXTURE_PATH.is_file()
 
     def test_fixture_within_length_bounds(self, golden):
-        line_count = golden.count("\n") + 1
-        assert MIN_AGENT_SPEC_LINES <= line_count <= MAX_AGENT_SPEC_LINES, (
-            f"golden fixture out of bounds: {line_count} lines "
-            f"(allowed {MIN_AGENT_SPEC_LINES}-{MAX_AGENT_SPEC_LINES})"
+        char_count = len(golden)
+        assert MIN_AGENT_SPEC_CHARS <= char_count <= MAX_AGENT_SPEC_CHARS, (
+            f"golden fixture out of bounds: {char_count} chars "
+            f"(allowed {MIN_AGENT_SPEC_CHARS}-{MAX_AGENT_SPEC_CHARS})"
         )
 
     def test_golden_passes_validator(self, golden):
@@ -136,7 +136,7 @@ class TestValidateAgentSpec:
             )
 
     def test_under_length_rejected(self):
-        """Short specs (< MIN_AGENT_SPEC_LINES) → 'Degenerate spec' (mirrors
+        """Short specs (< MIN_AGENT_SPEC_CHARS) → 'Degenerate spec' (mirrors
         the tech validator's wording so log greps stay consistent)."""
         short_spec = "# Tiny\n## A\n## B\n## C\n## D\n"
         ok, reason = validate_agent_spec(short_spec)
@@ -144,11 +144,14 @@ class TestValidateAgentSpec:
         assert "Degenerate spec" in reason
 
     def test_over_length_rejected(self):
-        """Long specs (> MAX_AGENT_SPEC_LINES) → 'Over-scoped spec'."""
-        # Construct a spec well beyond MAX_AGENT_SPEC_LINES.
+        """Long specs (> MAX_AGENT_SPEC_CHARS) → 'Over-scoped spec'."""
+        # Construct a spec well beyond MAX_AGENT_SPEC_CHARS. Each filler
+        # line is ~14 chars; we need MAX + buffer.
         header = "# Big - Agent Specification\n## Overview\nx\n## Agent shape\nx\n## Constraints\nx\n## Success criteria\nx\nagent.yaml skills/ SKILL.md test_e2e README\n"
-        padding = "filler line\n" * (MAX_AGENT_SPEC_LINES + 50)
-        tainted = header + padding
+        filler_line = "filler line\n"
+        padding_count = (MAX_AGENT_SPEC_CHARS // len(filler_line)) + 100
+        tainted = header + (filler_line * padding_count)
+        assert len(tainted) > MAX_AGENT_SPEC_CHARS, "fixture must exceed the ceiling"
         ok, reason = validate_agent_spec(tainted)
         assert not ok
         assert "Over-scoped spec" in reason
@@ -162,7 +165,7 @@ class TestValidateAgentSpec:
     def test_insufficient_headers_rejected(self):
         """Spec with < MIN_AGENT_SECTION_HEADERS (= 4) ## headers → reject.
 
-        Build a spec with enough lines to pass length check but only 3
+        Build a spec with enough chars to pass length check but only 3
         ## headings. Include required topical markers so we hit the
         header-count branch, not the missing-section branch.
         """
@@ -176,9 +179,9 @@ class TestValidateAgentSpec:
             "Some text here.\n\n"
             # Only 3 ## headers — short of the 4-header minimum.
         )
-        filler = ("text line " + "x") + "\n"
-        # Pad to MIN length, keeping the line count below the header check.
-        while body.count("\n") < MIN_AGENT_SPEC_LINES + 5:
+        filler = "text line filler content with more words to add density\n"
+        # Pad past the char floor so the header-count branch fires.
+        while len(body) < MIN_AGENT_SPEC_CHARS + 200:
             body += filler
         ok, reason = validate_agent_spec(body)
         assert not ok

@@ -330,8 +330,8 @@ def _make_valid_agent_spec(title: str) -> str:
     Mirrors _make_valid_spec but produces CCOS-agent shape. Used by the
     TestSpecGeneratorLLMIntegration tests which dispatch through
     SpecGenerator.generate_spec (which now routes life_domain to expand_agent
-    + validate_agent_spec). Lands ~70 lines — comfortably above the
-    MIN_AGENT_SPEC_LINES (60) floor.
+    + validate_agent_spec). Lands ~70 lines / ~2500-3000 chars — comfortably
+    above the MIN_AGENT_SPEC_CHARS (2000) floor.
     """
     lines = [
         f"# {title} - Agent Specification",
@@ -343,6 +343,9 @@ def _make_valid_agent_spec(title: str) -> str:
         "Every test asserts on a moment from Alex's actual day.",
         "Two paragraphs of Scene establishing the user, the moment, and",
         "the cognitive load the agent captures before any feature.",
+        "Alex's mornings start with overlapping priorities, and the agent's",
+        "job is to absorb the first 90 seconds of triage that usually eats",
+        "the headspace Alex needs for everything else that day.",
         "",
         "## Agent shape",
         "",
@@ -579,6 +582,64 @@ class TestSpecGeneratorLLMIntegration:
             call_args = mock_instance.expand_agent.call_args[0][0]
             assert call_args["artifact_type"] == "agent"
             assert call_args["title"] == "PR Review Agent"
+
+
+class TestValidateAgentSpecCharBounds:
+    """Char-based length bound checks for validate_agent_spec.
+
+    The agent validator switched from line-count to char-count on
+    2026-05-12 (spec-brevity refactor). Lines were always a proxy for
+    spec density — Mistral-Small-3.2-24B for #427 produced 49-53 line
+    specs that were 2617-3781 chars (dense ~50-73 chars/line) but
+    failed a line floor while being substantively buildable.
+    """
+
+    def test_canned_fixture_passes_floor(self):
+        """The hand-built fixture exists comfortably above the floor with margin."""
+        spec = _make_valid_agent_spec("Test")
+        ok, reason = validate_agent_spec(spec)
+        assert ok, f"_make_valid_agent_spec is the canonical valid example: {reason}"
+
+    def test_rejects_under_min_chars(self):
+        """A spec well under the floor is rejected with the Degenerate-spec prefix."""
+        from gates.llm_expander import MIN_AGENT_SPEC_CHARS
+        # Build a structurally OK but tiny spec — passes header count, fails char floor
+        tiny = (
+            "# Tiny Agent - Agent Specification\n\n"
+            "## Overview\nshort\n\n"
+            "## Agent shape\nagent.yaml, skills/, test_e2e, README.\n\n"
+            "## Constraints\nnone\n\n"
+            "## Success criteria\nworks\n"
+        )
+        assert len(tiny) < MIN_AGENT_SPEC_CHARS, "fixture must be under the floor"
+        ok, reason = validate_agent_spec(tiny)
+        assert not ok
+        assert reason.startswith("Degenerate spec:")
+        assert "chars" in reason
+        assert f"need >= {MIN_AGENT_SPEC_CHARS}" in reason
+
+    def test_rejects_over_max_chars(self):
+        """A spec well over the ceiling is rejected with the Over-scoped-spec prefix."""
+        from gates.llm_expander import MAX_AGENT_SPEC_CHARS
+        # Start from valid base and pad with extra-content lines that don't
+        # trip parrot markers or duplicate-Overview.
+        base = _make_valid_agent_spec("Bloated")
+        padding_line = "- extra detail about an edge case the agent handles end of line\n"
+        oversized = base + "\n## Additional notes\n\n" + (padding_line * 320)
+        assert len(oversized) > MAX_AGENT_SPEC_CHARS, "fixture must exceed the ceiling"
+        ok, reason = validate_agent_spec(oversized)
+        assert not ok
+        assert reason.startswith("Over-scoped spec:")
+        assert "chars" in reason
+        assert f"max {MAX_AGENT_SPEC_CHARS}" in reason
+
+    def test_message_prefixes_preserved_for_dashboard_grep(self):
+        """The 'Degenerate spec' / 'Over-scoped spec' prefixes must survive the
+        char-count refactor (existing log greps and dashboard queries key off them)."""
+        tiny = "# X\n## A\n## B\n## C\n## D\nagent.yaml skills/ test_e2e README\n"
+        ok, reason = validate_agent_spec(tiny)
+        assert not ok
+        assert "Degenerate spec:" in reason
 
 
 class TestAgentSpecPromptContent:

@@ -121,11 +121,20 @@ def validate_spec(spec_text: str) -> tuple[bool, str]:
 #
 # Length bounds: agent specs describe a 4-file project (agent.yaml, one
 # SKILL.md, one E2E test, README) plus a Scene paragraph. The golden
-# fixture lands ~200 lines; the bounds (60-400) leave room for richer
-# multi-skill agents while catching degenerate single-paragraph output
-# and over-scoped specs that try to define every internal turn.
-MIN_AGENT_SPEC_LINES = 60
-MAX_AGENT_SPEC_LINES = 400
+# fixture lands ~200 lines / ~5500 chars; the bounds leave room for
+# richer multi-skill agents while catching degenerate single-paragraph
+# output and over-scoped specs that try to define every internal turn.
+#
+# Char-based, not line-based (2026-05-12 spec-brevity refactor): the
+# original 60-line floor measured a proxy (newlines) for the actual
+# signal (spec density). Live Mistral-Small-3.2-24B output for #427
+# produced 2617-3781 char specs spread over 49-53 lines — substantively
+# dense (~50-73 chars/line) but failing a line-count floor because the
+# model writes long paragraph blocks rather than bullet lists. The
+# char-based floor admits dense-paragraph specs while still rejecting
+# truly degenerate single-paragraph output (<2000 chars).
+MIN_AGENT_SPEC_CHARS = 2000
+MAX_AGENT_SPEC_CHARS = 20000
 
 # An agent spec MUST have at least four named sections beyond the title:
 # Overview, Agent shape, Constraints, Success criteria. (README is described
@@ -182,15 +191,18 @@ def validate_agent_spec(spec_text: str) -> tuple[bool, str]:
     Checks for:
     - Chain-of-thought leakage (3+ CoT markers — same threshold as
       validate_spec; we reuse COT_MARKERS).
-    - Length bounds (60-400 lines — see module docstring for rationale).
+    - Length bounds (2000-20000 chars — see module docstring for rationale;
+      char-based to admit dense-paragraph specs that some terser models
+      produce, where line-count alone misrepresents content density).
     - Minimum section headers (>= 4 ## headings).
     - Duplicate Overview section.
     - Agent-prompt template parroting (AGENT_PARROT_MARKERS).
     - Required topical markers: agent.yaml, skills/, test_e2e, README.
 
-    Length / duplicate / CoT messages mirror validate_spec verbatim so log
-    greps and dashboards that key off "Degenerate spec" or "Duplicate
-    content" continue to work across both rubrics.
+    Length / duplicate / CoT messages keep "Degenerate spec" / "Over-scoped
+    spec" / "Duplicate content" prefixes so log greps and dashboards that
+    key off them continue to work across both rubrics (validate_spec stays
+    line-based; only validate_agent_spec uses char-based bounds).
 
     Args:
         spec_text: The generated spec markdown text.
@@ -212,12 +224,14 @@ def validate_agent_spec(spec_text: str) -> tuple[bool, str]:
     if len(cot_hits) >= 3:
         return False, f"CoT leakage detected ({len(cot_hits)} markers: {cot_hits[:5]})"
 
-    # Length bounds.
-    line_count = spec_text.count("\n") + 1
-    if line_count < MIN_AGENT_SPEC_LINES:
-        return False, f"Degenerate spec: {line_count} lines (need >= {MIN_AGENT_SPEC_LINES})"
-    if line_count > MAX_AGENT_SPEC_LINES:
-        return False, f"Over-scoped spec: {line_count} lines (max {MAX_AGENT_SPEC_LINES})"
+    # Length bounds — char-based. Line-count was the original signal but
+    # measured visual structure rather than spec density; see module
+    # docstring for the 2026-05-12 refactor rationale.
+    char_count = len(spec_text)
+    if char_count < MIN_AGENT_SPEC_CHARS:
+        return False, f"Degenerate spec: {char_count} chars (need >= {MIN_AGENT_SPEC_CHARS})"
+    if char_count > MAX_AGENT_SPEC_CHARS:
+        return False, f"Over-scoped spec: {char_count} chars (max {MAX_AGENT_SPEC_CHARS})"
 
     # Minimum section structure (## headers).
     header_count = spec_text.count("\n## ")

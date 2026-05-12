@@ -192,7 +192,8 @@ def _make_valid_agent_spec(title: str, idea_desc: str, problem: str, audience: s
     Mirrors _make_valid_spec but produces CCOS-agent shape: agent.yaml +
     skills/ + test_e2e_*.py + README references, with the four required
     section headers (Overview, Agent shape, Constraints, Success criteria).
-    Length lands ~80 lines — comfortably inside the 60-400 bounds.
+    Length lands ~2300 chars — comfortably above the MIN_AGENT_SPEC_CHARS
+    (2000) floor introduced by the 2026-05-12 char-count refactor.
     """
     lines = [
         f"# {title} - Agent Specification",
@@ -204,14 +205,18 @@ def _make_valid_agent_spec(title: str, idea_desc: str, problem: str, audience: s
         f"**Target Audience**: {audience}",
         "",
         f"This is a CCOS agent for {audience}. It captures roughly 60-70%",
-        "of the cognitive load described in the Scene below.",
+        "of the cognitive load described in the Scene below. The agent",
+        "absorbs the first 90 seconds of triage that usually eats the",
+        "headspace the user needs for everything else that day.",
         "",
         "**The struggling user.** Alex, 35, deals with the problem on a daily basis.",
-        "We anchor every test on a moment from their day.",
+        "We anchor every test on a moment from their day. Mornings start",
+        "with overlapping priorities and a sense of which thing is on fire.",
         "",
         "## Agent shape",
         "",
-        "Four file types in the produced project directory.",
+        "Four file types in the produced project directory. Each is named",
+        "explicitly below so the Builder LLM can map it one-to-one to a file.",
         "",
         "### agent.yaml",
         "",
@@ -224,11 +229,13 @@ def _make_valid_agent_spec(title: str, idea_desc: str, problem: str, audience: s
         "",
         "### skills/main_skill/SKILL.md",
         "",
-        "Frontmatter: name, description, trigger. Body 4-8 paragraphs.",
+        "Frontmatter: name, description, trigger. Body 4-8 paragraphs that",
+        "describe the decision logic for the one Scene this agent owns.",
         "",
         "### tests/test_e2e_scenes.py",
         "",
         "At least three E2E tests, each describing a Scene from the user's day.",
+        "Tests assert on both the Scene input and the agent response shape.",
         "",
         "- test_e2e_morning_scene",
         "- test_e2e_midday_scene",
@@ -237,13 +244,16 @@ def _make_valid_agent_spec(title: str, idea_desc: str, problem: str, audience: s
         "### README.md",
         "",
         "Scene-opening story. Four paragraphs. Meets the user before the agent.",
+        "Paragraph one: Alex in the moment. Paragraph two: the agent acting.",
+        "Paragraph three: invocation example. Paragraph four: deploy note.",
         "",
         "## Constraints",
         "",
         "- No external services.",
         "- No API keys hardcoded; telegram_bot_token_env may be stubbed at T1.",
-        "- Skills bundled in agent directory.",
+        "- Skills bundled in agent directory, not loaded from global registry.",
         "- No web frontend at T1.",
+        "- Single-purpose. One agent, one Scene.",
         "",
         "## Success criteria",
         "",
@@ -251,12 +261,14 @@ def _make_valid_agent_spec(title: str, idea_desc: str, problem: str, audience: s
         "2. skills/main_skill/SKILL.md exists with proper frontmatter.",
         "3. All three test_e2e tests pass against a mocked LLM.",
         "4. README opens with a Scene paragraph, not a feature list.",
+        "5. Response time on a 60-second input is under five seconds.",
         "",
         "## Out of scope (T1)",
         "",
         "- Multi-user support.",
         "- Cross-session memory.",
         "- Web frontend.",
+        "- Voice synthesis.",
     ]
     return "\n".join(lines)
 
