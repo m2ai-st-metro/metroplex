@@ -327,6 +327,12 @@ class BuildOrchestrator:
                 status = "failed"
                 error_msg = f"Unexpected error queuing build: {e}"
 
+        # R-A item 3: propagate scoring_rubric from ideas.scoring_rubric onto
+        # build_jobs so the orchestrator and CLI score callers can pass it
+        # through to score_project(scoring_rubric=...). idea.get('scoring_rubric')
+        # is populated for ideaforge sources by IdeaForgeReader; non-ideaforge
+        # sources (skylynx/linear/academy) leave it None — those streams
+        # bypass the life_domain category gate by design.
         job = BuildJob(
             idea_id=idea["id"],
             title=idea["title"],
@@ -334,6 +340,7 @@ class BuildOrchestrator:
             queue_job_id=job_id,
             status=status,
             queued_at=queued_at,
+            scoring_rubric=idea.get("scoring_rubric"),
         )
         self.state_db.record_build_job(job)
 
@@ -1028,7 +1035,8 @@ class BuildOrchestrator:
                     spec_path="",
                     queue_job_id=f"metroplex-ideaforge-{idea.get('id', 0)}",
                     status="failed",
-                    queued_at=datetime.now()
+                    queued_at=datetime.now(),
+                    scoring_rubric=idea.get("scoring_rubric"),
                 )
                 self.state_db.record_build_job(job)
                 jobs.append(job)
@@ -1104,19 +1112,76 @@ class BuildOrchestrator:
             # Refresh fields that may be stale in the priority queue snapshot.
             # The triage gate snapshots idea_data at enqueue time, but fields
             # like artifact_type may be populated by a later classification step.
-            if idea.get("artifact_type") is None and self.ideaforge_reader and item.source == "ideaforge":
+            #
+            # R-A item 3 (2026-05-12): we now ALSO refresh whenever the
+            # priority_queue snapshot lacks scoring_rubric, even if
+            # artifact_type is already populated. The rubric is the new
+            # gate input and must be present for life_domain enforcement.
+            needs_refresh = self.ideaforge_reader and item.source == "ideaforge" and (
+                idea.get("artifact_type") is None
+                or idea.get("scoring_rubric") is None
+            )
+            if needs_refresh:
                 try:
                     fresh = self.ideaforge_reader.get_idea_by_id(int(item.source_id))
                     if fresh:
-                        for field in ("artifact_type", "problem_statement", "target_audience"):
+                        # R-A item 3: include scoring_rubric in the refresh
+                        # field set so the rubric carried by the reader makes
+                        # it onto the BuildJob even when the priority_queue
+                        # snapshot pre-dated the rubric column.
+                        for field in (
+                            "artifact_type", "problem_statement",
+                            "target_audience", "scoring_rubric",
+                        ):
                             if fresh.get(field) and not idea.get(field):
                                 idea[field] = fresh[field]
                         logger.info(
-                            "Refreshed stale snapshot for idea %s: artifact_type=%s",
+                            "Refreshed stale snapshot for idea %s: artifact_type=%s rubric=%s",
                             item.source_id, idea.get("artifact_type"),
+                            idea.get("scoring_rubric"),
                         )
                 except Exception as e:
                     logger.warning("Failed to refresh idea %s from IdeaForge: %s", item.source_id, e)
+
+            # R-A item 3 defense-in-depth (fail-closed; Codex Round 2 Medium 3):
+            # drop ideaforge items whose rubric is anything other than the
+            # exact string 'life_domain'. The reader filter is the primary
+            # enforcement point (only life_domain rows enter the priority
+            # queue going forward), but stale tech-rubric entries that were
+            # enqueued before this code-deploy could still sit in
+            # priority_queue — AND a refresh failure (no upstream reader,
+            # DB unreachable, etc.) could leave scoring_rubric=None on a row
+            # that should have been tech. Failing closed (require explicit
+            # 'life_domain') eliminates the gap: an ideaforge row without a
+            # known-good rubric is rejected rather than silently dispatched.
+            # Sources other than ideaforge (skylynx/linear/academy) are
+            # pass-through: they bypass the rubric gate by design.
+            if item.source == "ideaforge":
+                rubric = idea.get("scoring_rubric")
+                if rubric != "life_domain":
+                    logger.info(
+                        "Build dequeue REJECT for %s: scoring_rubric=%r is not "
+                        "'life_domain' (fail-closed; tech path deprecated, "
+                        "D1 archive 2026-05-11; NULL rubric also rejected to "
+                        "close the refresh-failure gap)",
+                        idea.get("title", "?"), rubric,
+                    )
+                    self.audit_logger.log_decision(
+                        gate="build",
+                        action="rubric_rejected",
+                        details={
+                            "idea_id": idea.get("id"),
+                            "title": idea.get("title"),
+                            "scoring_rubric": rubric,
+                            "reason": (
+                                "non-life_domain rubric — pre-pivot queue "
+                                "entry or refresh failure"
+                            ),
+                        },
+                    )
+                    if not dry_run and item.id:
+                        state_db.update_item_status(item.id, "failed", "completed_at")
+                    continue
 
             # Idea quality gate: reject ideas with insufficient data
             idea_description = idea.get("description") or ""
@@ -1268,6 +1333,7 @@ class BuildOrchestrator:
                     queue_job_id=job_id,
                     status="queued",
                     queued_at=queued_at,
+                    scoring_rubric=idea.get("scoring_rubric"),
                 )
                 self.state_db.record_build_job(job)
                 jobs.append(job)
@@ -1322,6 +1388,7 @@ class BuildOrchestrator:
                         queue_job_id=job_id,
                         status="failed",
                         queued_at=queued_at,
+                        scoring_rubric=idea.get("scoring_rubric"),
                     )
                     self.state_db.record_build_job(job)
                     jobs.append(job)

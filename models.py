@@ -27,6 +27,11 @@ class BuildJob(BaseModel):
     status: Literal["queued", "started", "completed", "failed"]
     queued_at: datetime
     strategic_theme: str | None = None
+    # R-A item 3: rubric carried from ideas.scoring_rubric -> build_jobs.scoring_rubric
+    # so the quality scorer (R-A item 4) can apply the life_domain category gate.
+    # None on non-ideaforge sources (skylynx/linear/academy) — those streams bypass
+    # the gate by design.
+    scoring_rubric: str | None = None
 
 
 class PatchApplication(BaseModel):

@@ -1037,16 +1037,20 @@ class TestBuildOrchestrator:
             audit_logger=mock_audit_logger,
         )
 
-        # Create mock priority items (3 available, but per-cycle cap is 2)
+        # Create mock priority items (3 available, but per-cycle cap is 2).
+        # R-A item 3: every ideaforge fixture must carry scoring_rubric='life_domain'
+        # to clear the post-pivot dequeue guard. These tests exercise capacity
+        # behavior, not the rubric filter — so we give them the rubric value the
+        # production filter requires.
         mock_items = [
             Mock(id=10, source="ideaforge", source_id=10, title="Idea A", description="A CLI tool that scans codebases for issues",
                  idea_data=json.dumps({"id": 10, "title": "Idea A", "description": "A CLI tool that scans codebases for issues",
                                        "problem_statement": "P", "target_audience": "T",
-                                       "artifact_type": "tool"})),
+                                       "artifact_type": "tool", "scoring_rubric": "life_domain"})),
             Mock(id=11, source="ideaforge", source_id=11, title="Idea B", description="A markdown linter for documentation files",
                  idea_data=json.dumps({"id": 11, "title": "Idea B", "description": "A markdown linter for documentation files",
                                        "problem_statement": "P", "target_audience": "T",
-                                       "artifact_type": "tool"})),
+                                       "artifact_type": "tool", "scoring_rubric": "life_domain"})),
         ]
         mock_state_db.claim_next_pending = Mock(side_effect=mock_items + [None])
         mock_state_db.update_item_status = Mock()
@@ -1237,6 +1241,7 @@ class TestSelfHealingLivenessGuard:
                 "description": "A CLI tool that scans codebases for issues",
                 "problem_statement": "P", "target_audience": "T",
                 "artifact_type": "tool",
+                "scoring_rubric": "life_domain",
             }),
         )
         mock_state_db.claim_next_pending = Mock(side_effect=[item, None])
@@ -1272,6 +1277,7 @@ class TestSelfHealingLivenessGuard:
                 "description": "A CLI tool that generates changelogs automatically",
                 "problem_statement": "P", "target_audience": "T",
                 "artifact_type": "tool",
+                "scoring_rubric": "life_domain",
             }),
         )
         mock_state_db.claim_next_pending = Mock(side_effect=[item, None])
@@ -1309,6 +1315,7 @@ class TestSelfHealingLivenessGuard:
                 "description": "A CLI tool that exists primarily to test backoff handling",
                 "problem_statement": "P", "target_audience": "T",
                 "artifact_type": "tool",
+                "scoring_rubric": "life_domain",
             }),
         )
         mock_state_db.claim_next_pending = Mock(side_effect=[item, None])
@@ -1322,5 +1329,236 @@ class TestSelfHealingLivenessGuard:
         adapter.queue.assert_not_called()
         mock_state_db.record_build_job.assert_not_called()
         assert jobs == []
+
+
+class TestBuildDequeueRubricFilter:
+    """R-A item 3 / Codex Round 1 defense-in-depth: tech-rubric items
+    sitting stale in the priority_queue must be drained at dequeue, not
+    dispatched."""
+
+    @pytest.fixture
+    def mock_state_db(self):
+        db = Mock(spec=StateDB)
+        db.record_build_job = Mock()
+        db.release_claim = Mock()
+        db.update_item_status = Mock()
+        db.has_completed_build = Mock(return_value=False)
+        db.has_exhausted_retries = Mock(return_value=False)
+        db.count_failed_builds = Mock(return_value=0)
+        return db
+
+    @pytest.fixture
+    def mock_audit_logger(self):
+        logger = Mock(spec=AuditLogger)
+        logger.log_decision = Mock()
+        logger.log_error = Mock()
+        return logger
+
+    @pytest.fixture
+    def mock_spec_generator(self):
+        generator = Mock(spec=SpecGenerator)
+        return generator
+
+    def test_tech_rubric_dequeue_is_rejected(
+        self, mock_state_db, mock_spec_generator, mock_audit_logger,
+    ):
+        """An ideaforge priority_queue item carrying scoring_rubric='tech'
+        is rejected at dequeue. No spec generation, no BuildJob recorded.
+        """
+        config = Config()
+        config.max_approve_per_cycle = 1
+        orch = BuildOrchestrator(
+            config=config,
+            state_db=mock_state_db,
+            spec_generator=mock_spec_generator,
+            audit_logger=mock_audit_logger,
+        )
+
+        tech_item = Mock(
+            id=701, source="ideaforge", source_id=701, title="Legacy Tech",
+            description="A CLI tool for tech things",
+            idea_data=json.dumps({
+                "id": 701, "title": "Legacy Tech",
+                "description": "A CLI tool for tech things",
+                "problem_statement": "P", "target_audience": "T",
+                "artifact_type": "tool",
+                "scoring_rubric": "tech",
+            }),
+        )
+        mock_state_db.claim_next_pending = Mock(side_effect=[tech_item, None])
+
+        with patch.object(orch, 'start_queue_background'):
+            jobs = orch.run_from_queue(mock_state_db, dry_run=False)
+
+        assert jobs == [], "tech-rubric item must not dispatch"
+        mock_spec_generator.generate_spec.assert_not_called()
+        mock_state_db.record_build_job.assert_not_called()
+        # Item is finalized (status='failed') so it doesn't re-appear next cycle.
+        mock_state_db.update_item_status.assert_called_with(
+            701, "failed", "completed_at",
+        )
+        # Audit log captured the rejection with the rubric value.
+        rejection_calls = [
+            c for c in mock_audit_logger.log_decision.call_args_list
+            if c.kwargs.get("action") == "rubric_rejected"
+        ]
+        assert len(rejection_calls) == 1
+        details = rejection_calls[0].kwargs["details"]
+        assert details["scoring_rubric"] == "tech"
+
+    def test_life_domain_rubric_dequeue_proceeds(
+        self, mock_state_db, mock_spec_generator, mock_audit_logger,
+    ):
+        """A life_domain item dequeues normally — guard is rubric-specific."""
+        config = Config()
+        config.max_approve_per_cycle = 1
+        orch = BuildOrchestrator(
+            config=config,
+            state_db=mock_state_db,
+            spec_generator=mock_spec_generator,
+            audit_logger=mock_audit_logger,
+        )
+
+        mock_spec_path = Mock()
+        mock_spec_path.read_text.return_value = "spec"
+        mock_spec_path.resolve.return_value = mock_spec_path
+        mock_spec_generator.generate_spec = Mock(return_value=mock_spec_path)
+
+        life_item = Mock(
+            id=702, source="ideaforge", source_id=702, title="Life Domain Idea",
+            description="A self-care reflection journal that lives on your phone",
+            idea_data=json.dumps({
+                "id": 702, "title": "Life Domain Idea",
+                "description": "A self-care reflection journal that lives on your phone",
+                "problem_statement": "Problem statement here", "target_audience": "Adults",
+                "artifact_type": "agent",
+                "scoring_rubric": "life_domain",
+            }),
+        )
+        mock_state_db.claim_next_pending = Mock(side_effect=[life_item, None])
+
+        with patch.object(orch, 'queue_build') as mock_queue, \
+             patch.object(orch, 'start_queue_background'):
+            mock_queue.return_value = BuildJob(
+                idea_id=702, title="Life Domain Idea", spec_path="",
+                queue_job_id="metroplex-ideaforge-702", status="queued",
+                queued_at=datetime.now(),
+                scoring_rubric="life_domain",
+            )
+            jobs = orch.run_from_queue(mock_state_db, dry_run=False)
+
+        # No rubric_rejected audit entry for life_domain.
+        rejection_calls = [
+            c for c in mock_audit_logger.log_decision.call_args_list
+            if c.kwargs.get("action") == "rubric_rejected"
+        ]
+        assert rejection_calls == [], (
+            "life_domain items must NOT trigger the rubric_rejected guard"
+        )
+        # And the item dispatched normally.
+        assert len(jobs) == 1
+        mock_queue.assert_called_once()
+
+    def test_null_rubric_in_snapshot_triggers_refresh_then_rejects_if_still_non_life_domain(
+        self, mock_state_db, mock_spec_generator, mock_audit_logger,
+    ):
+        """When the priority_queue snapshot has scoring_rubric=None AND the
+        upstream refresh fills it in as 'tech', the dequeue guard still
+        rejects (defense in depth even after the refresh).
+        """
+        config = Config()
+        config.max_approve_per_cycle = 1
+
+        ideaforge_reader = Mock()
+        ideaforge_reader.get_idea_by_id = Mock(return_value={
+            "id": 703, "title": "Stale Tech Refresh",
+            "description": "tech path", "problem_statement": "P",
+            "target_audience": "T", "artifact_type": "tool",
+            "scoring_rubric": "tech",
+        })
+
+        orch = BuildOrchestrator(
+            config=config,
+            state_db=mock_state_db,
+            spec_generator=mock_spec_generator,
+            audit_logger=mock_audit_logger,
+            ideaforge_reader=ideaforge_reader,
+        )
+
+        item = Mock(
+            id=703, source="ideaforge", source_id=703,
+            title="Stale Tech", description="Stale tech in queue",
+            idea_data=json.dumps({
+                "id": 703, "title": "Stale Tech",
+                "description": "Stale tech in queue",
+                "problem_statement": "P", "target_audience": "T",
+                # Note: scoring_rubric absent (pre-rubric snapshot).
+                "artifact_type": None,  # forces refresh
+            }),
+        )
+        mock_state_db.claim_next_pending = Mock(side_effect=[item, None])
+
+        with patch.object(orch, 'start_queue_background'):
+            jobs = orch.run_from_queue(mock_state_db, dry_run=False)
+
+        # Reader was queried.
+        ideaforge_reader.get_idea_by_id.assert_called_with(703)
+        # And the rubric_rejected audit entry fired with 'tech'.
+        rejection_calls = [
+            c for c in mock_audit_logger.log_decision.call_args_list
+            if c.kwargs.get("action") == "rubric_rejected"
+        ]
+        assert len(rejection_calls) == 1
+        assert rejection_calls[0].kwargs["details"]["scoring_rubric"] == "tech"
+        assert jobs == []
+
+    def test_null_rubric_dequeue_is_rejected_fail_closed(
+        self, mock_state_db, mock_spec_generator, mock_audit_logger,
+    ):
+        """Codex Round 2 Medium 3: fail-closed.
+
+        When the priority_queue snapshot has NO scoring_rubric AND no
+        ideaforge_reader is wired (or the refresh fails), the dequeue guard
+        MUST reject the item rather than dispatch it with rubric=None.
+        This closes the refresh-failure gap: a NULL rubric on an ideaforge
+        item is treated as 'unknown, do not dispatch'.
+        """
+        config = Config()
+        config.max_approve_per_cycle = 1
+        # No ideaforge_reader wired -> refresh path is skipped.
+        orch = BuildOrchestrator(
+            config=config,
+            state_db=mock_state_db,
+            spec_generator=mock_spec_generator,
+            audit_logger=mock_audit_logger,
+            ideaforge_reader=None,
+        )
+
+        item = Mock(
+            id=704, source="ideaforge", source_id=704,
+            title="Stale Null Rubric", description="A self-care reflection journal",
+            idea_data=json.dumps({
+                "id": 704, "title": "Stale Null Rubric",
+                "description": "A self-care reflection journal",
+                "problem_statement": "P", "target_audience": "T",
+                "artifact_type": "agent",
+                # No scoring_rubric at all.
+            }),
+        )
+        mock_state_db.claim_next_pending = Mock(side_effect=[item, None])
+
+        with patch.object(orch, 'start_queue_background'):
+            jobs = orch.run_from_queue(mock_state_db, dry_run=False)
+
+        rejection_calls = [
+            c for c in mock_audit_logger.log_decision.call_args_list
+            if c.kwargs.get("action") == "rubric_rejected"
+        ]
+        assert len(rejection_calls) == 1
+        assert rejection_calls[0].kwargs["details"]["scoring_rubric"] is None
+        assert jobs == []
+        mock_state_db.update_item_status.assert_called_with(
+            704, "failed", "completed_at",
+        )
 
 

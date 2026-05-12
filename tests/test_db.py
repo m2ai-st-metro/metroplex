@@ -900,3 +900,147 @@ class TestCostBySource:
 
     def test_get_cost_by_source_empty(self, db):
         assert db.get_cost_by_source(days=7) == []
+
+
+class TestBuildJobsScoringRubricMigration:
+    """R-A item 3 (2026-05-12): build_jobs.scoring_rubric idempotent migration
+    + record_build_job persistence.
+    """
+
+    def _get_columns(self, db) -> dict:
+        """Return PRAGMA table_info(build_jobs) as {name: row dict}."""
+        cursor = db.conn.cursor()
+        cursor.execute("PRAGMA table_info(build_jobs)")
+        return {row["name"]: dict(row) for row in cursor.fetchall()}
+
+    def _build_job(self, idea_id=42, queue_job_id="metroplex-ideaforge-42",
+                   scoring_rubric=None):
+        return BuildJob(
+            idea_id=idea_id,
+            title=f"Idea {idea_id}",
+            spec_path=f"/tmp/spec_{idea_id}.txt",
+            queue_job_id=queue_job_id,
+            status="queued",
+            queued_at=datetime.now(),
+            scoring_rubric=scoring_rubric,
+        )
+
+    # --- C1: migration is idempotent + nullable ---
+
+    def test_scoring_rubric_column_present_on_fresh_db(self, db):
+        cols = self._get_columns(db)
+        assert "scoring_rubric" in cols
+        assert cols["scoring_rubric"]["type"].upper() == "TEXT"
+
+    def test_scoring_rubric_column_nullable_for_legacy_inserts(self, db):
+        """A BuildJob without scoring_rubric must store NULL (not 'tech')."""
+        job = self._build_job(queue_job_id="metroplex-ideaforge-100")
+        db.record_build_job(job)
+
+        row = db.get_build_by_queue_job_id("metroplex-ideaforge-100")
+        assert row is not None
+        assert row["scoring_rubric"] is None
+
+    def test_init_db_is_idempotent_on_scoring_rubric(self, tmp_path):
+        """Re-running init_db on an already-migrated DB must not raise
+        'duplicate column name' and must keep exactly one scoring_rubric column.
+        """
+        db_path = str(tmp_path / "idem.db")
+        first = StateDB(db_path)
+        first.init_db()
+        first.close()
+
+        second = StateDB(db_path)
+        # MUST NOT raise: PRAGMA-driven guard skips the ALTER.
+        second.init_db()
+
+        cursor = second.conn.cursor()
+        cursor.execute("PRAGMA table_info(build_jobs)")
+        names = [row["name"] for row in cursor.fetchall()]
+        assert names.count("scoring_rubric") == 1
+        second.close()
+
+    def test_preexisting_rows_survive_migration(self, tmp_path):
+        """Create a DB without the new column, insert a row, then run the
+        migration. The row must still be present with scoring_rubric=NULL.
+        """
+        import sqlite3
+        db_path = str(tmp_path / "preexisting.db")
+
+        # Bootstrap a minimal build_jobs table WITHOUT scoring_rubric.
+        bootstrap = sqlite3.connect(db_path)
+        bootstrap.execute("""
+            CREATE TABLE build_jobs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                idea_id INTEGER NOT NULL,
+                title TEXT NOT NULL,
+                spec_path TEXT NOT NULL,
+                queue_job_id TEXT NOT NULL,
+                status TEXT NOT NULL CHECK(status IN ('queued', 'started', 'completed', 'failed')),
+                queued_at TEXT NOT NULL,
+                completed_at TEXT
+            )
+        """)
+        bootstrap.execute(
+            "INSERT INTO build_jobs (idea_id, title, spec_path, queue_job_id, status, queued_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (777, "Pre-Migration", "/tmp/pre.txt", "pre-001", "queued",
+             datetime.now().isoformat()),
+        )
+        bootstrap.commit()
+        bootstrap.close()
+
+        # Run the full Metroplex migration on top of the bootstrap.
+        db = StateDB(db_path)
+        db.init_db()
+
+        # Pre-migration row survives, with scoring_rubric NULL.
+        row = db.get_build_by_queue_job_id("pre-001")
+        assert row is not None
+        assert row["title"] == "Pre-Migration"
+        assert row["scoring_rubric"] is None
+        db.close()
+
+    # --- C2: record_build_job persists the rubric ---
+
+    def test_record_build_job_persists_life_domain_rubric(self, db):
+        job = self._build_job(
+            queue_job_id="metroplex-ideaforge-201",
+            scoring_rubric="life_domain",
+        )
+        db.record_build_job(job)
+
+        row = db.get_build_by_queue_job_id("metroplex-ideaforge-201")
+        assert row is not None
+        assert row["scoring_rubric"] == "life_domain"
+
+    def test_record_build_job_persists_tech_rubric_verbatim(self, db):
+        """Build queue is allowed to pass 'tech' explicitly; the DB must
+        store it verbatim (no auto-rewrite to NULL or 'life_domain').
+        """
+        job = self._build_job(
+            queue_job_id="metroplex-ideaforge-202",
+            scoring_rubric="tech",
+        )
+        db.record_build_job(job)
+
+        row = db.get_build_by_queue_job_id("metroplex-ideaforge-202")
+        assert row is not None
+        assert row["scoring_rubric"] == "tech"
+
+    def test_record_build_job_persists_null_rubric_by_default(self, db):
+        """A BuildJob constructed without the kwarg defaults to None."""
+        # Mirror legacy construction (no scoring_rubric kwarg).
+        job = BuildJob(
+            idea_id=203,
+            title="Legacy Construction",
+            spec_path="/tmp/legacy.txt",
+            queue_job_id="metroplex-ideaforge-203",
+            status="queued",
+            queued_at=datetime.now(),
+        )
+        db.record_build_job(job)
+
+        row = db.get_build_by_queue_job_id("metroplex-ideaforge-203")
+        assert row is not None
+        assert row["scoring_rubric"] is None

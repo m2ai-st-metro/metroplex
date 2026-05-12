@@ -221,6 +221,14 @@ class StateDB:
             # Backfill: no suffixed IDs exist yet, so base = queue_job_id
             cursor.execute("UPDATE build_jobs SET base_job_id = queue_job_id WHERE base_job_id IS NULL")
 
+        # Migrate: add scoring_rubric to build_jobs (R-A item 3, 2026-05-12).
+        # Carries ideas.scoring_rubric forward so orchestrator/CLI score callers
+        # can pass it to quality_scorer.score_project. NULL on legacy rows is
+        # backward-compat (no rubric arg -> no category gate applied).
+        # Idempotent: PRAGMA-driven, skipped if column already exists.
+        if "scoring_rubric" not in bj_columns:
+            cursor.execute("ALTER TABLE build_jobs ADD COLUMN scoring_rubric TEXT DEFAULT NULL")
+
         # Migrate: add a2a_task_id to build_jobs (Phase E A2A dispatch tracking)
         if "a2a_task_id" not in bj_columns:
             cursor.execute("ALTER TABLE build_jobs ADD COLUMN a2a_task_id TEXT DEFAULT NULL")
@@ -470,8 +478,8 @@ class StateDB:
         inherited_retry = (row[0] or 0) if row and row[0] is not None else 0
 
         cursor.execute("""
-            INSERT INTO build_jobs (idea_id, title, spec_path, queue_job_id, status, queued_at, retry_count, base_job_id)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO build_jobs (idea_id, title, spec_path, queue_job_id, status, queued_at, retry_count, base_job_id, scoring_rubric)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             job.idea_id,
             job.title,
@@ -481,6 +489,7 @@ class StateDB:
             job.queued_at.isoformat(),
             inherited_retry,
             base_job_id,
+            job.scoring_rubric,
         ))
 
         self.conn.commit()

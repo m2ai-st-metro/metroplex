@@ -1070,8 +1070,10 @@ def cmd_score_builds(args, config: Config):
         state_db.connect()
         cursor = state_db.conn.cursor()
 
+        # R-A item 3: select scoring_rubric so we can forward it to score_project.
+        # NULL rows -> rubric=None -> backward-compat (no category gate applied).
         cursor.execute("""
-            SELECT DISTINCT b.queue_job_id, b.title, b.project_dir, b.quality_score
+            SELECT DISTINCT b.queue_job_id, b.title, b.project_dir, b.quality_score, b.scoring_rubric
             FROM build_jobs b
             WHERE b.status = 'completed'
             AND b.id IN (SELECT MAX(id) FROM build_jobs GROUP BY queue_job_id)
@@ -1094,17 +1096,24 @@ def cmd_score_builds(args, config: Config):
                     print(f"  Skip (no dir): {row['title']}")
                 continue
 
-            breakdown = score_project(Path(project_dir))
+            rubric = row["scoring_rubric"]
+            breakdown = score_project(Path(project_dir), scoring_rubric=rubric)
+
+            # When the life_domain category gate fired, surface the reason
+            # in the operator-visible output so the 0/100 is not opaque.
+            gate_hint = ""
+            if breakdown.category_failed:
+                gate_hint = f", CATEGORY_FAILED={breakdown.category_failure_reason}"
 
             if args.dry_run:
                 print(f"  [DRY RUN] {row['title']}: {breakdown.total_score}/100 "
                       f"(static={breakdown.static_score}, src={breakdown.source_file_count}, "
-                      f"tests={breakdown.test_file_count})")
+                      f"tests={breakdown.test_file_count}{gate_hint})")
             else:
                 state_db.update_build_quality_score(row["queue_job_id"], breakdown.total_score)
                 print(f"  {row['title']}: {breakdown.total_score}/100 "
                       f"(static={breakdown.static_score}, src={breakdown.source_file_count}, "
-                      f"tests={breakdown.test_file_count})")
+                      f"tests={breakdown.test_file_count}{gate_hint})")
             scored += 1
 
         action = "Would score" if args.dry_run else "Scored"

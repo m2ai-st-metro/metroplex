@@ -15,11 +15,17 @@ from readers import IdeaForgeReader, SkyLynxReader, STRecordsReader
 
 @pytest.fixture
 def ideaforge_test_db():
-    """Create an in-memory IdeaForge database with test data."""
+    """Create an in-memory IdeaForge database with test data.
+
+    The fixture seeds the legacy three life_domain ideas (so the historical
+    test_ideaforge_get_unprocessed_ideas assertion of 3 rows still holds)
+    plus rubric-variation rows used by the R-A item 3 filter tests.
+    """
     conn = sqlite3.connect(":memory:")
     cursor = conn.cursor()
 
-    # Create ideas table with IdeaForge schema
+    # Create ideas table with IdeaForge schema. R-A item 3 (2026-05-12)
+    # adds the scoring_rubric column to match the live IdeaForge schema.
     cursor.execute("""
         CREATE TABLE ideas (
             id INTEGER PRIMARY KEY,
@@ -39,22 +45,32 @@ def ideaforge_test_db():
             status TEXT,
             claimed_by TEXT,
             claimed_at TEXT,
-            strategic_theme TEXT
+            strategic_theme TEXT,
+            scoring_rubric TEXT DEFAULT 'tech'
         )
     """)
 
-    # Insert test ideas with different scores
+    # Legacy classified rows -- backfilled to scoring_rubric='life_domain'
+    # so the existing get_unprocessed_ideas test (which expects 3 rows)
+    # continues to pass. Rubric-variation rows (10-12) drive C4 tests.
     test_ideas = [
         (1, "AI Task Scheduler", "AI-powered task scheduling", "Users struggle with scheduling",
-         "Busy professionals", 8.5, 9.0, 8.0, 8.5, 9.0, 7.5, "tool", 15, "classified"),
+         "Busy professionals", 8.5, 9.0, 8.0, 8.5, 9.0, 7.5, "tool", 15, "classified", "life_domain"),
         (2, "Code Review Bot", "Automated code review assistant", "Manual reviews are slow",
-         "Software teams", 7.2, 7.5, 7.0, 7.2, 7.0, 7.0, "agent", 10, "classified"),
+         "Software teams", 7.2, 7.5, 7.0, 7.2, 7.0, 7.0, "agent", 10, "classified", "life_domain"),
         (3, "Meeting Summarizer", "AI meeting summary generator", "Notes are incomplete",
-         "Remote workers", 9.1, 9.5, 9.0, 8.5, 9.0, 8.0, "product", 20, "classified"),
+         "Remote workers", 9.1, 9.5, 9.0, 8.5, 9.0, 8.0, "product", 20, "classified", "life_domain"),
         (4, "Unscored Idea", "This idea has no score", "Some problem",
-         "Some audience", None, None, None, None, None, None, "tool", 5, "draft"),
+         "Some audience", None, None, None, None, None, None, "tool", 5, "draft", "life_domain"),
         (5, "Draft Idea", "This idea is not scored yet", "Another problem",
-         "Another audience", 6.0, 6.0, 6.0, 6.0, 6.0, 6.0, "agent", 3, "draft"),
+         "Another audience", 6.0, 6.0, 6.0, 6.0, 6.0, 6.0, "agent", 3, "draft", "life_domain"),
+        # R-A item 3 filter probes
+        (10, "Tech Path Idea", "A tech-rubric idea", "Devs need a thing",
+         "Engineers", 8.0, 8.0, 8.0, 8.0, 8.0, 8.0, "tool", 8, "classified", "tech"),
+        (11, "Null Rubric Legacy", "Pre-rubric legacy row", "Old problem",
+         "Old audience", 7.5, 7.5, 7.5, 7.5, 7.5, 7.5, "tool", 7, "classified", None),
+        (12, "Life Dismissed", "A life_domain idea already dismissed", "Some problem",
+         "Some audience", 8.2, 8.2, 8.2, 8.2, 8.2, 8.2, "agent", 12, "dismissed", "life_domain"),
     ]
 
     for idea in test_ideas:
@@ -62,8 +78,9 @@ def ideaforge_test_db():
             INSERT INTO ideas (
                 id, title, description, problem_statement, target_audience,
                 weighted_score, opportunity_score, problem_score, feasibility_score,
-                why_now_score, competition_score, artifact_type, signal_count, status
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                why_now_score, competition_score, artifact_type, signal_count, status,
+                scoring_rubric
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, idea)
 
     conn.commit()
@@ -144,6 +161,159 @@ def test_ideaforge_get_idea_by_id(ideaforge_test_db):
     # Get non-existent idea
     idea = reader.get_idea_by_id(999)
     assert idea is None
+
+    reader.close()
+
+
+# --- R-A item 3: scoring_rubric filter (life_domain allow-list) ---
+
+
+def test_ideaforge_filters_to_life_domain_rubric(ideaforge_test_db):
+    """get_unprocessed_ideas admits only scoring_rubric='life_domain' rows.
+
+    Fixture seeds rows 10 (tech), 11 (NULL rubric), and 12 (life_domain but
+    status='dismissed'). All must be excluded.
+    """
+    reader = IdeaForgeReader(ideaforge_test_db)
+    ideas = reader.get_unprocessed_ideas()
+    returned_ids = {row["id"] for row in ideas}
+
+    # Legacy classified life_domain ids (1, 2, 3) admitted.
+    assert 1 in returned_ids
+    assert 2 in returned_ids
+    assert 3 in returned_ids
+
+    # Tech rubric row (10) MUST NOT slip through.
+    assert 10 not in returned_ids, (
+        "tech-rubric ideas must be filtered out (D1 archive 2026-05-11)"
+    )
+
+    # NULL-rubric legacy row (11) MUST NOT slip through.
+    assert 11 not in returned_ids, (
+        "NULL-rubric legacy rows pre-date the rubric concept and must not "
+        "enter the build queue"
+    )
+
+    # Dismissed life_domain row (12) excluded by the status filter.
+    assert 12 not in returned_ids
+
+    reader.close()
+
+
+def test_ideaforge_get_unprocessed_ideas_includes_scoring_rubric(ideaforge_test_db):
+    """The reader's return contract must include scoring_rubric so the build
+    gate can wire it into BuildJob.scoring_rubric.
+    """
+    reader = IdeaForgeReader(ideaforge_test_db)
+    ideas = reader.get_unprocessed_ideas()
+
+    assert len(ideas) >= 1
+    for idea in ideas:
+        assert "scoring_rubric" in idea, (
+            "scoring_rubric must be present on every returned dict"
+        )
+        assert idea["scoring_rubric"] == "life_domain", (
+            f"only life_domain rows may be returned; got rubric="
+            f"{idea['scoring_rubric']} for id={idea['id']}"
+        )
+
+    reader.close()
+
+
+def test_ideaforge_get_idea_by_id_includes_scoring_rubric(ideaforge_test_db):
+    """get_idea_by_id must also return scoring_rubric.
+
+    The build gate's stale-snapshot-refresh path (build.py: run_from_queue)
+    pulls fresh fields via get_idea_by_id and merges them into the idea
+    dict; without scoring_rubric in this return shape, the refresh path
+    cannot restore the rubric for priority_queue snapshots that pre-dated
+    the rubric column.
+    """
+    reader = IdeaForgeReader(ideaforge_test_db)
+
+    # life_domain row
+    idea = reader.get_idea_by_id(1)
+    assert idea is not None
+    assert idea["scoring_rubric"] == "life_domain"
+
+    # tech row (get_idea_by_id has no status/rubric filter; returns whatever exists)
+    idea = reader.get_idea_by_id(10)
+    assert idea is not None
+    assert idea["scoring_rubric"] == "tech"
+
+    # NULL-rubric legacy row
+    idea = reader.get_idea_by_id(11)
+    assert idea is not None
+    assert idea["scoring_rubric"] is None
+
+    reader.close()
+
+
+@pytest.fixture
+def ideaforge_legacy_schema_db(tmp_path):
+    """IdeaForge schema WITHOUT scoring_rubric column.
+
+    Mirrors the upstream-DB state that exists before the IdeaForge schema
+    migration lands. Used to assert the reader's PRAGMA fallback works.
+    """
+    db_path = tmp_path / "ideaforge_legacy.db"
+    conn = sqlite3.connect(str(db_path))
+    conn.execute("""
+        CREATE TABLE ideas (
+            id INTEGER PRIMARY KEY,
+            title TEXT NOT NULL,
+            description TEXT,
+            problem_statement TEXT,
+            target_audience TEXT,
+            struggling_user TEXT,
+            weighted_score REAL,
+            opportunity_score REAL,
+            problem_score REAL,
+            feasibility_score REAL,
+            why_now_score REAL,
+            competition_score REAL,
+            artifact_type TEXT,
+            signal_count INTEGER,
+            status TEXT,
+            claimed_by TEXT,
+            claimed_at TEXT,
+            strategic_theme TEXT
+        )
+    """)
+    conn.execute("""
+        INSERT INTO ideas (
+            id, title, description, problem_statement, target_audience,
+            weighted_score, opportunity_score, problem_score, feasibility_score,
+            why_now_score, competition_score, artifact_type, signal_count, status
+        ) VALUES (
+            1, 'Legacy Idea', 'pre-rubric DB', 'p', 'aud',
+            8.0, 8.0, 8.0, 8.0, 8.0, 8.0, 'tool', 3, 'classified'
+        )
+    """)
+    conn.commit()
+    conn.close()
+    return str(db_path)
+
+
+def test_ideaforge_reader_falls_back_on_legacy_schema(ideaforge_legacy_schema_db):
+    """R-A item 3 / Codex Round 1 HIGH: when the upstream DB lacks the
+    scoring_rubric column, the reader must NOT raise OperationalError.
+    It falls back to a legacy query shape and returns the row(s) without
+    a scoring_rubric field.
+    """
+    reader = IdeaForgeReader(ideaforge_legacy_schema_db)
+
+    # MUST NOT raise.
+    ideas = reader.get_unprocessed_ideas()
+    assert len(ideas) == 1
+    assert ideas[0]["title"] == "Legacy Idea"
+    # Legacy fallback: no scoring_rubric key in the returned dict.
+    assert "scoring_rubric" not in ideas[0]
+
+    # get_idea_by_id also falls back.
+    idea = reader.get_idea_by_id(1)
+    assert idea is not None
+    assert "scoring_rubric" not in idea
 
     reader.close()
 

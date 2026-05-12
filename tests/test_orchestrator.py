@@ -1171,3 +1171,170 @@ class TestCLIQueue:
         assert result.returncode == 0
         assert "PRIORITY QUEUE" in result.stdout
         assert "Total items:" in result.stdout
+
+
+class TestQualityScoringForwardsRubric:
+    """R-A item 3 (2026-05-12): the quality-scoring step reads
+    build_jobs.scoring_rubric and forwards it to score_project."""
+
+    @staticmethod
+    def _seed_build(state_db, queue_job_id, project_dir, scoring_rubric=None):
+        """Insert a build_jobs row with the given rubric and project_dir."""
+        job = BuildJob(
+            idea_id=str(queue_job_id),
+            title=f"T-{queue_job_id}",
+            spec_path="/tmp/spec.txt",
+            queue_job_id=queue_job_id,
+            status="queued",
+            queued_at=datetime.now(),
+            scoring_rubric=scoring_rubric,
+        )
+        state_db.record_build_job(job)
+        # Now mark it completed + reviewed + attach project_dir
+        state_db.update_build_job_status(queue_job_id, "completed")
+        state_db.update_build_job_project_dir(queue_job_id, str(project_dir))
+        state_db.update_build_review_status(queue_job_id, "reviewed")
+
+    @staticmethod
+    def _review_pass_result(queue_job_id, title):
+        """Stub mimicking ReviewResult — duck-typed."""
+        r = MagicMock()
+        r.verdict = "pass"
+        r.queue_job_id = queue_job_id
+        r.title = title
+        return r
+
+    def test_orchestrator_forwards_life_domain_rubric(
+        self, orchestrator, state_db, tmp_path,
+    ):
+        """C3a: when build_jobs.scoring_rubric='life_domain', score_project
+        receives scoring_rubric='life_domain'."""
+        # Project dir: no agent shape -> life_domain gate would fire if real.
+        # We patch score_project so we only assert the kwarg.
+        project_dir = tmp_path / "proj_life"
+        project_dir.mkdir()
+        (project_dir / "README.md").write_text("hello")
+
+        self._seed_build(state_db, "build-life-1", project_dir,
+                         scoring_rubric="life_domain")
+
+        review_results = [self._review_pass_result("build-life-1", "T-life")]
+
+        with patch("orchestrator.score_project") as mock_score:
+            mock_breakdown = MagicMock()
+            mock_breakdown.total_score = 0.0
+            mock_breakdown.static_score = 0.0
+            mock_breakdown.source_file_count = 0
+            mock_breakdown.test_file_count = 0
+            mock_breakdown.category_failed = True
+            mock_breakdown.category_failure_reason = "missing_agent_yaml"
+            mock_score.return_value = mock_breakdown
+
+            scored = orchestrator._score_review_pass_builds(
+                review_results, dry_run=False,
+            )
+
+        assert scored == 1
+        assert mock_score.call_count == 1
+        # Assert via kwargs so positional/keyword equivalence is irrelevant.
+        _, kwargs = mock_score.call_args
+        assert kwargs.get("scoring_rubric") == "life_domain"
+
+    def test_orchestrator_forwards_none_rubric_when_null(
+        self, orchestrator, state_db, tmp_path,
+    ):
+        """C3b: NULL scoring_rubric -> score_project called with rubric=None
+        (backward-compat: pre-rubric rows must not be gated)."""
+        project_dir = tmp_path / "proj_null"
+        project_dir.mkdir()
+        (project_dir / "README.md").write_text("hi")
+        (project_dir / "main.py").write_text("print('hi')\n")
+
+        self._seed_build(state_db, "build-null-1", project_dir,
+                         scoring_rubric=None)
+
+        review_results = [self._review_pass_result("build-null-1", "T-null")]
+
+        with patch("orchestrator.score_project") as mock_score:
+            mock_breakdown = MagicMock()
+            mock_breakdown.total_score = 24.0
+            mock_breakdown.static_score = 24.0
+            mock_breakdown.source_file_count = 1
+            mock_breakdown.test_file_count = 0
+            mock_breakdown.category_failed = False
+            mock_breakdown.category_failure_reason = None
+            mock_score.return_value = mock_breakdown
+
+            scored = orchestrator._score_review_pass_builds(
+                review_results, dry_run=False,
+            )
+
+        assert scored == 1
+        assert mock_score.call_count == 1
+        _, kwargs = mock_score.call_args
+        assert kwargs.get("scoring_rubric") is None
+
+    def test_orchestrator_skips_when_project_dir_missing(
+        self, orchestrator, state_db, tmp_path,
+    ):
+        """C3d: rows where project_dir is missing or non-dir are skipped
+        with no score_project call and no DB update."""
+        # Seed a row whose project_dir points at a non-existent path.
+        bogus = tmp_path / "does_not_exist"
+        # We seed without calling update_build_job_project_dir to leave NULL.
+        job = BuildJob(
+            idea_id="404",
+            title="Phantom",
+            spec_path="/tmp/spec.txt",
+            queue_job_id="build-phantom",
+            status="queued",
+            queued_at=datetime.now(),
+            scoring_rubric="life_domain",
+        )
+        state_db.record_build_job(job)
+        state_db.update_build_job_status("build-phantom", "completed")
+
+        review_results = [self._review_pass_result("build-phantom", "T-phantom")]
+
+        with patch("orchestrator.score_project") as mock_score:
+            scored = orchestrator._score_review_pass_builds(
+                review_results, dry_run=False,
+            )
+
+        assert scored == 0
+        assert mock_score.call_count == 0
+
+    def test_orchestrator_dry_run_skips_db_write_but_still_calls_score(
+        self, orchestrator, state_db, tmp_path,
+    ):
+        """dry_run=True: score_project still invoked (so we can observe the
+        gate via audit log), but update_build_quality_score is NOT called."""
+        project_dir = tmp_path / "proj_dry"
+        project_dir.mkdir()
+        (project_dir / "README.md").write_text("x")
+
+        self._seed_build(state_db, "build-dry-1", project_dir,
+                         scoring_rubric="life_domain")
+
+        review_results = [self._review_pass_result("build-dry-1", "T-dry")]
+
+        with patch("orchestrator.score_project") as mock_score, \
+             patch.object(state_db, "update_build_quality_score") as mock_update:
+            mock_breakdown = MagicMock()
+            mock_breakdown.total_score = 0.0
+            mock_breakdown.static_score = 0.0
+            mock_breakdown.source_file_count = 0
+            mock_breakdown.test_file_count = 0
+            mock_breakdown.category_failed = True
+            mock_breakdown.category_failure_reason = "missing_agent_yaml"
+            mock_score.return_value = mock_breakdown
+            # Re-bind the state_db on orchestrator to the patched one
+            orchestrator.state_db = state_db
+
+            scored = orchestrator._score_review_pass_builds(
+                review_results, dry_run=True,
+            )
+
+        assert scored == 1
+        assert mock_score.call_count == 1
+        mock_update.assert_not_called()

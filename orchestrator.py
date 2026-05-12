@@ -672,6 +672,71 @@ class CycleOrchestrator:
 
         return result
 
+    def _score_review_pass_builds(self, review_results, dry_run: bool = False) -> int:
+        """Score builds that passed the review gate.
+
+        Extracted from run_cycle (Phase 14b inline loop) for testability and
+        to centralize the scoring_rubric forwarding (R-A item 3, 2026-05-12).
+
+        For each review result with verdict='pass':
+          1. Look up the build_jobs row by queue_job_id.
+          2. Skip rows missing project_dir or where the dir does not exist.
+          3. Read scoring_rubric from the build row (NULL -> no rubric arg
+             effect; passed through as None which score_project short-circuits).
+          4. Call score_project(project_dir, scoring_rubric=rubric).
+          5. Persist the resulting total_score (unless dry_run).
+          6. Emit an audit-log decision with quality_score, breakdown, and
+             — when the life_domain category gate fired —
+             category_failure_reason for operator visibility.
+
+        Args:
+            review_results: Iterable of review results (objects with
+                .verdict, .queue_job_id, .title attributes).
+            dry_run: If True, skip DB writes (audit-log still emits).
+
+        Returns:
+            Number of builds for which scoring was actually attempted
+            (i.e. had a project_dir on disk).
+        """
+        scored_builds = 0
+        for r in review_results:
+            if r.verdict != "pass":
+                continue
+            build = self.state_db.get_build_by_queue_job_id(r.queue_job_id)
+            if not build or not build.get("project_dir"):
+                continue
+            project_dir = Path(build["project_dir"])
+            if not project_dir.is_dir():
+                continue
+
+            # R-A item 3: read scoring_rubric from the build row and forward
+            # it to the scorer. NULL -> None -> backward-compat (no gate).
+            # 'life_domain' -> gate fires when agent shape is missing.
+            # 'tech' -> gate bypassed (publish-path safe).
+            rubric = build.get("scoring_rubric") if isinstance(build, dict) else None
+            breakdown = score_project(project_dir, scoring_rubric=rubric)
+            if not dry_run:
+                self.state_db.update_build_quality_score(
+                    r.queue_job_id, breakdown.total_score,
+                )
+            scored_builds += 1
+            self.audit_logger.log_decision(
+                gate="quality",
+                action="scored",
+                details={
+                    "queue_job_id": r.queue_job_id,
+                    "title": r.title,
+                    "quality_score": breakdown.total_score,
+                    "static_score": breakdown.static_score,
+                    "source_files": breakdown.source_file_count,
+                    "test_files": breakdown.test_file_count,
+                    "scoring_rubric": rubric,
+                    "category_failed": breakdown.category_failed,
+                    "category_failure_reason": breakdown.category_failure_reason,
+                },
+            )
+        return scored_builds
+
     def run_cycle(self, dry_run: bool = False) -> CycleResult:
         """
         Run a single Metroplex cycle: intake -> triage -> build -> patch.
@@ -1122,36 +1187,9 @@ class CycleOrchestrator:
         # Quality scoring (Phase 14b) — score builds that passed review
         if review_count > 0:
             try:
-                scored_builds = 0
-                for r in review_results:
-                    if r.verdict != "pass":
-                        continue
-                    build = self.state_db.get_build_by_queue_job_id(r.queue_job_id)
-                    if not build or not build.get("project_dir"):
-                        continue
-                    project_dir = Path(build["project_dir"])
-                    if not project_dir.is_dir():
-                        continue
-
-                    breakdown = score_project(project_dir)
-                    if not dry_run:
-                        self.state_db.update_build_quality_score(
-                            r.queue_job_id, breakdown.total_score,
-                        )
-                    scored_builds += 1
-                    self.audit_logger.log_decision(
-                        gate="quality",
-                        action="scored",
-                        details={
-                            "queue_job_id": r.queue_job_id,
-                            "title": r.title,
-                            "quality_score": breakdown.total_score,
-                            "static_score": breakdown.static_score,
-                            "source_files": breakdown.source_file_count,
-                            "test_files": breakdown.test_file_count,
-                        },
-                    )
-
+                scored_builds = self._score_review_pass_builds(
+                    review_results, dry_run=dry_run,
+                )
                 if scored_builds > 0:
                     print(f"+ Quality scored: {scored_builds} builds")
             except Exception as e:
