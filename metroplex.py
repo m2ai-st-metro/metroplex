@@ -158,15 +158,6 @@ def initialize_components(config: Config):
     # Initialize dispatcher for non-buildable queue items (Sky-Lynx -> ClaudeClaw)
     dispatcher = create_dispatcher(config.dispatch_db, config.dispatch_chat_id)
 
-    # Initialize A2A server manager (if using A2A or auto dispatch)
-    a2a_manager = None
-    if config.build_target in ("a2a", "auto"):
-        from a2a_lifecycle import A2AServerManager
-        a2a_manager = A2AServerManager(
-            yce_dir=config.yce_dir,
-            server_url=config.a2a_server_url,
-        )
-
     # Initialize orchestrator
     orchestrator = CycleOrchestrator(
         config=config,
@@ -187,7 +178,6 @@ def initialize_components(config: Config):
         event_emitter=event_emitter,
         readme_gate=readme_gate,
         readiness_gate=readiness_gate,
-        a2a_manager=a2a_manager,
     )
 
     return orchestrator, state_db, circuit_breaker
