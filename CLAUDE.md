@@ -20,7 +20,7 @@ All API keys sourced from `~/.env.shared` — no separate `.env` needed.
 ```bash
 source venv/bin/activate
 python metroplex.py triage [--dry-run]                          # Gate 1: score & threshold
-python metroplex.py build [--dry-run] [--idea-id N]             # Gate 2: spec + YCE dispatch
+python metroplex.py build [--dry-run] [--idea-id N]             # Gate 2: spec + adapter dispatch
 python metroplex.py publish [--dry-run]                         # Gate 4: GitHub repo push
 ```
 
@@ -75,7 +75,7 @@ Service unit: `deploy/metroplex.service` — runs `run-all --cycles 0` with `Res
 | Gate | Class | Purpose |
 |------|-------|---------|
 | 1 Triage | `gates/triage.py` | Score IdeaForge ideas against thresholds, approve/reject/defer |
-| 2 Build | `gates/build.py` | Generate spec via LLM, dispatch to YCE Harness |
+| 2 Build | `gates/build.py` | Generate spec via LLM, dispatch via the configured BuildAdapter (SelfHealing or Oz) |
 | 4 Publish | `gates/publish.py` | Create repos on configured hosts (GitHub `m2ai-portfolio` org and/or GitLab `m2ai-portfolio` group), push completed builds. First entry in `publish_targets` is primary; subsequent entries are mirrors (their URLs go in `publish_jobs.mirror_urls`, per-target outcome in `targets_status`). |
 | 4.5 Review | `gates/review.py` | Automated quality checks before publish (source code, README, no secrets, no large files) |
 
@@ -92,9 +92,18 @@ All approved/recommended items compete via weighted scores:
 - IdeaForge: weight 1.0
 - Sky-Lynx: weight 1.5
 
-### YCE Dispatch
+### Build Adapter Dispatch
 
-Build gate generates an app spec via LLM, then dispatches to YCE Harness for autonomous build. Timeout watchdog kills builds after 90 min (configurable: `METROPLEX_BUILD_TIMEOUT_SECONDS`).
+Build gate generates an app spec via LLM, then dispatches via the configured BuildAdapter selected by `METROPLEX_BUILD_TARGET`. Valid targets:
+
+| Target | Adapter | Runtime |
+|--------|---------|---------|
+| `self_healing` (default) | `SelfHealingAdapter` | Long-running Claude Code daemon processing the `/self-healing-pipeline` skill |
+| `cloud` | `OzAdapter` | Oz cloud agent via `oz_bridge.submit_to_oz()` |
+
+Legacy targets (`local` yce-harness queue_runner, `a2a` Google A2A protocol via `yce-harness/a2a_server.py`, `auto` a2a/local fallback chain) were retired in CLEANUP-B 2026-05-12. The Google A2A path never dispatched a production build; CCOS / ClaudeClaw owns inter-agent communication via its own `delegateToAgent` primitive.
+
+Timeout watchdog kills builds after 90 min (configurable: `METROPLEX_BUILD_TIMEOUT_SECONDS`).
 
 ### Auto-Retry (Phase 13f)
 
@@ -128,8 +137,7 @@ Non-buildable items routed to EA-Claude workers via `WORKER_ROUTES` dict. Writes
 |------|---------|
 | `data/decisions.log` | JSON Lines audit trail (every gate action) |
 | `data/metroplex.log` | Python logging output |
-| `data/runner.log` | YCE queue_runner subprocess output |
-| `data/build_logs/` | Per-build YCE dispatch logs (timestamped) |
+| `data/build_logs/` | Per-build dispatch logs (timestamped) |
 | `data/specs/` | Generated app spec files |
 
 ## Key Environment Variables
@@ -174,9 +182,9 @@ After changing any of these, restart the metroplex service (`systemctl --user re
 ## Design Decisions
 
 1. **No cross-project imports** — reads upstream SQLite directly, no IdeaForge/ST Records code imports
-2. **Subprocess isolation** — YCE builds and git ops run as subprocesses, never in-process
+2. **Subprocess isolation** — git ops run as subprocesses, never in-process
 3. **Score scaling** — IdeaForge 0-10 scaled to 0-100 for threshold intuition (guard validates range)
-4. **Fire-and-forget builds** — YCE dispatch subprocess; results polled on next cycle
+4. **Fire-and-forget builds** — BuildAdapter dispatches asynchronously; results polled on next cycle
 5. **Per-cycle caps** — hard limits prevent runaway autonomy
 6. **Circuit breaker per-gate** — one gate failure doesn't halt others
 
@@ -208,26 +216,6 @@ sqlite3 data/metroplex.db "
   FROM build_jobs
   WHERE status = 'failed'
   ORDER BY queued_at DESC LIMIT 20;"
-```
-
-### Cleaning YCE queue.json
-
-The YCE queue runner reads `data/yce_queue/queue.json`. Stale entries accumulate when builds are killed or time out.
-
-```bash
-# Inspect current queue
-cat data/yce_queue/queue.json | python3 -m json.tool
-
-# Remove a specific stale entry (replace JOB_ID)
-python3 -c "
-import json
-with open('data/yce_queue/queue.json') as f: q = json.load(f)
-q = [j for j in q if j.get('job_id') != 'JOB_ID']
-with open('data/yce_queue/queue.json', 'w') as f: json.dump(q, f, indent=2)
-"
-
-# Nuclear option: empty the queue (builds in progress will orphan)
-echo '[]' > data/yce_queue/queue.json
 ```
 
 ### Recovering Abandoned Builds
@@ -405,6 +393,6 @@ journalctl --user -u metroplex -n 100 --no-pager
 # Check decision audit log
 tail -20 data/decisions.log | python3 -m json.tool
 
-# Check for orphan build processes
-ps aux | grep queue_runner
+# Check the self-healing daemon heartbeat
+stat -c '%Y %n' data/self_healing_queue/heartbeat-worker-1.txt
 ```

@@ -155,13 +155,11 @@ class TestConfigValidation:
         config = Config()
         config.ideaforge_db = "/nonexistent/path.db"
         config.st_records_db = "/nonexistent/path3.db"
-        config.yce_dir = "/nonexistent/dir"
 
         warnings = config.validate()
-        assert len(warnings) >= 3
+        assert len(warnings) >= 2
         assert any("IdeaForge DB" in w for w in warnings)
         assert any("ST Records DB" in w for w in warnings)
-        assert any("YCE directory" in w for w in warnings)
 
     def test_validate_approve_below_reject(self):
         config = Config()
@@ -191,7 +189,6 @@ class TestConfigValidation:
         config = Config()
         config.ideaforge_db = str(db_file)
         config.st_records_db = str(db_file)
-        config.yce_dir = str(tmp_path)
 
         warnings = config.validate()
         # Only threshold-related warnings should remain (none if defaults)

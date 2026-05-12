@@ -341,7 +341,7 @@ def find_orphan_processes(metroplex_pid: int) -> list[tuple[int, str]]:
 
     # Patterns that are legitimate Metroplex processes (never kill)
     safe_patterns = (
-        "metroplex.py", "queue_runner",
+        "metroplex.py",
     )
 
     cgroup_procs = Path(

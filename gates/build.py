@@ -1,14 +1,12 @@
 """
 Build Gate - Gate 2
 Generates specs from approved ideas via LLM, runs Tyrest pre-build
-review, then dispatches to YCE Harness for autonomous building.
+review, then dispatches to the configured BuildAdapter for autonomous building.
 """
 import json
 import logging
 import os
-import signal
 import sys
-import subprocess
 from pathlib import Path
 from typing import Optional
 from datetime import datetime
@@ -210,14 +208,18 @@ class BuildOrchestrator:
         self.spec_generator = spec_generator
         self.audit_logger = audit_logger
         self.ideaforge_reader = ideaforge_reader
+        if adapter is None:
+            raise ValueError(
+                "BuildOrchestrator requires a BuildAdapter; the inline "
+                "yce-harness subprocess fallback was removed in CLEANUP-B "
+                "(2026-05-12). Construct with one of: SelfHealingAdapter, "
+                "OzAdapter."
+            )
         self.adapter = adapter
-        self.queue_runner_path = Path(config.yce_dir) / "queue_runner.py"
-        self.yce_python = Path(config.yce_dir) / "venv" / "bin" / "python"
 
     def queue_build(self, idea: dict, spec_path: Path, dry_run: bool = False, attempt: int = 0) -> BuildJob | None:
         """
-        Queue a build job. Delegates to adapter if available, otherwise
-        falls back to inline subprocess logic.
+        Queue a build job via the configured BuildAdapter.
 
         Args:
             idea: Idea dictionary with id and title
@@ -241,7 +243,6 @@ class BuildOrchestrator:
 
         if (
             self.config.build_target == "self_healing"
-            and self.adapter is not None
             and not self.adapter.is_active()
         ):
             logger.warning(
@@ -253,48 +254,16 @@ class BuildOrchestrator:
             )
             return None
 
-        if self.adapter is not None:
-            # Delegate to pluggable adapter
-            result = self.adapter.queue(
-                spec_path=spec_path,
-                job_id=job_id,
-                model=self.config.build_model,
-                parallel=self.config.build_parallel,
-                max_workers=self.config.build_max_workers,
-            )
-            status = result.status
-            error_msg = result.error
-        else:
-            # Inline subprocess fallback (original implementation)
-            command = [
-                str(self.yce_python),
-                str(self.queue_runner_path),
-                "add",
-                str(spec_path.resolve()),
-                "--id",
-                job_id,
-                "--model",
-                self.config.build_model,
-            ]
-            if self.config.build_parallel:
-                command.append("--parallel")
-                command.extend(["--max-workers", str(self.config.build_max_workers)])
-
-            try:
-                proc_result = subprocess.run(
-                    command, capture_output=True, text=True, timeout=30
-                )
-                if proc_result.returncode == 0:
-                    status = "queued"
-                else:
-                    status = "failed"
-                    error_msg = proc_result.stderr.strip() or proc_result.stdout.strip() or "Unknown error"
-            except subprocess.TimeoutExpired:
-                status = "failed"
-                error_msg = "queue_build command timed out after 30 seconds"
-            except Exception as e:
-                status = "failed"
-                error_msg = f"Unexpected error queuing build: {e}"
+        # Delegate to pluggable adapter
+        result = self.adapter.queue(
+            spec_path=spec_path,
+            job_id=job_id,
+            model=self.config.build_model,
+            parallel=self.config.build_parallel,
+            max_workers=self.config.build_max_workers,
+        )
+        status = result.status
+        error_msg = result.error
 
         # R-A item 3: propagate scoring_rubric from ideas.scoring_rubric onto
         # build_jobs so the orchestrator and CLI score callers can pass it
@@ -326,25 +295,11 @@ class BuildOrchestrator:
         return job
 
     def is_runner_active(self) -> bool:
-        """Check if a queue_runner process is still running from a previous dispatch."""
-        if self.adapter is not None:
-            return self.adapter.is_active()
-        if not RUNNER_PID_FILE.exists():
-            return False
-        try:
-            pid = int(RUNNER_PID_FILE.read_text().strip())
-            os.kill(pid, 0)  # Signal 0 = check if process exists
-            return True
-        except (ValueError, ProcessLookupError, PermissionError):
-            # Stale PID file -- clean up
-            RUNNER_PID_FILE.unlink(missing_ok=True)
-            return False
+        """Check if the build adapter's runner is alive."""
+        return self.adapter.is_active()
 
     def start_queue_background(self, dry_run: bool = False) -> bool:
-        """
-        Start queue_runner.py as a background process (non-blocking).
-        Stores PID in data/runner.pid for later monitoring.
-        Delegates to adapter if available.
+        """Start the build adapter's runner (non-blocking).
 
         Args:
             dry_run: If True, print command without executing
@@ -353,153 +308,18 @@ class BuildOrchestrator:
             True if started, False otherwise
         """
         concurrency = self.config.max_concurrent_builds
-
         if dry_run:
             print(f"[DRY RUN] Would start queue runner (concurrency={concurrency})")
             return True
-
-        if self.adapter is not None:
-            return self.adapter.start(concurrency)
-
-        command = [
-            str(self.yce_python),
-            str(self.queue_runner_path),
-            "start",
-            "--concurrency",
-            str(concurrency),
-        ]
-
-        if self.is_runner_active():
-            print("Queue runner already active, skipping start")
-            return True
-
-        try:
-            log_path = Path(__file__).parent.parent / "data" / "runner.log"
-            log_path.parent.mkdir(parents=True, exist_ok=True)
-            log_file = open(log_path, "a")
-
-            proc = subprocess.Popen(
-                command,
-                stdout=log_file,
-                stderr=subprocess.STDOUT,
-                cwd=str(Path(self.config.yce_dir)),
-                start_new_session=True,  # Detach from parent process group
-            )
-
-            # Write PID for later monitoring
-            RUNNER_PID_FILE.parent.mkdir(parents=True, exist_ok=True)
-            RUNNER_PID_FILE.write_text(str(proc.pid))
-
-            self.audit_logger.log_decision(
-                gate="build",
-                action="start_queue_background",
-                details={"pid": proc.pid, "log": str(log_path)}
-            )
-            print(f"Queue runner started (PID {proc.pid})")
-            return True
-
-        except Exception as e:
-            self.audit_logger.log_error(
-                gate="build",
-                error=f"Failed to start queue runner: {str(e)}",
-                details={}
-            )
-            return False
-
-    def start_queue(self, dry_run: bool = False) -> bool:
-        """
-        Start the queue runner (blocking, kept for backward compatibility / CLI use).
-
-        Args:
-            dry_run: If True, print command without executing
-
-        Returns:
-            True if successful, False otherwise
-        """
-        command = [
-            str(self.yce_python),
-            str(self.queue_runner_path),
-            "start"
-        ]
-
-        if dry_run:
-            print(f"[DRY RUN] Would execute: {' '.join(command)}")
-            return True
-
-        try:
-            result = subprocess.run(
-                command,
-                capture_output=True,
-                text=True,
-                timeout=None  # Long-running process
-            )
-
-            if result.returncode == 0:
-                self.audit_logger.log_decision(
-                    gate="build",
-                    action="start_queue",
-                    details={"status": "success"}
-                )
-                return True
-            else:
-                error_msg = result.stderr.strip() or result.stdout.strip() or "Unknown error"
-                self.audit_logger.log_error(
-                    gate="build",
-                    error=f"Failed to start queue: {error_msg}",
-                    details={"returncode": result.returncode}
-                )
-                return False
-
-        except Exception as e:
-            self.audit_logger.log_error(
-                gate="build",
-                error=f"Failed to start queue: {str(e)}",
-                details={}
-            )
-            return False
+        return self.adapter.start(concurrency)
 
     def check_status(self) -> dict:
-        """
-        Check queue status. Delegates to adapter if available.
+        """Check the build adapter's queue status.
 
         Returns:
             Parsed status dict, or empty dict on error
         """
-        if self.adapter is not None:
-            return self.adapter.poll()
-
-        command = [
-            str(self.yce_python),
-            str(self.queue_runner_path),
-            "status",
-            "--json"
-        ]
-
-        try:
-            result = subprocess.run(
-                command,
-                capture_output=True,
-                text=True,
-                timeout=30
-            )
-
-            if result.returncode == 0:
-                return json.loads(result.stdout)
-            else:
-                self.audit_logger.log_error(
-                    gate="build",
-                    error="Failed to check queue status",
-                    details={"returncode": result.returncode}
-                )
-                return {}
-
-        except Exception as e:
-            self.audit_logger.log_error(
-                gate="build",
-                error=f"Failed to check queue status: {str(e)}",
-                details={}
-            )
-            return {}
+        return self.adapter.poll()
 
     def _record_build_session(self, job_id: str, project_dir: str) -> None:
         """Record a session snapshot after a build reaches terminal state.
@@ -648,7 +468,7 @@ class BuildOrchestrator:
 
     def poll_and_sync_status(self) -> dict:
         """
-        Poll queue_runner status and sync completed/failed jobs back to metroplex DB.
+        Poll the build adapter status and sync completed/failed jobs back to metroplex DB.
 
         Writes terminal statuses (completed/failed) back to both build_jobs
         and priority_queue tables so dispatched items don't stay stuck forever.
@@ -746,75 +566,20 @@ class BuildOrchestrator:
 
         result["running_count"] = len(result["running"])
 
-        # Filesystem fallback: detect orphaned builds where the queue_runner
-        # shows "pending" but a completed generation directory already exists.
-        # This covers the case where the runner process was killed before it
-        # could persist completion status back to queue.json.
-        yce_generations = Path(self.config.yce_dir) / "generations"
-        for job_data in status["jobs"]:
-            job_status = job_data.get("status", "")
-            job_id = job_data.get("id", "")
-            if job_status == "pending" and job_id and not job_data.get("project_dir"):
-                candidate_dir = yce_generations / job_id
-                if candidate_dir.is_dir() and self._has_source_code(candidate_dir):
-                    try:
-                        changed = self.state_db.update_build_job_status(job_id, "completed")
-                        if changed:
-                            logger.info(
-                                "Filesystem fallback: detected orphaned completed build for %s at %s",
-                                job_id, candidate_dir,
-                            )
-                            result["newly_synced"].append(job_id)
-                            self.state_db.update_build_job_project_dir(job_id, str(candidate_dir))
-                            result["completed"].append(job_id)
-                            self.audit_logger.log_decision(
-                                gate="build",
-                                action="filesystem_fallback_sync",
-                                details={
-                                    "job_id": job_id,
-                                    "project_dir": str(candidate_dir),
-                                },
-                            )
-                    except Exception as e:
-                        self.audit_logger.log_error(
-                            gate="build",
-                            error=f"Failed filesystem fallback sync for {job_id}: {e}",
-                            details={"job_id": job_id},
-                        )
-
-        # Fix C: Before checking for stale queued builds, read the YCE
-        # queue.json directly to find jobs the runner is ACTIVELY working on.
-        # Without this, a build that just transitioned to running in YCE but
-        # hasn't been picked up by this poll's `check_status()` snapshot could
-        # still be classified stale and marked abandoned.  Excluding these
-        # IDs from the stale check prevents that race.
+        # CLEANUP-B (2026-05-12): the yce-harness filesystem-fallback paths
+        # that previously lived here (orphan-detection by scanning
+        # yce-harness/generations/, plus stale-exclusion by reading
+        # yce-harness/data/queue.json directly) were retired with yce-harness.
+        # SelfHealingAdapter and OzAdapter both write project_dir back via
+        # their own status update paths, so the orphan recovery the
+        # filesystem fallback covered no longer happens. If a future
+        # adapter needs equivalent stale-exclusion, expose it via
+        # `adapter.poll()` rather than reaching into adapter-specific
+        # on-disk state from BuildOrchestrator.
         excluded_running_jobs: set[str] = set()
-        try:
-            yce_queue_path = Path(self.config.yce_dir) / "data" / "queue.json"
-            if yce_queue_path.exists():
-                with open(yce_queue_path, "r", encoding="utf-8") as f:
-                    yce_data = json.load(f)
-                # YCE's queue.json is {"version": N, "jobs": [...]}; older
-                # fixtures and tests used a bare list. Handle both shapes.
-                yce_jobs = (
-                    yce_data.get("jobs", [])
-                    if isinstance(yce_data, dict)
-                    else yce_data
-                )
-                for yj in yce_jobs:
-                    if yj.get("status") in ("running", "pending"):
-                        yjid = yj.get("job_id") or yj.get("id")
-                        if yjid:
-                            excluded_running_jobs.add(yjid)
-        except Exception as e:
-            self.audit_logger.log_error(
-                gate="build",
-                error=f"Failed to read YCE queue.json for stale exclusion: {e}",
-                details={},
-            )
 
         # Stale queued build recovery: detect builds stuck in 'queued' status
-        # where priority_queue says 'dispatched' but the YCE runner never picked
+        # where priority_queue says 'dispatched' but the runner never picked
         # them up.  Reset to 'pending' so the next cycle re-dispatches.
         try:
             stale_builds = self.state_db.get_stale_queued_builds(
@@ -920,7 +685,7 @@ class BuildOrchestrator:
                 })
 
             self.state_db.record_cost(
-                source="yce_build",
+                source="adapter_build",
                 model=model_used,
                 input_tokens=input_tokens,
                 output_tokens=output_tokens,
@@ -1020,10 +785,10 @@ class BuildOrchestrator:
 
     def run_from_queue(self, state_db: StateDB, dry_run: bool = False) -> list[BuildJob]:
         """
-        Pull items from the priority queue, generate specs, and dispatch to YCE.
+        Pull items from the priority queue, generate specs, and dispatch via the adapter.
 
         Flow: pull pending idea → generate spec (LLMSpecExpander) → Tyrest
-        pre-build review → queue YCE build → start runner.
+        pre-build review → queue build via adapter → start adapter runner.
 
         Args:
             state_db: StateDB instance (for priority queue access)
@@ -1343,7 +1108,7 @@ class BuildOrchestrator:
                 jobs.append(job)
                 current_job = job
             else:
-                # Local build: generate spec → queue YCE
+                # Adapter build: generate spec → queue via BuildAdapter
                 try:
                     output_dir = Path(__file__).parent.parent / "data" / "specs"
                     spec_path = self.spec_generator.generate_spec(
@@ -1354,7 +1119,7 @@ class BuildOrchestrator:
                     if attempt > 0 and not dry_run:
                         self._inject_session_context(base_job_id, attempt, spec_path)
 
-                    # Queue build via YCE queue_runner
+                    # Queue build via the configured adapter
                     job = self.queue_build(idea, spec_path, dry_run=dry_run, attempt=attempt)
                     if job is None:
                         # Skip dispatch (e.g., self-healing daemon down). Release the
@@ -1417,7 +1182,7 @@ class BuildOrchestrator:
                     "job_id": job_id,
                     "title": idea["title"],
                     "status": current_job.status if current_job is not None else "unknown",
-                    "route": "oz-cloud" if oz_run_id else "yce-local",
+                    "route": "oz-cloud" if oz_run_id else "adapter",
                 },
             )
 
@@ -1431,7 +1196,7 @@ class BuildOrchestrator:
         if not jobs:
             print("No pending items in priority queue")
 
-        # Start YCE queue runner if any jobs were queued
+        # Start the adapter's runner if any jobs were queued
         if not dry_run and queued_jobs:
             self.start_queue_background(dry_run=dry_run)
 

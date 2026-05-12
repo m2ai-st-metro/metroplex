@@ -897,10 +897,6 @@ class StateDB:
             )
         changed = cursor.rowcount > 0
 
-        # Discover and set project_dir if not already set
-        if status in ("completed", "failed"):
-            self._backfill_project_dir(cursor, queue_job_id)
-
         # Parse queue_job_id to extract source and source_id
         # Strip -rN retry suffix before parsing
         base_id = re.sub(r'-r\d+$', '', queue_job_id)
@@ -1000,46 +996,6 @@ class StateDB:
 
         self.conn.commit()
         return True
-
-    def _backfill_project_dir(self, cursor, queue_job_id: str) -> None:
-        """Discover and set project_dir on a build_job if not already set.
-
-        Searches YCE generations directory for both naming conventions:
-        1. Directory named after queue_job_id (e.g., metroplex-ideaforge-43/)
-        2. um-{title}-{uuid} pattern (UM bridge naming)
-        """
-        from pathlib import Path as _Path
-
-        # Check if project_dir already set
-        cursor.execute(
-            "SELECT project_dir FROM build_jobs WHERE queue_job_id = ?",
-            (queue_job_id,),
-        )
-        row = cursor.fetchone()
-        if not row or (row["project_dir"] and row["project_dir"].strip()):
-            return
-
-        yce_generations = _Path(__file__).parent.parent / "yce-harness" / "generations"
-        if not yce_generations.is_dir():
-            return
-
-        # Convention 1: directory named after queue_job_id
-        candidate = yce_generations / queue_job_id
-        if candidate.is_dir():
-            cursor.execute(
-                "UPDATE build_jobs SET project_dir = ? WHERE queue_job_id = ?",
-                (str(candidate), queue_job_id),
-            )
-            return
-
-        # Convention 2: scan for any directory containing the queue_job_id as substring
-        for entry in yce_generations.iterdir():
-            if entry.is_dir() and queue_job_id in entry.name:
-                cursor.execute(
-                    "UPDATE build_jobs SET project_dir = ? WHERE queue_job_id = ?",
-                    (str(entry), queue_job_id),
-                )
-                return
 
     # --- Review Gate (Phase 13c) ---
 

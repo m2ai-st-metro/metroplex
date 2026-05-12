@@ -35,9 +35,6 @@ class Config:
     um_db: str = field(default="")  # Deprecated: UM removed from pipeline (2026-03-15)
     st_records_db: str = field(default="/home/apexaipc/projects/st-records/data/persona_metrics.db")
 
-    # Directory paths
-    yce_dir: str = field(default="/home/apexaipc/projects/yce-harness")
-
     # Model settings
     build_model: str = field(default="opus")
 
@@ -139,7 +136,6 @@ class Config:
         self.ideaforge_db = os.environ.get("METROPLEX_IDEAFORGE_DB", self.ideaforge_db)
         self.um_db = os.environ.get("METROPLEX_UM_DB", self.um_db)
         self.st_records_db = os.environ.get("METROPLEX_ST_RECORDS_DB", self.st_records_db)
-        self.yce_dir = os.environ.get("METROPLEX_YCE_DIR", self.yce_dir)
         self.build_model = os.environ.get("METROPLEX_BUILD_MODEL", self.build_model)
 
         # Parallel build settings
@@ -307,10 +303,10 @@ class Config:
         except ValueError:
             pass
 
-        # Oz Cloud Agent settings
+        # Build target settings (post-CLEANUP-B: cloud or self_healing only)
         self.build_target = os.environ.get("METROPLEX_BUILD_TARGET", self.build_target)
-        if self.build_target not in ("local", "cloud", "self_healing"):
-            self.build_target = "local"
+        if self.build_target not in ("cloud", "self_healing"):
+            self.build_target = "self_healing"
         self.self_healing_workspace_root = os.environ.get(
             "METROPLEX_SELF_HEALING_WORKSPACE_ROOT",
             getattr(self, "self_healing_workspace_root", ""),
@@ -340,10 +336,6 @@ class Config:
             if not Path(path).exists():
                 warnings.append(f"{name} not found at {path}")
 
-        # Check yce_dir
-        if not Path(self.yce_dir).exists():
-            warnings.append(f"YCE directory not found at {self.yce_dir}")
-
         # Validate thresholds
         if self.approve_threshold <= self.reject_threshold:
             warnings.append(f"approve_threshold ({self.approve_threshold}) must be > reject_threshold ({self.reject_threshold})")
@@ -366,8 +358,8 @@ class Config:
     ratchet_stale_cycles: int = field(default=100)  # Unchanged cycles before decay triggers
     ratchet_decay_amount: float = field(default=0.5)  # How much to loosen per decay step
 
-    # Oz Cloud Agent settings
-    build_target: str = field(default="local")  # local|cloud|self_healing
+    # Build target settings (post-CLEANUP-B 2026-05-12: cloud or self_healing only)
+    build_target: str = field(default="self_healing")  # cloud|self_healing
     oz_environment_id: str = field(default="")
     oz_build_model: str = field(default="claude-sonnet-4-6")
 

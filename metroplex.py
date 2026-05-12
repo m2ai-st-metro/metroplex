@@ -486,9 +486,9 @@ def cmd_status(args, config: Config):
                 if queue.get(s, 0) > 0:
                     print(f"  {s.capitalize()}: {queue[s]}")
 
-        # Runner status
+        # Build adapter runner status
         runner = status.get("runner_active", False)
-        print(f"\nYCE Runner: {'ACTIVE' if runner else 'idle'}")
+        print(f"\nBuild Runner: {'ACTIVE' if runner else 'idle'}")
 
         # Schedule
         sched = status.get("schedule", {})

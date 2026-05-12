@@ -89,7 +89,7 @@ All settings via environment variables (prefix `METROPLEX_`). Set in `~/.env.sha
 | `METROPLEX_IDEAFORGE_DB` | `.../ideaforge/data/ideaforge.db` | IdeaForge database path |
 | `METROPLEX_UM_DB` | `.../ultra-magnus/.../idea-factory.db` | Ultra-Magnus database path |
 | `METROPLEX_ST_RECORDS_DB` | `.../st-records/data/persona_metrics.db` | ST Records database path |
-| `METROPLEX_YCE_DIR` | `.../yce-harness` | YCE Harness directory |
+| `METROPLEX_BUILD_TARGET` | `self_healing` | Build adapter selector: `self_healing` (Claude Code daemon) or `cloud` (Oz). |
 | `METROPLEX_BUILD_MODEL` | `opus` | Claude model for spec generation |
 | `METROPLEX_APPROVE_THRESHOLD` | `70` | Score threshold for approval (0-100) |
 | `METROPLEX_REJECT_THRESHOLD` | `40` | Score threshold for rejection (0-100) |
