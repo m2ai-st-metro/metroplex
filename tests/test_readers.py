@@ -27,6 +27,7 @@ def ideaforge_test_db():
             description TEXT,
             problem_statement TEXT,
             target_audience TEXT,
+            struggling_user TEXT,
             weighted_score REAL,
             opportunity_score REAL,
             problem_score REAL,
