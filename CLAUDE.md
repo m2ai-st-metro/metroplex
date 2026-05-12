@@ -193,7 +193,6 @@ After changing any of these, restart the metroplex service (`systemctl --user re
 
 ```
 pydantic>=2.0
-jinja2
 pyyaml
 pytest
 arcadepy

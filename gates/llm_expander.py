@@ -1,7 +1,6 @@
 """
 LLM Spec Expander - Gate 2 Enhancement
-Calls Claude (via DeepInfra) to expand thin IdeaForge idea data into rich, idea-specific app specs.
-Falls back to Jinja2 template rendering on failure.
+Calls Claude (via DeepInfra) to expand thin IdeaForge idea data into rich, idea-specific agent specs.
 Injects past build failure patterns as constraints to improve spec quality over time.
 """
 import os

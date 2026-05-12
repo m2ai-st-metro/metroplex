@@ -110,7 +110,7 @@ IdeaForge (signals+scores) ──→ Gate 1: Triage ──→ approve/reject/def
                                                         │
                                                         ▼
                                           Gate 2: Spec Gen + Build
-                                          Jinja2 template → app spec
+                                          LLM expander → agent spec
                                           queue_runner.py subprocess
                                                         │
 ST Records (persona_patches) ──→ Gate 3: Patcher ──→ git clone/commit/push
@@ -147,4 +147,4 @@ ST Records (persona_patches) ──→ Gate 3: Patcher ──→ git clone/commi
 | `readers/ideaforge_reader.py` | IdeaForge SQLite (read-only) |
 | `readers/st_records_reader.py` | ST Records SQLite (read + patch status write) |
 | `readers/um_reader.py` | Ultra-Magnus SQLite (read-only) |
-| `spec_templates/app_spec_template.md` | Jinja2 template for generated specs |
+| `spec_templates/fixtures/agent_spec_golden.md` | Golden agent spec fixture (LLM expander anchor) |

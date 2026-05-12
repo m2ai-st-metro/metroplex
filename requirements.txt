@@ -1,5 +1,4 @@
 pydantic>=2.0
-jinja2
 pyyaml
 pytest
 arcadepy

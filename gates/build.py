@@ -12,8 +12,6 @@ import subprocess
 from pathlib import Path
 from typing import Optional
 from datetime import datetime
-from jinja2 import Environment, FileSystemLoader, Template, TemplateNotFound
-
 from config import Config
 from models import BuildJob, PriorityItem
 from db import StateDB
@@ -21,9 +19,7 @@ from audit import AuditLogger
 from cost_rates import estimate_cost
 from gates.llm_expander import (
     LLMSpecExpander,
-    validate_spec,
     validate_agent_spec,
-    format_failure_feedback,
 )
 from postmortem import capture_postmortem, get_failure_patterns
 from oz_bridge import submit_to_oz
@@ -35,7 +31,7 @@ RUNNER_PID_FILE = Path(__file__).parent.parent / "data" / "runner.pid"
 
 
 class SpecGenerator:
-    """Gate 2: Spec Generation - LLM expansion with Jinja2 fallback."""
+    """Gate 2: Spec Generation - LLM expansion (life_domain rubric only)."""
 
     def __init__(self, config: Config, template_dir: Path, state_db: Optional[StateDB] = None):
         """
@@ -56,14 +52,6 @@ class SpecGenerator:
         if not template_dir.exists():
             raise FileNotFoundError(f"Template directory not found at {template_dir}")
 
-        # Set up Jinja2 environment (fallback)
-        self.env = Environment(
-            loader=FileSystemLoader(str(template_dir)),
-            trim_blocks=True,
-            lstrip_blocks=True,
-            keep_trailing_newline=True
-        )
-
         # Initialize LLM expander if configured
         self.llm_expander: Optional[LLMSpecExpander] = None
         if config.spec_use_llm:
@@ -78,7 +66,7 @@ class SpecGenerator:
                 )
             except (ValueError, Exception) as e:
                 logger.warning(
-                    "LLM spec expansion unavailable, using Jinja2 fallback: %s", e
+                    "LLM spec expansion unavailable; builds will fail until configured: %s", e
                 )
 
     def generate_spec(
@@ -88,10 +76,7 @@ class SpecGenerator:
         queue_job_id: str | None = None,
     ) -> Path:
         """
-        Generate app spec file from idea data.
-
-        Uses LLM expansion when available for idea-specific specs.
-        Falls back to Jinja2 template rendering on LLM failure or when disabled.
+        Generate app spec file from idea data via LLM expansion.
 
         Args:
             idea: Idea dictionary with required fields:
@@ -109,8 +94,9 @@ class SpecGenerator:
             Path to generated spec file
 
         Raises:
-            FileNotFoundError: If template file not found (Jinja2 fallback only)
-            ValueError: If required fields missing from idea
+            ValueError: If required fields missing from idea, scoring_rubric
+                is not 'life_domain', or LLM output fails validation.
+            RuntimeError: If LLM expander is not configured.
         """
         # Validate required fields
         required_fields = [
@@ -198,46 +184,6 @@ class SpecGenerator:
         )
 
         return output_path
-
-    def _render_jinja2(self, idea: dict) -> str:
-        """Render spec using Jinja2 template (fallback path).
-
-        Selects template based on source:
-        - Academy promotions use tier1_agent_template.md
-        - All other sources use app_spec_template.md
-        """
-        # Select template based on source
-        is_academy = idea.get("_source") == "academy"
-        template_name = "tier1_agent_template.md" if is_academy else "app_spec_template.md"
-
-        try:
-            template = self.env.get_template(template_name)
-        except TemplateNotFound:
-            raise FileNotFoundError(
-                f"Template not found: {template_name} in {self.template_dir}"
-            )
-
-        template_vars = {
-            "title": idea["title"],
-            "description": idea["description"],
-            "problem_statement": idea["problem_statement"],
-            "target_audience": idea["target_audience"],
-            "artifact_type": idea["artifact_type"],
-            "tech_stack": idea.get("tech_stack", None),
-        }
-
-        # Add Academy-specific template variables for agent builds
-        if is_academy:
-            template_vars.update({
-                "persona_id": idea.get("_persona_id", "unknown"),
-                "model": idea.get("_model", "sonnet"),
-                "tool_groups": idea.get("_tool_groups", ["file_readonly"]),
-                "prompt_file": idea.get("_prompt_file", "agent_prompt.md"),
-                "promotion_reason": idea.get("_promotion_reason", "Graduation gates passed"),
-            })
-
-        return template.render(**template_vars)
-
 
 class BuildOrchestrator:
     """Gate 2: Build Orchestration - Queue Runner Integration.

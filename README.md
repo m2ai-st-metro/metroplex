@@ -15,7 +15,7 @@ Gate 1: Triage ──> approve / reject / defer
 Priority Queue ──> weighted intake from IdeaForge / Sky-Lynx / Linear
     |                  (configurable source weights)
     v
-Gate 2: Build ──> Jinja2 spec gen + queue_runner.py dispatch
+Gate 2: Build ──> LLM agent-spec gen + queue_runner.py dispatch
     |                  (background subprocess -> YCE Harness)
     |
 ST Records (persona_patches)
@@ -134,7 +134,8 @@ metroplex/
 │   ├── st_records_reader.py    # ST Records SQLite (read + patch status write)
 │   └── um_reader.py            # Ultra-Magnus SQLite (read-only)
 ├── spec_templates/
-│   └── app_spec_template.md    # Jinja2 template for generated specs
+│   └── fixtures/
+│       └── agent_spec_golden.md  # Golden agent spec (LLM expander anchor)
 ├── deploy/
 │   ├── metroplex.service       # systemd user service unit
 │   └── install.sh              # Service installer
