@@ -16,10 +16,9 @@ from audit import AuditLogger
 from safety import CircuitBreaker, CycleCaps, ShutdownHandler
 from gates.triage import TriageGate
 from gates.build import SpecGenerator, BuildOrchestrator
-from gates.patcher import PatchGate
 from orchestrator import CycleOrchestrator
 from notifier import LogNotifier
-from models import TriageDecision, BuildJob, PatchApplication, PriorityItem
+from models import TriageDecision, BuildJob, PriorityItem
 
 
 def make_pq_item(**kwargs) -> PriorityItem:
@@ -129,29 +128,10 @@ def mock_build_orchestrator():
 
 
 @pytest.fixture
-def mock_patch_gate():
-    """Create mock patch gate."""
-    gate = Mock(spec=PatchGate)
-    gate.run.return_value = [
-        PatchApplication(
-            patch_id="patch-1",
-            persona_id="persona-1",
-            from_version="1.0",
-            to_version="1.1",
-            status="applied",
-            reason="patch applied successfully",
-            applied_at=datetime.now()
-        )
-    ]
-    return gate
-
-
-@pytest.fixture
 def orchestrator(
     config,
     mock_triage_gate,
     mock_build_orchestrator,
-    mock_patch_gate,
     circuit_breaker,
     cycle_caps,
     shutdown_handler,
@@ -163,7 +143,6 @@ def orchestrator(
         config=config,
         triage_gate=mock_triage_gate,
         build_orchestrator=mock_build_orchestrator,
-        patch_gate=mock_patch_gate,
         circuit_breaker=circuit_breaker,
         cycle_caps=cycle_caps,
         shutdown_handler=shutdown_handler,
@@ -176,20 +155,18 @@ def orchestrator(
 class TestCycleOrchestrator:
     """Test CycleOrchestrator class."""
 
-    def test_run_cycle_success(self, orchestrator, mock_triage_gate, mock_build_orchestrator, mock_patch_gate):
+    def test_run_cycle_success(self, orchestrator, mock_triage_gate, mock_build_orchestrator):
         """Test successful cycle execution."""
         result = orchestrator.run_cycle(dry_run=True)
 
         # Verify all gates were called
         mock_triage_gate.run.assert_called_once_with(dry_run=True)
         mock_build_orchestrator.run_from_queue.assert_called_once()
-        mock_patch_gate.run.assert_called_once_with(dry_run=True)
 
         # Verify result
         assert result.cycle_id.startswith("cycle-")
         assert result.triage_count == 1
         assert result.build_count == 1
-        assert result.patch_count == 1
         assert len(result.errors) == 0
         assert result.completed_at is not None
 
@@ -265,12 +242,11 @@ class TestCycleOrchestrator:
         assert "pending_builds" in status
 
         # Verify gate statuses
-        assert len(status["gate_statuses"]) == 4
+        assert len(status["gate_statuses"]) == 3
         gate_names = [gs["gate"] for gs in status["gate_statuses"]]
         assert "triage" in gate_names
         assert "build" in gate_names
         assert "publish" in gate_names
-        assert "patch" in gate_names
 
         # Verify recent cycles
         assert len(status["recent_cycles"]) >= 1
@@ -322,7 +298,7 @@ class TestCLI:
 
         # Should succeed (or fail gracefully if no DBs)
         assert result.returncode in [0, 1]
-        assert "Gate 1" in result.stdout or "Gate 2" in result.stdout or "Gate 3" in result.stdout or "Warning" in result.stdout
+        assert "Gate 1" in result.stdout or "Gate 2" in result.stdout or "Gate 4" in result.stdout or "Warning" in result.stdout
 
     def test_cli_reset_gate(self):
         """Test 'metroplex.py reset --gate triage' command."""
@@ -352,7 +328,7 @@ class TestCLI:
         assert result.returncode == 0
         assert "triage" in result.stdout
         assert "build" in result.stdout
-        assert "patch" in result.stdout
+        assert "publish" in result.stdout
 
     def test_cli_help(self):
         """Test 'metroplex.py --help' command."""
@@ -368,7 +344,7 @@ class TestCLI:
         assert "Metroplex" in result.stdout
         assert "triage" in result.stdout
         assert "build" in result.stdout
-        assert "patch" in result.stdout
+        assert "publish" in result.stdout
         assert "run-all" in result.stdout
         assert "status" in result.stdout
         assert "reset" in result.stdout
@@ -448,8 +424,6 @@ class TestScheduleWindows:
         mock_build = Mock(spec=BuildOrchestrator)
         mock_build.run_from_queue.return_value = []
         mock_build.is_runner_active.return_value = False
-        mock_patch = Mock(spec=PatchGate)
-        mock_patch.run.return_value = []
         cb = CircuitBreaker(threshold=3, state_db=state_db)
         cc = CycleCaps(config)
         sh = ShutdownHandler()
@@ -458,7 +432,6 @@ class TestScheduleWindows:
             config=config,
             triage_gate=mock_triage,
             build_orchestrator=mock_build,
-            patch_gate=mock_patch,
             circuit_breaker=cb,
             cycle_caps=cc,
             shutdown_handler=sh,
@@ -573,7 +546,7 @@ class TestOrchestratorNotifications:
 
     def test_cycle_notifies_on_triage_approval(
         self, config, mock_triage_gate, mock_build_orchestrator,
-        mock_patch_gate, circuit_breaker, cycle_caps,
+        circuit_breaker, cycle_caps,
         shutdown_handler, state_db, audit_logger
     ):
         """Test that approved ideas trigger a notification."""
@@ -584,7 +557,6 @@ class TestOrchestratorNotifications:
             config=config,
             triage_gate=mock_triage_gate,
             build_orchestrator=mock_build_orchestrator,
-            patch_gate=mock_patch_gate,
             circuit_breaker=circuit_breaker,
             cycle_caps=cycle_caps,
             shutdown_handler=shutdown_handler,
@@ -602,7 +574,7 @@ class TestOrchestratorNotifications:
 
     def test_cycle_notifies_on_build_queued(
         self, config, mock_triage_gate, mock_build_orchestrator,
-        mock_patch_gate, circuit_breaker, cycle_caps,
+        circuit_breaker, cycle_caps,
         shutdown_handler, state_db, audit_logger
     ):
         """Test that queued builds trigger a notification."""
@@ -613,7 +585,6 @@ class TestOrchestratorNotifications:
             config=config,
             triage_gate=mock_triage_gate,
             build_orchestrator=mock_build_orchestrator,
-            patch_gate=mock_patch_gate,
             circuit_breaker=circuit_breaker,
             cycle_caps=cycle_caps,
             shutdown_handler=shutdown_handler,
@@ -631,7 +602,7 @@ class TestOrchestratorNotifications:
 
     def test_cycle_notifies_on_error(
         self, config, mock_triage_gate, mock_build_orchestrator,
-        mock_patch_gate, circuit_breaker, cycle_caps,
+        circuit_breaker, cycle_caps,
         shutdown_handler, state_db, audit_logger
     ):
         """Test that gate failures trigger an error notification."""
@@ -644,7 +615,6 @@ class TestOrchestratorNotifications:
             config=config,
             triage_gate=mock_triage_gate,
             build_orchestrator=mock_build_orchestrator,
-            patch_gate=mock_patch_gate,
             circuit_breaker=circuit_breaker,
             cycle_caps=cycle_caps,
             shutdown_handler=shutdown_handler,
@@ -669,8 +639,6 @@ class TestOrchestratorNotifications:
         mock_build = Mock(spec=BuildOrchestrator)
         mock_build.run_from_queue.return_value = []
         mock_build.is_runner_active.return_value = False
-        mock_patch = Mock(spec=PatchGate)
-        mock_patch.run.return_value = []
 
         mock_notifier = Mock()
         mock_notifier.notify.return_value = True
@@ -683,7 +651,6 @@ class TestOrchestratorNotifications:
             config=config,
             triage_gate=mock_triage,
             build_orchestrator=mock_build,
-            patch_gate=mock_patch,
             circuit_breaker=cb,
             cycle_caps=cc,
             shutdown_handler=sh,
@@ -745,7 +712,7 @@ class TestStandaloneStatusPolling:
         assert mock_build_orchestrator.poll_and_sync_status.called
 
     def test_run_cycle_notifies_completed_builds(
-        self, config, mock_triage_gate, mock_build_orchestrator, mock_patch_gate,
+        self, config, mock_triage_gate, mock_build_orchestrator,
         circuit_breaker, cycle_caps, shutdown_handler, state_db, audit_logger
     ):
         """Completed builds from polling generate notifications."""
@@ -760,7 +727,7 @@ class TestStandaloneStatusPolling:
 
         orch = CycleOrchestrator(
             config=config, triage_gate=mock_triage_gate,
-            build_orchestrator=mock_build_orchestrator, patch_gate=mock_patch_gate,
+            build_orchestrator=mock_build_orchestrator,
             circuit_breaker=circuit_breaker, cycle_caps=cycle_caps,
             shutdown_handler=shutdown_handler, state_db=state_db,
             audit_logger=audit_logger, cycle_sleep_seconds=1,
@@ -773,15 +740,13 @@ class TestStandaloneStatusPolling:
         assert any("completed" in c.lower() or "Build completed" in c for c in notify_calls)
 
     def test_run_cycle_poll_failure_nonfatal(
-        self, orchestrator, mock_build_orchestrator, mock_patch_gate, audit_logger
+        self, orchestrator, mock_build_orchestrator, audit_logger
     ):
         """A polling failure doesn't prevent the rest of the cycle from running."""
         mock_build_orchestrator.poll_and_sync_status.side_effect = Exception("poll error")
 
         result = orchestrator.run_cycle(dry_run=True)
 
-        # Patch gate should still have been called
-        assert mock_patch_gate.run.called
         # Cycle should complete without raising
         assert result.completed_at is not None
 
@@ -790,7 +755,7 @@ class TestSkyLynxIntake:
     """Tests for Sky-Lynx recommendation intake in CycleOrchestrator."""
 
     def test_ingest_skylynx_enqueues_recommendations(
-        self, config, mock_triage_gate, mock_build_orchestrator, mock_patch_gate,
+        self, config, mock_triage_gate, mock_build_orchestrator,
         circuit_breaker, cycle_caps, shutdown_handler, state_db, audit_logger
     ):
         """ingest_skylynx reads pending recs and enqueues them as PriorityItems."""
@@ -823,7 +788,7 @@ class TestSkyLynxIntake:
 
         orch = CycleOrchestrator(
             config=config, triage_gate=mock_triage_gate,
-            build_orchestrator=mock_build_orchestrator, patch_gate=mock_patch_gate,
+            build_orchestrator=mock_build_orchestrator,
             circuit_breaker=circuit_breaker, cycle_caps=cycle_caps,
             shutdown_handler=shutdown_handler, state_db=state_db,
             audit_logger=audit_logger, cycle_sleep_seconds=1,
@@ -841,7 +806,7 @@ class TestSkyLynxIntake:
         assert summary.get("total", 0) == 1
 
     def test_ingest_skylynx_applies_weight(
-        self, config, mock_triage_gate, mock_build_orchestrator, mock_patch_gate,
+        self, config, mock_triage_gate, mock_build_orchestrator,
         circuit_breaker, cycle_caps, shutdown_handler, state_db, audit_logger
     ):
         """Priority score is base_score * skylynx_weight."""
@@ -864,7 +829,7 @@ class TestSkyLynxIntake:
 
         orch = CycleOrchestrator(
             config=config, triage_gate=mock_triage_gate,
-            build_orchestrator=mock_build_orchestrator, patch_gate=mock_patch_gate,
+            build_orchestrator=mock_build_orchestrator,
             circuit_breaker=circuit_breaker, cycle_caps=cycle_caps,
             shutdown_handler=shutdown_handler, state_db=state_db,
             audit_logger=audit_logger, skylynx_reader=mock_reader,
@@ -877,7 +842,7 @@ class TestSkyLynxIntake:
         assert item.priority_score == 85.0 * 1.5
 
     def test_ingest_skylynx_dry_run_no_writes(
-        self, config, mock_triage_gate, mock_build_orchestrator, mock_patch_gate,
+        self, config, mock_triage_gate, mock_build_orchestrator,
         circuit_breaker, cycle_caps, shutdown_handler, state_db, audit_logger
     ):
         """Dry run counts items but does not enqueue or mark dispatched."""
@@ -897,7 +862,7 @@ class TestSkyLynxIntake:
 
         orch = CycleOrchestrator(
             config=config, triage_gate=mock_triage_gate,
-            build_orchestrator=mock_build_orchestrator, patch_gate=mock_patch_gate,
+            build_orchestrator=mock_build_orchestrator,
             circuit_breaker=circuit_breaker, cycle_caps=cycle_caps,
             shutdown_handler=shutdown_handler, state_db=state_db,
             audit_logger=audit_logger, skylynx_reader=mock_reader,
@@ -917,7 +882,7 @@ class TestSkyLynxIntake:
         assert count == 0
 
     def test_run_cycle_calls_ingest_skylynx(
-        self, config, mock_triage_gate, mock_build_orchestrator, mock_patch_gate,
+        self, config, mock_triage_gate, mock_build_orchestrator,
         circuit_breaker, cycle_caps, shutdown_handler, state_db, audit_logger
     ):
         """run_cycle invokes Sky-Lynx intake before triage."""
@@ -926,7 +891,7 @@ class TestSkyLynxIntake:
 
         orch = CycleOrchestrator(
             config=config, triage_gate=mock_triage_gate,
-            build_orchestrator=mock_build_orchestrator, patch_gate=mock_patch_gate,
+            build_orchestrator=mock_build_orchestrator,
             circuit_breaker=circuit_breaker, cycle_caps=cycle_caps,
             shutdown_handler=shutdown_handler, state_db=state_db,
             audit_logger=audit_logger, skylynx_reader=mock_reader,
@@ -953,8 +918,6 @@ class TestDispatchIntegration:
             "running": [], "running_count": 0,
             "completed": [], "failed": [], "newly_synced": [],
         }
-        mock_patch = Mock(spec=PatchGate)
-        mock_patch.run.return_value = []
         cb = CircuitBreaker(threshold=3, state_db=state_db)
         cc = CycleCaps(config)
         sh = ShutdownHandler()
@@ -964,7 +927,6 @@ class TestDispatchIntegration:
             config=config,
             triage_gate=mock_triage,
             build_orchestrator=mock_build,
-            patch_gate=mock_patch,
             circuit_breaker=cb,
             cycle_caps=cc,
             shutdown_handler=sh,
@@ -1058,7 +1020,7 @@ class TestDispatchIntegration:
             mock_dispatch.assert_called_once_with(dry_run=True)
 
     def test_dispatch_error_does_not_halt_cycle(self, config, state_db, audit_logger):
-        """Dispatch errors are non-fatal — cycle continues to Gate 4 and Gate 3."""
+        """Dispatch errors are non-fatal — cycle continues to Gate 4."""
         mock_dispatcher = Mock()
         mock_dispatcher.dispatch.side_effect = Exception("DB locked")
 
@@ -1105,14 +1067,10 @@ class TestDispatchIntegration:
             "running": [], "running_count": 0,
             "completed": [], "failed": [], "newly_synced": [],
         }
-        mock_patch = Mock(spec=PatchGate)
-        mock_patch.run.return_value = []
-
         orch = CycleOrchestrator(
             config=config,
             triage_gate=mock_triage,
             build_orchestrator=mock_build,
-            patch_gate=mock_patch,
             circuit_breaker=CircuitBreaker(threshold=3, state_db=state_db),
             cycle_caps=CycleCaps(config),
             shutdown_handler=ShutdownHandler(),

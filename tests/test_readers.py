@@ -7,7 +7,7 @@ import json
 import tempfile
 from pathlib import Path
 
-from readers import IdeaForgeReader, SkyLynxReader, STRecordsReader
+from readers import IdeaForgeReader, SkyLynxReader
 
 
 # --- IdeaForge Reader Tests ---
@@ -318,229 +318,6 @@ def test_ideaforge_reader_falls_back_on_legacy_schema(ideaforge_legacy_schema_db
     reader.close()
 
 
-# --- ST Records Reader Tests ---
-
-
-@pytest.fixture
-def st_records_test_db():
-    """Create an in-memory ST Records database with test data."""
-    conn = sqlite3.connect(":memory:")
-    cursor = conn.cursor()
-
-    # Create persona_patches table
-    cursor.execute("""
-        CREATE TABLE persona_patches (
-            id INTEGER PRIMARY KEY,
-            patch_id TEXT NOT NULL,
-            persona_id TEXT NOT NULL,
-            rationale TEXT,
-            from_version TEXT,
-            to_version TEXT,
-            raw_json TEXT,
-            status TEXT
-        )
-    """)
-
-    # Create improvement_recommendations table (matches real persona_metrics.db schema)
-    cursor.execute("""
-        CREATE TABLE improvement_recommendations (
-            id INTEGER PRIMARY KEY,
-            recommendation_id TEXT,
-            session_id TEXT,
-            recommendation_type TEXT,
-            target_system TEXT,
-            title TEXT,
-            priority TEXT,
-            scope TEXT,
-            target_department TEXT,
-            status TEXT,
-            emitted_at TEXT,
-            raw_json TEXT,
-            effectiveness TEXT,
-            effectiveness_score REAL,
-            effectiveness_evaluated_at TEXT
-        )
-    """)
-
-    # Create outcome_records table (matches real persona_metrics.db schema)
-    cursor.execute("""
-        CREATE TABLE outcome_records (
-            id INTEGER PRIMARY KEY,
-            idea_id INTEGER,
-            idea_title TEXT,
-            outcome TEXT,
-            overall_score REAL,
-            recommendation TEXT,
-            capabilities_fit TEXT,
-            build_outcome TEXT,
-            artifact_count INTEGER,
-            tech_stack TEXT,
-            total_duration_seconds REAL,
-            tags TEXT,
-            github_url TEXT,
-            emitted_at TEXT,
-            raw_json TEXT
-        )
-    """)
-
-    # Insert test patches
-    test_patches = [
-        (1, "patch-001", "persona-alpha", "Improve error handling",
-         "1.0", "1.1", json.dumps({"operation": "add", "field": "error_handler"}), "proposed"),
-        (2, "patch-002", "persona-beta", "Add new feature",
-         "2.0", "2.1", json.dumps({"operation": "update", "field": "feature_x"}), "proposed"),
-        (3, "patch-003", "persona-gamma", "Already applied",
-         "3.0", "3.1", json.dumps({"operation": "remove", "field": "deprecated"}), "applied"),
-    ]
-
-    for patch in test_patches:
-        cursor.execute("""
-            INSERT INTO persona_patches (
-                id, patch_id, persona_id, rationale, from_version, to_version, raw_json, status
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        """, patch)
-
-    # Insert test recommendations
-    cursor.execute("""
-        INSERT INTO improvement_recommendations (
-            id, recommendation_id, session_id, recommendation_type,
-            target_system, title, priority, scope, target_department,
-            status, emitted_at, raw_json
-        ) VALUES
-            (1, 'rec-001', 'sess-001', 'optimization', 'metroplex', 'Optimize performance',
-             'high', 'module', 'engineering', 'pending', '2024-01-01T10:00:00', '{}'),
-            (2, 'rec-002', 'sess-002', 'refactor', 'metroplex', 'Refactor module X',
-             'medium', 'module', 'engineering', 'pending', '2024-01-01T11:00:00', '{}'),
-            (3, 'rec-003', 'sess-003', 'optimization', 'metroplex', 'Already done',
-             'low', 'module', 'engineering', 'completed', '2024-01-01T09:00:00', '{}')
-    """)
-
-    # Insert test outcome records
-    cursor.execute("""
-        INSERT INTO outcome_records (
-            id, idea_id, idea_title, outcome, overall_score, recommendation,
-            capabilities_fit, build_outcome, artifact_count, tech_stack,
-            total_duration_seconds, tags, github_url, emitted_at, raw_json
-        ) VALUES
-            (1, 101, 'Idea A', 'success', 8.5, 'Ship it', 'high', 'build_success',
-             3, 'python', 120.0, 'ai,tool', 'https://github.com/org/a', '2024-01-01T10:00:00', '{}'),
-            (2, 102, 'Idea B', 'success', 7.0, 'Approve', 'medium', 'test_pass',
-             2, 'typescript', 90.0, 'web', 'https://github.com/org/b', '2024-01-01T11:00:00', '{}'),
-            (3, 103, 'Idea C', 'success', 9.0, 'Ship it', 'high', 'deploy_complete',
-             5, 'python', 200.0, 'agent', 'https://github.com/org/c', '2024-01-01T12:00:00', '{}')
-    """)
-
-    conn.commit()
-
-    # Save to a temporary file for testing
-    with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
-        temp_path = f.name
-
-    # Copy in-memory DB to file
-    file_conn = sqlite3.connect(temp_path)
-    conn.backup(file_conn)
-    file_conn.close()
-    conn.close()
-
-    yield temp_path
-
-    # Cleanup
-    Path(temp_path).unlink(missing_ok=True)
-
-
-def test_st_records_reader_initialization(st_records_test_db):
-    """Test ST Records reader initialization."""
-    reader = STRecordsReader(st_records_test_db)
-    assert reader.db_path == st_records_test_db
-    assert reader.conn is not None
-    reader.close()
-
-
-def test_st_records_reader_missing_db():
-    """Test ST Records reader raises FileNotFoundError for missing DB."""
-    with pytest.raises(FileNotFoundError, match="ST Records database not found"):
-        STRecordsReader("/nonexistent/path/to/db.db")
-
-
-def test_st_records_get_proposed_patches(st_records_test_db):
-    """Test getting proposed patches."""
-    reader = STRecordsReader(st_records_test_db)
-
-    patches = reader.get_proposed_patches()
-
-    # Should return only proposed patches
-    assert len(patches) == 2
-
-    # Verify first patch
-    patch = patches[0]
-    assert patch["patch_id"] == "patch-001"
-    assert patch["persona_id"] == "persona-alpha"
-    assert patch["rationale"] == "Improve error handling"
-    assert patch["from_version"] == "1.0"
-    assert patch["to_version"] == "1.1"
-
-    # Verify raw_json is parsed from JSON string to dict
-    assert isinstance(patch["raw_json"], dict)
-    assert patch["raw_json"]["operation"] == "add"
-    assert patch["raw_json"]["field"] == "error_handler"
-
-    reader.close()
-
-
-def test_st_records_get_pending_recommendations(st_records_test_db):
-    """Test getting pending recommendations."""
-    reader = STRecordsReader(st_records_test_db)
-
-    recommendations = reader.get_pending_recommendations()
-
-    # Should return only pending recommendations
-    assert len(recommendations) == 2
-
-    assert recommendations[0]["title"] == "Optimize performance"
-    assert recommendations[1]["title"] == "Refactor module X"
-
-    reader.close()
-
-
-def test_st_records_update_patch_status(st_records_test_db):
-    """Test updating patch status (write operation)."""
-    reader = STRecordsReader(st_records_test_db)
-
-    # Update patch status
-    reader.update_patch_status("patch-001", "applied")
-
-    # Verify the status was updated
-    # Need to open a new read connection to check
-    verify_conn = sqlite3.connect(st_records_test_db)
-    verify_conn.row_factory = sqlite3.Row
-    cursor = verify_conn.cursor()
-
-    cursor.execute("SELECT status FROM persona_patches WHERE patch_id = ?", ("patch-001",))
-    row = cursor.fetchone()
-    assert row["status"] == "applied"
-
-    verify_conn.close()
-    reader.close()
-
-
-def test_st_records_get_outcome_records(st_records_test_db):
-    """Test getting outcome records."""
-    reader = STRecordsReader(st_records_test_db)
-
-    records = reader.get_outcome_records(limit=2)
-
-    # Should return most recent 2 records in DESC order
-    assert len(records) == 2
-    assert records[0]["build_outcome"] == "deploy_complete"  # Most recent
-    assert records[1]["build_outcome"] == "test_pass"
-
-    # Test with default limit
-    all_records = reader.get_outcome_records()
-    assert len(all_records) == 3
-
-    reader.close()
-
-
 # --- Sky-Lynx Reader Tests ---
 
 
@@ -795,10 +572,7 @@ def test_all_readers_raise_filenotfound():
     with pytest.raises(FileNotFoundError):
         SkyLynxReader(nonexistent_path)
 
-    with pytest.raises(FileNotFoundError):
-        STRecordsReader(nonexistent_path)
-
-def test_all_readers_close_properly(ideaforge_test_db, st_records_test_db, skylynx_test_db):
+def test_all_readers_close_properly(ideaforge_test_db, skylynx_test_db):
     """Test that all readers close connections properly."""
     # IdeaForge
     reader1 = IdeaForgeReader(ideaforge_test_db)
@@ -811,9 +585,3 @@ def test_all_readers_close_properly(ideaforge_test_db, st_records_test_db, skyly
     assert reader_sl.conn is not None
     reader_sl.close()
     assert reader_sl.conn is None
-
-    # ST Records
-    reader2 = STRecordsReader(st_records_test_db)
-    assert reader2.conn is not None
-    reader2.close()
-    assert reader2.conn is None

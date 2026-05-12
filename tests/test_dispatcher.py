@@ -233,9 +233,6 @@ class TestRouteToWorker:
     def test_skylynx_case_study(self):
         assert route_to_worker("skylynx", "case_study_addition") == "soundwave"
 
-    def test_linear_default(self):
-        assert route_to_worker("linear", "") == "ravage"
-
     def test_ideaforge_default(self):
         assert route_to_worker("ideaforge", "") == "ravage"
 
@@ -290,23 +287,6 @@ class TestBuildDispatchPrompt:
         prompt = build_dispatch_prompt(item)
         assert "pipeline_change" in prompt
         assert "all_personas" in prompt
-
-    def test_linear_prompt_includes_identifier(self):
-        """Linear items include the issue identifier."""
-        item = {
-            "source": "linear",
-            "source_id": "M2A-42",
-            "title": "API Endpoint",
-            "description": "Build REST API",
-            "priority_score": 150.0,
-            "idea_data": json.dumps({
-                "description": "Build REST API",
-                "_linear_identifier": "M2A-42",
-            }),
-        }
-
-        prompt = build_dispatch_prompt(item)
-        assert "M2A-42" in prompt
 
     def test_empty_idea_data(self):
         """Handles empty or missing idea_data gracefully."""

@@ -33,13 +33,13 @@ class CircuitBreaker:
         self.threshold = threshold
         self.state_db = state_db
 
-    def record_success(self, gate: Literal["triage", "build", "publish", "patch"]) -> None:
+    def record_success(self, gate: Literal["triage", "build", "publish"]) -> None:
         """
         Record successful gate execution.
         Resets consecutive failures to 0.
 
         Args:
-            gate: Gate name (triage, build, patch)
+            gate: Gate name (triage, build, publish)
         """
         if self.state_db is None:
             return
@@ -49,13 +49,13 @@ class CircuitBreaker:
         status.last_error = None
         self.state_db.update_gate_status(status)
 
-    def record_failure(self, gate: Literal["triage", "build", "publish", "patch"], error: str) -> None:
+    def record_failure(self, gate: Literal["triage", "build", "publish"], error: str) -> None:
         """
         Record failed gate execution.
         Increments consecutive failures. If >= threshold, halts the gate.
 
         Args:
-            gate: Gate name (triage, build, patch)
+            gate: Gate name (triage, build, publish)
             error: Error message/description
         """
         if self.state_db is None:
@@ -71,12 +71,12 @@ class CircuitBreaker:
 
         self.state_db.update_gate_status(status)
 
-    def is_halted(self, gate: Literal["triage", "build", "publish", "patch"]) -> bool:
+    def is_halted(self, gate: Literal["triage", "build", "publish"]) -> bool:
         """
         Check if a gate is halted.
 
         Args:
-            gate: Gate name (triage, build, patch)
+            gate: Gate name (triage, build, publish)
 
         Returns:
             True if gate is halted, False otherwise
@@ -87,13 +87,13 @@ class CircuitBreaker:
         status = self.state_db.get_gate_status(gate)
         return status.halted
 
-    def reset(self, gate: Literal["triage", "build", "publish", "patch"]) -> None:
+    def reset(self, gate: Literal["triage", "build", "publish"]) -> None:
         """
         Manually reset a gate (for CLI reset command).
         Clears consecutive failures, unhalt, and clear error.
 
         Args:
-            gate: Gate name (triage, build, patch)
+            gate: Gate name (triage, build, publish)
         """
         if self.state_db is None:
             return
@@ -109,7 +109,7 @@ class CircuitBreaker:
         Get status of all gates.
 
         Returns:
-            List of GateStatus for triage, build, and patch gates
+            List of GateStatus for triage, build, and publish gates
         """
         if self.state_db is None:
             return []
@@ -118,7 +118,6 @@ class CircuitBreaker:
             self.state_db.get_gate_status("triage"),
             self.state_db.get_gate_status("build"),
             self.state_db.get_gate_status("publish"),
-            self.state_db.get_gate_status("patch"),
         ]
 
 
@@ -130,10 +129,9 @@ class CycleCaps:
         Initialize cycle caps from config.
 
         Args:
-            config: Metroplex config with max_approve_per_cycle and max_patches_per_cycle
+            config: Metroplex config with max_approve_per_cycle
         """
         self.max_approve = config.max_approve_per_cycle
-        self.max_patches = config.max_patches_per_cycle
 
     def check_approve_cap(self, current_count: int) -> bool:
         """
@@ -146,18 +144,6 @@ class CycleCaps:
             True if under cap (can approve more), False if at/over cap
         """
         return current_count < self.max_approve
-
-    def check_patch_cap(self, current_count: int) -> bool:
-        """
-        Check if patch cap has been reached.
-
-        Args:
-            current_count: Number of patches applied so far in cycle
-
-        Returns:
-            True if under cap (can apply more), False if at/over cap
-        """
-        return current_count < self.max_patches
 
 
 class BudgetEnforcer:

@@ -3,9 +3,8 @@ Sky-Lynx Recommendation Reader
 Read-only SQLite interface for Sky-Lynx improvement recommendations
 stored in the ST Records persona_metrics.db.
 
-Separate from STRecordsReader because Sky-Lynx recommendations are a
-distinct intake stream: they bypass triage and enqueue directly into
-the Metroplex priority queue.
+Sky-Lynx recommendations are a distinct intake stream from IdeaForge:
+they bypass triage and enqueue directly into the Metroplex priority queue.
 """
 import sqlite3
 import json
@@ -189,8 +188,7 @@ class SkyLynxReader:
         """
         Mark a recommendation as dispatched to the priority queue.
 
-        Opens a separate writable connection (same pattern as
-        STRecordsReader.update_patch_status).
+        Opens a separate writable connection.
 
         Args:
             recommendation_id: The recommendation_id to update

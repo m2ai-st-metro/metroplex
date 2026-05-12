@@ -38,9 +38,6 @@ class Config:
     # Directory paths
     yce_dir: str = field(default="/home/apexaipc/projects/yce-harness")
 
-    # GitHub repo
-    academy_repo: str = field(default="m2ai-st-metro/st-agent-registry")
-
     # Model settings
     build_model: str = field(default="opus")
 
@@ -56,7 +53,6 @@ class Config:
 
     # Cycle limits
     max_approve_per_cycle: int = field(default=3)
-    max_patches_per_cycle: int = field(default=5)
 
     # Circuit breaker
     circuit_breaker_threshold: int = field(default=3)
@@ -67,11 +63,6 @@ class Config:
     # Priority queue source weights
     ideaforge_weight: float = field(default=1.0)
     skylynx_weight: float = field(default=1.5)
-    academy_weight: float = field(default=2.0)
-
-    # Academy integration (persona -> agent promotions)
-    academy_dir: str = field(default="/home/apexaipc/projects/st-agent-registry")
-    academy_promotions_path: str = field(default="/home/apexaipc/projects/st-agent-registry/data/promotions.jsonl")
 
     # Telegram notifications (optional)
     telegram_bot_token: str = field(default="")
@@ -149,7 +140,6 @@ class Config:
         self.um_db = os.environ.get("METROPLEX_UM_DB", self.um_db)
         self.st_records_db = os.environ.get("METROPLEX_ST_RECORDS_DB", self.st_records_db)
         self.yce_dir = os.environ.get("METROPLEX_YCE_DIR", self.yce_dir)
-        self.academy_repo = os.environ.get("METROPLEX_ACADEMY_REPO", self.academy_repo)
         self.build_model = os.environ.get("METROPLEX_BUILD_MODEL", self.build_model)
 
         # Parallel build settings
@@ -185,11 +175,6 @@ class Config:
             pass
 
         try:
-            self.max_patches_per_cycle = int(os.environ.get("METROPLEX_MAX_PATCHES_PER_CYCLE", self.max_patches_per_cycle))
-        except ValueError:
-            pass
-
-        try:
             self.circuit_breaker_threshold = int(os.environ.get("METROPLEX_CIRCUIT_BREAKER_THRESHOLD", self.circuit_breaker_threshold))
         except ValueError:
             pass
@@ -208,14 +193,6 @@ class Config:
             self.skylynx_weight = float(os.environ.get("METROPLEX_SKYLYNX_WEIGHT", self.skylynx_weight))
         except ValueError:
             pass
-        try:
-            self.academy_weight = float(os.environ.get("METROPLEX_ACADEMY_WEIGHT", self.academy_weight))
-        except ValueError:
-            pass
-
-        # Academy
-        self.academy_dir = os.environ.get("METROPLEX_ACADEMY_DIR", self.academy_dir)
-        self.academy_promotions_path = os.environ.get("METROPLEX_ACADEMY_PROMOTIONS_PATH", self.academy_promotions_path)
 
         # Spec generation (LLM expansion)
         self.spec_use_llm = os.environ.get("METROPLEX_SPEC_USE_LLM", "").lower() not in ("0", "false", "no")

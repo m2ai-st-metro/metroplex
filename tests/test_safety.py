@@ -22,7 +22,7 @@ class TestCircuitBreaker:
 
         assert breaker.is_halted("triage") is False
         assert breaker.is_halted("build") is False
-        assert breaker.is_halted("patch") is False
+        assert breaker.is_halted("publish") is False
 
     def test_record_failures_below_threshold(self, in_memory_db):
         """Test recording failures below threshold does not halt."""
@@ -85,18 +85,18 @@ class TestCircuitBreaker:
         breaker = CircuitBreaker(threshold=3, state_db=in_memory_db)
 
         # Record 2 failures
-        breaker.record_failure("patch", "Error 1")
-        breaker.record_failure("patch", "Error 2")
+        breaker.record_failure("publish", "Error 1")
+        breaker.record_failure("publish", "Error 2")
 
         # Verify 2 failures
-        status = in_memory_db.get_gate_status("patch")
+        status = in_memory_db.get_gate_status("publish")
         assert status.consecutive_failures == 2
 
         # Record success
-        breaker.record_success("patch")
+        breaker.record_success("publish")
 
         # Should reset to 0
-        status = in_memory_db.get_gate_status("patch")
+        status = in_memory_db.get_gate_status("publish")
         assert status.consecutive_failures == 0
         assert status.last_error is None
         assert status.halted is False
@@ -113,7 +113,7 @@ class TestCircuitBreaker:
         # Other gates should still be un-halted
         assert breaker.is_halted("triage") is True
         assert breaker.is_halted("build") is False
-        assert breaker.is_halted("patch") is False
+        assert breaker.is_halted("publish") is False
 
     def test_get_status_all_gates(self, in_memory_db):
         """Test get_status() returns all gate statuses."""
@@ -126,18 +126,18 @@ class TestCircuitBreaker:
 
         statuses = breaker.get_status()
 
-        assert len(statuses) == 4
+        assert len(statuses) == 3
         gates = {s.gate for s in statuses}
-        assert gates == {"triage", "build", "publish", "patch"}
+        assert gates == {"triage", "build", "publish"}
 
         # Find specific gate statuses
         triage = next(s for s in statuses if s.gate == "triage")
         build = next(s for s in statuses if s.gate == "build")
-        patch = next(s for s in statuses if s.gate == "patch")
+        publish = next(s for s in statuses if s.gate == "publish")
 
         assert triage.consecutive_failures == 1
         assert build.consecutive_failures == 2
-        assert patch.consecutive_failures == 0
+        assert publish.consecutive_failures == 0
 
     def test_custom_threshold(self, in_memory_db):
         """Test circuit breaker with custom threshold."""
@@ -184,39 +184,16 @@ class TestCycleCaps:
         assert caps.check_approve_cap(4) is False
         assert caps.check_approve_cap(100) is False
 
-    def test_patch_cap_under_limit(self, test_config):
-        """Test patch cap returns True when under limit."""
-        # Default max_patches_per_cycle is 5
-        caps = CycleCaps(test_config)
-
-        assert caps.check_patch_cap(0) is True
-        assert caps.check_patch_cap(1) is True
-        assert caps.check_patch_cap(4) is True
-
-    def test_patch_cap_at_limit(self, test_config):
-        """Test patch cap returns False at/over limit."""
-        # Default max_patches_per_cycle is 5
-        caps = CycleCaps(test_config)
-
-        assert caps.check_patch_cap(5) is False
-        assert caps.check_patch_cap(6) is False
-        assert caps.check_patch_cap(100) is False
-
     def test_custom_caps(self):
         """Test cycle caps with custom config values."""
         config = Config()
         config.max_approve_per_cycle = 2
-        config.max_patches_per_cycle = 10
 
         caps = CycleCaps(config)
 
         # Approve cap at 2
         assert caps.check_approve_cap(1) is True
         assert caps.check_approve_cap(2) is False
-
-        # Patch cap at 10
-        assert caps.check_patch_cap(9) is True
-        assert caps.check_patch_cap(10) is False
 
 
 class TestShutdownHandler:

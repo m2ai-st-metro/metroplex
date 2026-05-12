@@ -1,6 +1,6 @@
 # Metroplex — Blueprint
 
-L5 autonomy layer for the ST Metro ecosystem. Closes all three human gates in the feedback loop: idea triage, build orchestration, and persona patch application.
+L5 autonomy layer for the ST Metro ecosystem. Closes the human gates in the feedback loop: idea triage, build orchestration, and publish.
 
 ## Phase 1: Build via yce-harness
 
@@ -113,9 +113,8 @@ IdeaForge (signals+scores) ──→ Gate 1: Triage ──→ approve/reject/def
                                           LLM expander → agent spec
                                           queue_runner.py subprocess
                                                         │
-ST Records (persona_patches) ──→ Gate 3: Patcher ──→ git clone/commit/push
-                                          YAML ops on Academy repo
-                                          Updates patch status → "applied"
+                                                        ▼
+                                          Gate 4: Publish ──→ create repos + push completed builds
 ```
 
 ## Key Design Decisions
@@ -142,9 +141,9 @@ ST Records (persona_patches) ──→ Gate 3: Patcher ──→ git clone/commi
 | `audit.py` | JSON lines audit logger |
 | `gates/triage.py` | Gate 1: score + threshold decisions |
 | `gates/build.py` | Gate 2: spec gen + queue_runner subprocess |
-| `gates/patcher.py` | Gate 3: YAML patches via git |
+| `gates/publish.py` | Gate 4: create repos + push completed builds |
+| `gates/review.py` | Gate 4.5: automated quality checks before publish |
 | `notifier.py` | Telegram + log notification backends |
 | `readers/ideaforge_reader.py` | IdeaForge SQLite (read-only) |
-| `readers/st_records_reader.py` | ST Records SQLite (read + patch status write) |
-| `readers/um_reader.py` | Ultra-Magnus SQLite (read-only) |
+| `readers/skylynx_reader.py` | Sky-Lynx recommendations (read-only) |
 | `spec_templates/fixtures/agent_spec_golden.md` | Golden agent spec fixture (LLM expander anchor) |

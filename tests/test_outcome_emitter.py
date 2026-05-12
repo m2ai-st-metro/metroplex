@@ -16,7 +16,6 @@ from models import TriageDecision, BuildJob, PublishJob
 from safety import CircuitBreaker, CycleCaps, ShutdownHandler
 from gates.triage import TriageGate
 from gates.build import BuildOrchestrator
-from gates.patcher import PatchGate
 from orchestrator import CycleOrchestrator
 from notifier import LogNotifier
 
@@ -225,9 +224,6 @@ def orchestrator_with_emitter(state_db, mock_emitter, tmp_path):
         "newly_synced": [],
     }
 
-    patch_gate = Mock(spec=PatchGate)
-    patch_gate.run.return_value = []
-
     circuit_breaker = CircuitBreaker(threshold=3, state_db=state_db)
     cycle_caps = CycleCaps(config)
     shutdown_handler = ShutdownHandler()
@@ -236,7 +232,6 @@ def orchestrator_with_emitter(state_db, mock_emitter, tmp_path):
         config=config,
         triage_gate=triage_gate,
         build_orchestrator=build_orch,
-        patch_gate=patch_gate,
         circuit_breaker=circuit_breaker,
         cycle_caps=cycle_caps,
         shutdown_handler=shutdown_handler,
@@ -358,14 +353,10 @@ class TestOrchestratorEmission:
             "newly_synced": [],
         }
 
-        patch_gate = Mock(spec=PatchGate)
-        patch_gate.run.return_value = []
-
         orch = CycleOrchestrator(
             config=config,
             triage_gate=triage_gate,
             build_orchestrator=build_orch,
-            patch_gate=patch_gate,
             circuit_breaker=CircuitBreaker(threshold=3, state_db=state_db),
             cycle_caps=CycleCaps(config),
             shutdown_handler=ShutdownHandler(),

@@ -9,7 +9,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
-from models import TriageDecision, BuildJob, PatchApplication, AgentPatchApplication, CycleResult, GateStatus, PriorityItem, PublishJob
+from models import TriageDecision, BuildJob, CycleResult, GateStatus, PriorityItem, PublishJob
 
 
 class StateDB:
@@ -429,7 +429,7 @@ class StateDB:
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_build_jobs_base_job_id ON build_jobs(base_job_id)")
 
         # Initialize gate status for all gates
-        for gate in ["triage", "build", "patch", "publish"]:
+        for gate in ["triage", "build", "publish"]:
             cursor.execute("""
                 INSERT OR IGNORE INTO gate_status (gate, consecutive_failures, halted)
                 VALUES (?, 0, 0)
@@ -534,48 +534,6 @@ class StateDB:
         )
         return cursor.fetchone()[0]
 
-    def record_patch_application(self, patch: PatchApplication):
-        """Record a patch application."""
-        self.connect()
-        cursor = self.conn.cursor()
-
-        cursor.execute("""
-            INSERT INTO patch_applications (patch_id, persona_id, from_version, to_version, status, reason, applied_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-        """, (
-            patch.patch_id,
-            patch.persona_id,
-            patch.from_version,
-            patch.to_version,
-            patch.status,
-            patch.reason,
-            patch.applied_at.isoformat()
-        ))
-
-        self.conn.commit()
-
-    def record_agent_patch_application(self, patch: AgentPatchApplication):
-        """Record an agent patch application."""
-        self.connect()
-        cursor = self.conn.cursor()
-
-        cursor.execute("""
-            INSERT INTO agent_patch_applications
-            (patch_id, agent_id, target, section, operation, status, reason, applied_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            patch.patch_id,
-            patch.agent_id,
-            patch.target,
-            patch.section,
-            patch.operation,
-            patch.status,
-            patch.reason,
-            patch.applied_at.isoformat()
-        ))
-
-        self.conn.commit()
-
     def start_cycle(self, cycle_id: str) -> CycleResult:
         """Start a new cycle."""
         self.connect()
@@ -596,7 +554,6 @@ class StateDB:
             completed_at=None,
             triage_count=0,
             build_count=0,
-            patch_count=0,
             errors=[]
         )
 
@@ -914,7 +871,7 @@ class StateDB:
         """Update a build job's status by its queue_job_id.
 
         Supports all queue_job_id formats:
-        - New:    'metroplex-{source}-{source_id}' (e.g. 'metroplex-linear-TOO-42')
+        - New:    'metroplex-{source}-{source_id}' (e.g. 'metroplex-skylynx-abc123')
         - Legacy: 'metroplex-{numeric_id}' (assumes ideaforge source)
 
         Also updates the corresponding priority_queue item if the status
@@ -952,7 +909,7 @@ class StateDB:
 
         parts = base_id.split("-", 2)  # Split into at most 3 parts
 
-        if len(parts) >= 3 and parts[0] == "metroplex" and parts[1] in ("ideaforge", "skylynx", "linear", "academy"):
+        if len(parts) >= 3 and parts[0] == "metroplex" and parts[1] in ("ideaforge", "skylynx"):
             # New format: metroplex-source-source_id (source_id may contain hyphens)
             source = parts[1]
             source_id = parts[2]
@@ -1026,7 +983,7 @@ class StateDB:
         source = None
         source_id = None
 
-        if len(parts) >= 3 and parts[0] == "metroplex" and parts[1] in ("ideaforge", "skylynx", "linear", "academy"):
+        if len(parts) >= 3 and parts[0] == "metroplex" and parts[1] in ("ideaforge", "skylynx"):
             source = parts[1]
             source_id = parts[2]
         elif len(parts) == 2 and parts[0] == "metroplex" and parts[1].isdigit():
@@ -1446,7 +1403,7 @@ class StateDB:
         parts = base_job_id.split("-", 2)
         source = None
         source_id = None
-        if len(parts) >= 3 and parts[0] == "metroplex" and parts[1] in ("ideaforge", "skylynx", "linear", "academy"):
+        if len(parts) >= 3 and parts[0] == "metroplex" and parts[1] in ("ideaforge", "skylynx"):
             source = parts[1]
             source_id = parts[2]
         elif len(parts) == 2 and parts[0] == "metroplex" and parts[1].isdigit():

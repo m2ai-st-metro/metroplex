@@ -62,7 +62,6 @@ def tmp_orchestrator(tmp_state_db, tmp_path):
         config=config,
         triage_gate=MagicMock(),
         build_orchestrator=MagicMock(),
-        patch_gate=MagicMock(),
         circuit_breaker=circuit_breaker,
         cycle_caps=cycle_caps,
         shutdown_handler=shutdown_handler,

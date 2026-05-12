@@ -20,9 +20,8 @@ from audit import AuditLogger
 from safety import CircuitBreaker, CycleCaps, ShutdownHandler
 from gates.triage import TriageGate
 from gates.build import BuildOrchestrator
-from gates.patcher import PatchGate
 from orchestrator import CycleOrchestrator
-from models import TriageDecision, BuildJob, PatchApplication
+from models import TriageDecision, BuildJob
 
 
 class TestCircuitBreakerPersistence:
@@ -138,48 +137,6 @@ class TestTriageGateCapEnforcement:
         db.close()
 
 
-class TestPatchGateCapEnforcement:
-    """Test that patch gate enforces max_patches_per_cycle cap."""
-
-    def test_max_5_patches_from_8_available(self):
-        """8 available patches should result in only 5 processed."""
-        config = Config()
-        config.max_patches_per_cycle = 5
-
-        db = StateDB(":memory:")
-        db.init_db()
-        audit = AuditLogger(os.devnull)
-
-        # Mock ST Records reader returning 8 agent patches
-        mock_reader = Mock()
-        mock_reader.get_approved_agent_patches.return_value = [
-            {
-                "patch_id": f"patch-{i}",
-                "agent_id": f"agent-{i}",
-                "target": "claude_md",
-                "section": "## Rules",
-                "operation": "append",
-                "value": f"- Rule {i}",
-                "rationale": "Test patch",
-            }
-            for i in range(1, 9)
-        ]
-
-        gate = PatchGate(
-            config=config,
-            state_db=db,
-            st_records_reader=mock_reader,
-            audit_logger=audit
-        )
-
-        patches = gate.run(dry_run=True)
-
-        # Only 5 should be processed (cap enforced by slicing in PatchGate.run)
-        assert len(patches) <= 5
-
-        db.close()
-
-
 class TestSIGTERMGracefulShutdown:
     """Test SIGTERM graceful shutdown of metroplex.py subprocess."""
 
@@ -266,13 +223,11 @@ class TestCycleSleepSecondsConfig:
 
         mock_triage = Mock(spec=TriageGate)
         mock_build = Mock(spec=BuildOrchestrator)
-        mock_patch = Mock(spec=PatchGate)
 
         orch = CycleOrchestrator(
             config=config,
             triage_gate=mock_triage,
             build_orchestrator=mock_build,
-            patch_gate=mock_patch,
             circuit_breaker=breaker,
             cycle_caps=caps,
             shutdown_handler=handler,

@@ -29,10 +29,8 @@ class TestConfigDefaults:
     def test_default_caps(self):
         with patch.dict("os.environ", {}, clear=False):
             os.environ.pop("METROPLEX_MAX_APPROVE_PER_CYCLE", None)
-            os.environ.pop("METROPLEX_MAX_PATCHES_PER_CYCLE", None)
             config = Config()
             assert config.max_approve_per_cycle == 3
-            assert config.max_patches_per_cycle == 5
 
     def test_default_circuit_breaker(self):
         config = Config()
@@ -57,11 +55,6 @@ class TestConfigDefaults:
         with patch.dict(os.environ, {"METROPLEX_BUILD_MAX_WORKERS": ""}):
             config = Config()
             assert config.build_max_workers == 2
-
-    def test_default_academy_repo(self):
-        config = Config()
-        assert config.academy_repo == "m2ai-st-metro/st-agent-registry"
-
 
 class TestConfigEnvOverrides:
     """Test Config environment variable overrides."""
@@ -90,12 +83,10 @@ class TestConfigEnvOverrides:
     def test_override_caps(self):
         env = {
             "METROPLEX_MAX_APPROVE_PER_CYCLE": "5",
-            "METROPLEX_MAX_PATCHES_PER_CYCLE": "10",
         }
         with patch.dict(os.environ, env):
             config = Config()
             assert config.max_approve_per_cycle == 5
-            assert config.max_patches_per_cycle == 10
 
     def test_override_build_model(self):
         with patch.dict(os.environ, {"METROPLEX_BUILD_MODEL": "sonnet"}):

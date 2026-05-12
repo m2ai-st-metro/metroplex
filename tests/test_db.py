@@ -6,7 +6,7 @@ import pytest
 from datetime import datetime
 
 from db import StateDB
-from models import TriageDecision, BuildJob, PatchApplication, GateStatus, PriorityItem
+from models import TriageDecision, BuildJob, GateStatus, PriorityItem
 
 
 def make_pq_item(**kwargs) -> PriorityItem:
@@ -56,7 +56,7 @@ class TestStateDBInit:
         assert "idx_cycles_started" in indexes
 
     def test_init_seeds_gate_status(self, db):
-        for gate in ["triage", "build", "patch"]:
+        for gate in ["triage", "build", "publish"]:
             status = db.get_gate_status(gate)
             assert status.gate == gate
             assert status.consecutive_failures == 0
@@ -250,48 +250,6 @@ class TestBuildJobRecords:
             )
 
 
-class TestPatchApplicationRecords:
-    """Test patch application recording."""
-
-    def test_record_and_query(self, db):
-        patch = PatchApplication(
-            patch_id="patch-abc",
-            persona_id="persona-xyz",
-            from_version="1.0",
-            to_version="1.1",
-            status="applied",
-            reason="success",
-            applied_at=datetime(2026, 2, 23, 15, 0, 0),
-        )
-        db.record_patch_application(patch)
-
-        cursor = db.conn.cursor()
-        cursor.execute("SELECT * FROM patch_applications WHERE patch_id = 'patch-abc'")
-        row = cursor.fetchone()
-
-        assert row["persona_id"] == "persona-xyz"
-        assert row["from_version"] == "1.0"
-        assert row["status"] == "applied"
-
-    def test_nullable_versions(self, db):
-        patch = PatchApplication(
-            patch_id="patch-null",
-            persona_id="p1",
-            from_version=None,
-            to_version=None,
-            status="skipped",
-            reason="no ops",
-            applied_at=datetime.now(),
-        )
-        db.record_patch_application(patch)
-
-        cursor = db.conn.cursor()
-        cursor.execute("SELECT * FROM patch_applications WHERE patch_id = 'patch-null'")
-        row = cursor.fetchone()
-        assert row["from_version"] is None
-        assert row["to_version"] is None
-
-
 class TestCycleRecords:
     """Test cycle start/end recording."""
 
@@ -341,10 +299,10 @@ class TestGateStatus:
         assert retrieved.halted is False
 
     def test_halt_gate(self, db):
-        status = GateStatus(gate="patch", consecutive_failures=3, halted=True, last_error="3 failures")
+        status = GateStatus(gate="publish", consecutive_failures=3, halted=True, last_error="3 failures")
         db.update_gate_status(status)
 
-        retrieved = db.get_gate_status("patch")
+        retrieved = db.get_gate_status("publish")
         assert retrieved.halted is True
 
     def test_reset_gate(self, db):
@@ -360,7 +318,7 @@ class TestGateStatus:
 
     def test_unknown_gate_returns_default(self, db):
         """Getting a gate not in the table returns a default."""
-        # The init seeds triage/build/patch, but let's query one that exists
+        # The init seeds triage/build/publish, but let's query one that exists
         status = db.get_gate_status("triage")
         assert status.gate == "triage"
 
@@ -715,30 +673,6 @@ class TestPriorityQueue:
         row = cursor.fetchone()
         assert row["status"] == "completed"
         assert row["completed_at"] is not None
-
-    def test_update_build_job_status_linear_source(self, db):
-        """New format job ID with linear source (non-digit source_id) syncs correctly."""
-        item = make_pq_item(
-            source="linear", source_id="TOO-42", title="Linear Issue",
-            description="Desc", priority_score=160.0,
-        )
-        row_id = db.enqueue_item(item)
-        db.update_item_status(row_id, "dispatched", "dispatched_at")
-
-        job = BuildJob(
-            idea_id=0, title="Linear Issue", spec_path="/tmp/spec.txt",
-            queue_job_id="metroplex-linear-TOO-42", status="queued",
-            queued_at=datetime(2026, 2, 27, 12, 0, 0),
-        )
-        db.record_build_job(job)
-
-        db.update_build_job_status("metroplex-linear-TOO-42", "failed")
-
-        cursor = db.conn.cursor()
-        cursor.execute(
-            "SELECT status FROM priority_queue WHERE source = 'linear' AND source_id = 'TOO-42'"
-        )
-        assert cursor.fetchone()["status"] == "failed"
 
     def test_update_build_job_status_ideaforge_new_format(self, db):
         """New format with ideaforge source (backward compat with numeric IDs)."""

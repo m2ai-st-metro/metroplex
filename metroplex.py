@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 """
 Metroplex CLI - Autonomous Build Layer Entry Point
-Orchestrates triage, build, and patch gates with safety systems.
+Orchestrates triage and build gates with safety systems.
 """
 import sys
 import os
@@ -17,7 +17,6 @@ from audit import AuditLogger
 from safety import CircuitBreaker, CycleCaps, ShutdownHandler
 from gates.triage import TriageGate
 from gates.build import SpecGenerator, BuildOrchestrator
-from gates.patcher import PatchGate
 from gates.publish import PublishGate
 from gates.readme import ReadmeGate
 from gates.readiness import ReadinessGate
@@ -25,9 +24,7 @@ from gates.review import ReviewGate
 from orchestrator import CycleOrchestrator
 from notifier import create_notifier, FilteredNotifier
 from readers.ideaforge_reader import IdeaForgeReader
-from readers.academy_reader import AcademyReader
 from readers.skylynx_reader import SkyLynxReader
-from readers.st_records_reader import STRecordsReader
 from dispatcher import create_dispatcher, route_to_worker, build_dispatch_prompt
 from outcome_emitter import create_outcome_emitter
 from dashboard import compute_funnel_metrics, format_funnel_output
@@ -87,22 +84,10 @@ def initialize_components(config: Config):
         ideaforge_reader = None
 
     try:
-        st_records_reader = STRecordsReader(config.st_records_db)
-    except FileNotFoundError:
-        print(f"Warning: ST Records DB not found at {config.st_records_db}")
-        st_records_reader = None
-
-    try:
         skylynx_reader = SkyLynxReader(config.st_records_db)
     except FileNotFoundError:
         print(f"Warning: ST Records DB not found at {config.st_records_db} (Sky-Lynx reader)")
         skylynx_reader = None
-
-    # Initialize Academy reader (reads from promotions JSONL file)
-    academy_reader = AcademyReader(
-        promotions_path=config.academy_promotions_path,
-        academy_dir=config.academy_dir,
-    )
 
     # Initialize gates
     triage_gate = TriageGate(
@@ -133,13 +118,6 @@ def initialize_components(config: Config):
         audit_logger=audit_logger,
         ideaforge_reader=ideaforge_reader,
         adapter=build_adapter,
-    )
-
-    patch_gate = PatchGate(
-        config=config,
-        state_db=state_db,
-        st_records_reader=st_records_reader,
-        audit_logger=audit_logger
     )
 
     publish_gate = PublishGate(
@@ -194,7 +172,6 @@ def initialize_components(config: Config):
         config=config,
         triage_gate=triage_gate,
         build_orchestrator=build_orchestrator,
-        patch_gate=patch_gate,
         circuit_breaker=circuit_breaker,
         cycle_caps=cycle_caps,
         shutdown_handler=shutdown_handler,
@@ -203,7 +180,6 @@ def initialize_components(config: Config):
         cycle_sleep_seconds=config.cycle_sleep_seconds,
         notifier=notifier,
         skylynx_reader=skylynx_reader,
-        academy_reader=academy_reader,
         publish_gate=publish_gate,
         review_gate=review_gate,
         dispatcher=dispatcher,
@@ -340,42 +316,6 @@ def cmd_build(args, config: Config):
         state_db.close()
 
 
-def cmd_patch(args, config: Config):
-    """
-    Run Gate 3 (patch) only.
-
-    Args:
-        args: Parsed command-line arguments
-        config: Metroplex configuration
-
-    Returns:
-        Exit code (0=success, 1=error, 2=halted)
-    """
-    orchestrator, state_db, circuit_breaker = initialize_components(config)
-
-    # Check if gate is halted
-    if circuit_breaker.is_halted("patch"):
-        print("ERROR: Patch gate is halted by circuit breaker")
-        print("Run 'metroplex.py reset --gate patch' to reset")
-        return 2
-
-    try:
-        print("Running Gate 3 (Patch)...")
-        patches = orchestrator.patch_gate.run(dry_run=args.dry_run)
-
-        print(f"\nCompleted: {len(patches)} patches")
-        print(f"  Applied: {sum(1 for p in patches if p.status == 'applied')}")
-        print(f"  Failed: {sum(1 for p in patches if p.status == 'failed')}")
-        print(f"  Skipped: {sum(1 for p in patches if p.status == 'skipped')}")
-
-        return 0
-    except Exception as e:
-        print(f"ERROR: {e}")
-        return 1
-    finally:
-        state_db.close()
-
-
 def cmd_publish(args, config: Config):
     """
     Run Gate 4 (publish) only -- push completed builds to GitHub.
@@ -433,7 +373,7 @@ def cmd_publish(args, config: Config):
 
 def cmd_run_all(args, config: Config):
     """
-    Run full cycle (triage → build → publish → patch).
+    Run full cycle (triage → build → publish).
 
     Args:
         args: Parsed command-line arguments
@@ -461,7 +401,6 @@ def cmd_run_all(args, config: Config):
         print(f"Total triage decisions: {sum(r.triage_count for r in results)}")
         print(f"Total build jobs: {sum(r.build_count for r in results)}")
         print(f"Total published: {sum(r.publish_count for r in results)}")
-        print(f"Total patches: {sum(r.patch_count for r in results)}")
         print(f"Total errors: {sum(len(r.errors) for r in results)}")
 
         return 0
@@ -577,7 +516,7 @@ def cmd_status(args, config: Config):
             print(f"  {cycle['cycle_id']}")
             print(f"    Started: {started}")
             print(f"    Completed: {completed}")
-            print(f"    Triage: {cycle['triage_count']}, Build: {cycle['build_count']}, Patch: {cycle['patch_count']}")
+            print(f"    Triage: {cycle['triage_count']}, Build: {cycle['build_count']}")
             if errors:
                 print(f"    Errors: {len(errors)}")
 
@@ -770,7 +709,7 @@ def cmd_reset(args, config: Config):
 
     try:
         if args.gate == "all":
-            gates = ["triage", "build", "publish", "patch"]
+            gates = ["triage", "build", "publish"]
         else:
             gates = [args.gate]
 
@@ -1451,12 +1390,8 @@ def main():
     publish_parser = subparsers.add_parser("publish", help="Run Gate 4 (publish) -- push builds to GitHub")
     publish_parser.add_argument("--dry-run", action="store_true", help="Show what would be published without creating repos")
 
-    # patch command
-    patch_parser = subparsers.add_parser("patch", help="Run Gate 3 (patch) only")
-    patch_parser.add_argument("--dry-run", action="store_true", help="Print patches without applying")
-
     # run-all command
-    run_all_parser = subparsers.add_parser("run-all", help="Run full cycle (triage → build → publish → patch)")
+    run_all_parser = subparsers.add_parser("run-all", help="Run full cycle (triage → build → publish)")
     run_all_parser.add_argument("--dry-run", action="store_true", help="Run in dry-run mode")
     run_all_parser.add_argument("--cycles", type=int, default=1, help="Number of cycles (0=infinite)")
 
@@ -1506,7 +1441,7 @@ def main():
 
     # reset command
     reset_parser = subparsers.add_parser("reset", help="Reset circuit breaker")
-    reset_parser.add_argument("--gate", required=True, choices=["triage", "build", "publish", "patch", "all"], help="Gate to reset")
+    reset_parser.add_argument("--gate", required=True, choices=["triage", "build", "publish", "all"], help="Gate to reset")
 
     # recalibrate command
     recalibrate_parser = subparsers.add_parser("recalibrate", help="Force-reset quality ratchet threshold to current proposed value")
@@ -1552,8 +1487,6 @@ def main():
         sys.exit(cmd_build(args, config))
     elif args.command == "publish":
         sys.exit(cmd_publish(args, config))
-    elif args.command == "patch":
-        sys.exit(cmd_patch(args, config))
     elif args.command == "run-all":
         # Single-instance lock: prevent dual metroplex daemons writing to
         # the same SQLite DB (Bug 2 — April 3 orphan process).

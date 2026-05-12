@@ -5,8 +5,8 @@ Looks up IdeaForge context (problem_statement, target_audience, plain descriptio
 for a given build_job_id so downstream publish-phase gates (README, Readiness)
 can use the original plain-speak framing instead of re-deriving it from code.
 
-Returns None for builds that did not originate in IdeaForge (e.g. Sky-Lynx,
-Linear, Academy) -- callers fall back to their prior behavior.
+Returns None for builds that did not originate in IdeaForge (e.g. Sky-Lynx)
+-- callers fall back to their prior behavior.
 """
 import logging
 from pathlib import Path

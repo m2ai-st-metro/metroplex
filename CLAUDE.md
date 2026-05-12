@@ -1,6 +1,6 @@
 # CLAUDE.md — Metroplex
 
-L5 autonomy layer for the ST Metro ecosystem. Closes all human gates in the feedback loop: triage ideas, build projects, apply persona patches, and publish to GitHub.
+L5 autonomy layer for the ST Metro ecosystem. Closes all human gates in the feedback loop: triage ideas, build projects, and publish to GitHub.
 
 ## Setup
 
@@ -21,7 +21,6 @@ All API keys sourced from `~/.env.shared` — no separate `.env` needed.
 source venv/bin/activate
 python metroplex.py triage [--dry-run]                          # Gate 1: score & threshold
 python metroplex.py build [--dry-run] [--idea-id N]             # Gate 2: spec + YCE dispatch
-python metroplex.py patch [--dry-run]                           # Gate 3: persona YAML patches
 python metroplex.py publish [--dry-run]                         # Gate 4: GitHub repo push
 ```
 
@@ -52,7 +51,6 @@ pytest tests/ -v                          # All 315 tests
 pytest tests/test_orchestrator.py -v      # Orchestrator
 pytest tests/test_triage.py -v            # Triage gate
 pytest tests/test_build.py -v             # Build gate
-pytest tests/test_patcher.py -v           # Patch gate
 pytest tests/test_dispatcher.py -v        # EA-Claude dispatch
 pytest tests/test_continuous.py -v        # Systemd + circuit breakers
 pytest tests/test_safety.py -v            # Circuit breaker, caps, shutdown
@@ -72,13 +70,12 @@ Service unit: `deploy/metroplex.service` — runs `run-all --cycles 0` with `Res
 
 ## Architecture
 
-### Four Gates
+### Gates
 
 | Gate | Class | Purpose |
 |------|-------|---------|
 | 1 Triage | `gates/triage.py` | Score IdeaForge ideas against thresholds, approve/reject/defer |
 | 2 Build | `gates/build.py` | Generate spec via LLM, dispatch to YCE Harness |
-| 3 Patch | `gates/patcher.py` | Apply ST Records persona YAML patches via git clone/commit/push |
 | 4 Publish | `gates/publish.py` | Create repos on configured hosts (GitHub `m2ai-portfolio` org and/or GitLab `m2ai-portfolio` group), push completed builds. First entry in `publish_targets` is primary; subsequent entries are mirrors (their URLs go in `publish_jobs.mirror_urls`, per-target outcome in `targets_status`). |
 | 4.5 Review | `gates/review.py` | Automated quality checks before publish (source code, README, no secrets, no large files) |
 
@@ -87,16 +84,13 @@ Service unit: `deploy/metroplex.service` — runs `run-all --cycles 0` with `Res
 | Reader | DB | Access |
 |--------|----|--------|
 | `readers/ideaforge_reader.py` | ideaforge.db | Read + claim (status='classified') |
-| `readers/st_records_reader.py` | persona_metrics.db | Read + patch status updates |
 | `readers/skylynx_reader.py` | persona_metrics.db | Read-only (recommendations) |
-| `readers/academy_reader.py` | File system | Read-only (promotions) |
 
 ### Priority Queue
 
 All approved/recommended items compete via weighted scores:
 - IdeaForge: weight 1.0
 - Sky-Lynx: weight 1.5
-- Academy: weight 2.0
 
 ### YCE Dispatch
 
@@ -109,7 +103,7 @@ Failed builds are automatically retried up to 3 times with exponential backoff (
 ### Safety Systems
 
 - **Circuit breaker**: 3 consecutive failures halts a gate. Reset via `metroplex.py reset`.
-- **Cycle caps**: Max 3 approvals, 5 patches, 3 publishes per cycle.
+- **Cycle caps**: Max 3 approvals, 3 publishes per cycle.
 - **Shutdown handler**: SIGTERM triggers finish-current-cycle then clean exit.
 - **Schedule windows**: Hour range + day-of-week filters.
 
@@ -147,7 +141,6 @@ Non-buildable items routed to EA-Claude workers via `WORKER_ROUTES` dict. Writes
 
 ### Cycle Limits
 - `METROPLEX_MAX_APPROVE_PER_CYCLE` (3)
-- `METROPLEX_MAX_PATCHES_PER_CYCLE` (5)
 - `METROPLEX_MAX_PUBLISH_PER_CYCLE` (3)
 - `METROPLEX_MAX_CONCURRENT_BUILDS` (1)
 
