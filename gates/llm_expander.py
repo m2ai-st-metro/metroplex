@@ -487,7 +487,7 @@ Produce a Markdown document with these sections (use `## ` headings):
 IMPORTANT RULES:
 - The spec must be SPECIFIC to this idea. Reference the struggling_user by name (invent a name if absent). Reference at least one concrete moment from the Scene.
 - Every E2E test name must describe a Scene, not a function (e.g., `test_e2e_2am_normal_hunger_scene`, not `test_e2e_input_validation`).
-- Total length 80 to 350 lines of markdown. Shorter is better.
+- Target length: 120 to 200 lines of markdown. Specs under 80 lines are rejected as under-specified; specs over 350 are over-scoped.
 - No external services. No API keys hardcoded.
 - Output ONLY the Markdown spec, no preamble, no reasoning.
 """
