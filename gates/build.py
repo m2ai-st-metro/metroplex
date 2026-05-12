@@ -19,7 +19,12 @@ from models import BuildJob, PriorityItem
 from db import StateDB
 from audit import AuditLogger
 from cost_rates import estimate_cost
-from gates.llm_expander import LLMSpecExpander, validate_spec, format_failure_feedback
+from gates.llm_expander import (
+    LLMSpecExpander,
+    validate_spec,
+    validate_agent_spec,
+    format_failure_feedback,
+)
 from postmortem import capture_postmortem, get_failure_patterns
 from oz_bridge import submit_to_oz
 from readers.ideaforge_reader import IdeaForgeReader
@@ -116,6 +121,16 @@ class SpecGenerator:
         if missing_fields:
             raise ValueError(f"Idea missing required fields: {missing_fields}")
 
+        # R-A item 1: strict rubric dispatch. Builder is now agent-shape only.
+        # The queue-level guard (R-A item 3) rejects non-life_domain at dequeue;
+        # this is defense-in-depth for any future code path that bypasses the
+        # queue. Raise BEFORE any LLM call so cost ledger stays clean.
+        rubric = idea.get("scoring_rubric")
+        if rubric != "life_domain":
+            raise ValueError(
+                f"Builder requires scoring_rubric='life_domain'; got {rubric!r}"
+            )
+
         # Create output directory if it doesn't exist
         output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -136,6 +151,14 @@ class SpecGenerator:
             except Exception as e:
                 logger.warning("Failed to fetch failure patterns for spec feedback: %s", e)
 
+        # Observable signal — log which prompt path this build used.
+        # Cost ledger entries land under source='spec_expander_agent' so
+        # operator can grep agent vs tech generation without parsing logs.
+        logger.info(
+            "SpecGenerator: agent-shape dispatch for idea %s (rubric=%s)",
+            idea["id"], rubric,
+        )
+
         # Retry loop: Nemotron-3 leaks CoT ~43% of the time and occasionally
         # parrots prompt instructions. These are stochastic -- a second call
         # usually produces a clean spec. Retry here instead of burning a
@@ -144,7 +167,7 @@ class SpecGenerator:
         last_rejection = ""
         for spec_attempt in range(max_spec_attempts):
             try:
-                rendered_spec = self.llm_expander.expand(
+                rendered_spec = self.llm_expander.expand_agent(
                     idea,
                     failure_patterns=failure_patterns,
                     queue_job_id=queue_job_id,
@@ -154,12 +177,12 @@ class SpecGenerator:
                     f"LLM expansion failed for idea {idea['id']} ({idea['title']}): {e}"
                 ) from e
 
-            is_valid, rejection_reason = validate_spec(rendered_spec)
+            is_valid, rejection_reason = validate_agent_spec(rendered_spec)
             if is_valid:
                 break
             last_rejection = rejection_reason
             logger.warning(
-                "Spec validation failed for idea %s (attempt %d/%d): %s",
+                "Agent spec validation failed for idea %s (attempt %d/%d): %s",
                 idea["id"], spec_attempt + 1, max_spec_attempts, rejection_reason,
             )
         else:
@@ -1182,6 +1205,41 @@ class BuildOrchestrator:
                     if not dry_run and item.id:
                         state_db.update_item_status(item.id, "failed", "completed_at")
                     continue
+            else:
+                # R-A item 1 (Codex Round 1 HIGH): non-ideaforge sources
+                # (skylynx, linear, academy) do not carry scoring_rubric and
+                # SpecGenerator.generate_spec now hard-fails non-life_domain.
+                # Gate these at the queue so the failure is loud, observable,
+                # and does NOT burn a build slot. The pivot doc §10 R5 (R-A
+                # plan, 2026-05-11) freezes the active pool to ideaforge
+                # life_domain; until a non-ideaforge source grows a rubric,
+                # those sources are bypassed by design.
+                #
+                # If we ever re-enable a non-ideaforge source: stamp
+                # scoring_rubric='life_domain' upstream (in the reader) and
+                # remove this branch — do NOT bypass the agent-shape gate.
+                logger.info(
+                    "Build dequeue REJECT for non-ideaforge source=%r item=%r: "
+                    "Builder now requires scoring_rubric='life_domain' which "
+                    "only ideaforge carries today (R-A item 1)",
+                    item.source, item.id,
+                )
+                self.audit_logger.log_decision(
+                    gate="build",
+                    action="source_rubric_rejected",
+                    details={
+                        "idea_id": idea.get("id"),
+                        "title": idea.get("title"),
+                        "source": item.source,
+                        "reason": (
+                            "non-ideaforge source has no scoring_rubric; "
+                            "agent-shape Builder requires life_domain"
+                        ),
+                    },
+                )
+                if not dry_run and item.id:
+                    state_db.update_item_status(item.id, "failed", "completed_at")
+                continue
 
             # Idea quality gate: reject ideas with insufficient data
             idea_description = idea.get("description") or ""
