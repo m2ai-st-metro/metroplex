@@ -67,7 +67,6 @@ class Config:
     # Priority queue source weights
     ideaforge_weight: float = field(default=1.0)
     skylynx_weight: float = field(default=1.5)
-    linear_weight: float = field(default=2.0)
     academy_weight: float = field(default=2.0)
 
     # Academy integration (persona -> agent promotions)
@@ -78,11 +77,6 @@ class Config:
     telegram_bot_token: str = field(default="")
     telegram_chat_id: str = field(default="")
     notify_mode: str = field(default="all")
-
-    # Linear integration (via Arcade SDK)
-    linear_team: str = field(default="")
-    linear_label_filter: str = field(default="metroplex")
-    linear_poll_states: str = field(default="Backlog,Todo")
 
     # Spec generation (LLM expansion)
     spec_use_llm: bool = field(default=True)
@@ -215,10 +209,6 @@ class Config:
         except ValueError:
             pass
         try:
-            self.linear_weight = float(os.environ.get("METROPLEX_LINEAR_WEIGHT", self.linear_weight))
-        except ValueError:
-            pass
-        try:
             self.academy_weight = float(os.environ.get("METROPLEX_ACADEMY_WEIGHT", self.academy_weight))
         except ValueError:
             pass
@@ -226,11 +216,6 @@ class Config:
         # Academy
         self.academy_dir = os.environ.get("METROPLEX_ACADEMY_DIR", self.academy_dir)
         self.academy_promotions_path = os.environ.get("METROPLEX_ACADEMY_PROMOTIONS_PATH", self.academy_promotions_path)
-
-        # Linear
-        self.linear_team = os.environ.get("METROPLEX_LINEAR_TEAM", self.linear_team)
-        self.linear_label_filter = os.environ.get("METROPLEX_LINEAR_LABEL_FILTER", self.linear_label_filter)
-        self.linear_poll_states = os.environ.get("METROPLEX_LINEAR_POLL_STATES", self.linear_poll_states)
 
         # Spec generation (LLM expansion)
         self.spec_use_llm = os.environ.get("METROPLEX_SPEC_USE_LLM", "").lower() not in ("0", "false", "no")

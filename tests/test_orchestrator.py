@@ -999,11 +999,11 @@ class TestDispatchIntegration:
         assert dispatcher.dispatched[0]["worker_type"] == "ravage"
 
     def test_dispatch_skips_buildable_sources(self, config, state_db, audit_logger):
-        """IdeaForge/linear/academy items are NOT dispatched (handled by Gate 2)."""
+        """IdeaForge/academy items are NOT dispatched (handled by Gate 2)."""
         from models import PriorityItem
         from dispatcher import LogDispatcher
 
-        for source in ("ideaforge", "linear", "academy"):
+        for source in ("ideaforge", "academy"):
             item = make_pq_item(
                 source=source,
                 source_id=f"{source}-001",

@@ -106,7 +106,6 @@ All settings via environment variables (prefix `METROPLEX_`). Set in `~/.env.sha
 | `METROPLEX_CYCLE_SLEEP_SECONDS` | `60` | Sleep between cycles (warning if < 10) |
 | `METROPLEX_IDEAFORGE_WEIGHT` | `1.0` | Priority queue weight for IdeaForge items |
 | `METROPLEX_SKYLYNX_WEIGHT` | `1.5` | Priority queue weight for Sky-Lynx items |
-| `METROPLEX_LINEAR_WEIGHT` | `2.0` | Priority queue weight for Linear items |
 | `METROPLEX_TELEGRAM_BOT_TOKEN` | *(empty)* | Telegram Bot API token (optional) |
 | `METROPLEX_TELEGRAM_CHAT_ID` | *(empty)* | Telegram chat ID for notifications |
 | `METROPLEX_SCHEDULE_START` | `0` | Active window start hour (0-23) |

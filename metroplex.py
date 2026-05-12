@@ -25,7 +25,6 @@ from gates.review import ReviewGate
 from orchestrator import CycleOrchestrator
 from notifier import create_notifier, FilteredNotifier
 from readers.ideaforge_reader import IdeaForgeReader
-from readers.linear_reader import LinearReader
 from readers.academy_reader import AcademyReader
 from readers.skylynx_reader import SkyLynxReader
 from readers.st_records_reader import STRecordsReader
@@ -98,28 +97,6 @@ def initialize_components(config: Config):
     except FileNotFoundError:
         print(f"Warning: ST Records DB not found at {config.st_records_db} (Sky-Lynx reader)")
         skylynx_reader = None
-
-    # Initialize Linear reader (requires ARCADE_API_KEY)
-    import os
-    arcade_key = os.environ.get("ARCADE_API_KEY", "")
-    if arcade_key and config.linear_team:
-        try:
-            linear_reader = LinearReader(
-                arcade_api_key=arcade_key,
-                arcade_user_id=os.environ.get("ARCADE_USER_ID", "agent@local"),
-                team=config.linear_team,
-                label_filter=config.linear_label_filter,
-                poll_states=config.linear_poll_states,
-            )
-        except (ValueError, Exception) as e:
-            print(f"Warning: Linear reader init failed: {e}")
-            linear_reader = None
-    else:
-        linear_reader = None
-        if not arcade_key:
-            pass  # Silent -- Arcade key not configured
-        elif not config.linear_team:
-            pass  # Silent -- no team configured
 
     # Initialize Academy reader (reads from promotions JSONL file)
     academy_reader = AcademyReader(
@@ -226,7 +203,6 @@ def initialize_components(config: Config):
         cycle_sleep_seconds=config.cycle_sleep_seconds,
         notifier=notifier,
         skylynx_reader=skylynx_reader,
-        linear_reader=linear_reader,
         academy_reader=academy_reader,
         publish_gate=publish_gate,
         review_gate=review_gate,

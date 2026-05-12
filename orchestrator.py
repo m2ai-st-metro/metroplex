@@ -29,7 +29,6 @@ from dispatcher import Dispatcher, LogDispatcher, route_to_worker, build_dispatc
 from readers.academy_reader import AcademyReader
 from oz_bridge import poll_oz_run
 from readers.skylynx_reader import SkyLynxReader
-from readers.linear_reader import LinearReader
 from outcome_emitter import OutcomeEmitter
 from event_emitter import EventEmitter
 from gates.quality_scorer import score_project
@@ -60,7 +59,6 @@ class CycleOrchestrator:
         cycle_sleep_seconds: int = 60,
         notifier: Notifier | None = None,
         skylynx_reader: SkyLynxReader | None = None,
-        linear_reader: LinearReader | None = None,
         academy_reader: AcademyReader | None = None,
         publish_gate: PublishGate | None = None,
         review_gate: ReviewGate | None = None,
@@ -87,7 +85,6 @@ class CycleOrchestrator:
             cycle_sleep_seconds: Sleep duration between cycles (default 60)
             notifier: Notification backend (defaults to LogNotifier)
             skylynx_reader: SkyLynxReader instance (optional, enables Sky-Lynx intake)
-            linear_reader: LinearReader instance (optional, enables Linear intake)
             academy_reader: AcademyReader instance (optional, enables Academy promotion intake)
             publish_gate: PublishGate instance (optional, enables Gate 4)
             review_gate: ReviewGate instance (optional, enables Gate 4.5 code review)
@@ -111,7 +108,6 @@ class CycleOrchestrator:
         self.cycle_sleep_seconds = cycle_sleep_seconds
         self.notifier = notifier or LogNotifier()
         self.skylynx_reader = skylynx_reader
-        self.linear_reader = linear_reader
         self.academy_reader = academy_reader
         self.dispatcher = dispatcher or LogDispatcher()
         self.outcome_emitter = outcome_emitter
@@ -353,56 +349,6 @@ class CycleOrchestrator:
 
         return count
 
-    def ingest_linear(self, dry_run: bool = False) -> int:
-        """
-        Ingest issues from Linear into the priority queue.
-
-        Linear issues bypass triage (they are already triaged in Linear)
-        and enqueue directly with linear_weight applied.
-
-        Args:
-            dry_run: If True, count items but don't write to DB
-
-        Returns:
-            Number of issues enqueued
-        """
-        if self.linear_reader is None:
-            return 0
-
-        try:
-            issues = self.linear_reader.get_issues()
-        except Exception as e:
-            self.audit_logger.log_error("linear_intake", f"Failed to read issues: {e}")
-            return 0
-
-        if not issues:
-            return 0
-
-        count = 0
-        for issue in issues:
-            base_score = self.linear_reader.priority_to_score(issue.get("priority", 0))
-            priority_score = base_score * self.config.linear_weight
-            idea = self.linear_reader.issue_to_idea(issue)
-
-            item = PriorityItem(
-                source="linear",
-                source_id=issue["identifier"],
-                title=issue["title"],
-                description=issue.get("description", issue["title"]) or issue["title"],
-                priority_score=priority_score,
-                idea_data=json.dumps(idea, default=str),
-            )
-
-            if dry_run:
-                print(f"  [DRY RUN] Would enqueue Linear: {issue['identifier']} {issue['title']} (score={priority_score:.1f})")
-                count += 1
-            else:
-                row_id = self.state_db.enqueue_item(item)
-                if row_id > 0:
-                    count += 1  # Linear has no write-back (no "mark dispatched")
-
-        return count
-
     def ingest_academy(self, dry_run: bool = False) -> int:
         """
         Ingest pending Academy persona promotions into the priority queue.
@@ -473,7 +419,7 @@ class CycleOrchestrator:
         parts = base_id.split("-", 2)
         source = None
         source_id = None
-        if len(parts) >= 3 and parts[0] == "metroplex" and parts[1] in ("ideaforge", "skylynx", "linear", "academy"):
+        if len(parts) >= 3 and parts[0] == "metroplex" and parts[1] in ("ideaforge", "skylynx", "academy"):
             source = parts[1]
             source_id = parts[2]
         elif len(parts) == 2 and parts[0] == "metroplex" and parts[1].isdigit():
@@ -494,7 +440,7 @@ class CycleOrchestrator:
         """
         Dispatch non-buildable priority queue items to ClaudeClaw workers.
 
-        Buildable items (ideaforge/linear/academy) are handled by Gate 2 (build).
+        Buildable items (ideaforge/academy) are handled by Gate 2 (build).
         Non-buildable items (skylynx) route to ClaudeClaw workers via the dispatcher.
 
         Args:
@@ -741,7 +687,7 @@ class CycleOrchestrator:
         """
         Run a single Metroplex cycle: intake -> triage -> build -> patch.
 
-        Intake: Sky-Lynx + Linear (bypass triage, direct to queue).
+        Intake: Sky-Lynx (bypass triage, direct to queue).
         Build gate pulls from the priority queue (populated by triage + intake).
 
         Args:
@@ -785,12 +731,6 @@ class CycleOrchestrator:
         if skylynx_count > 0:
             print(f"+ Sky-Lynx intake: {skylynx_count} recommendations enqueued")
             self.notifier.notify(f"Sky-Lynx: {skylynx_count} recommendations enqueued")
-
-        # Linear Intake (enqueue issues directly into priority queue)
-        linear_count = self.ingest_linear(dry_run=dry_run)
-        if linear_count > 0:
-            print(f"+ Linear intake: {linear_count} issues enqueued")
-            self.notifier.notify(f"Linear: {linear_count} issues enqueued")
 
         # Academy Intake (enqueue persona promotions directly into priority queue)
         academy_count = self.ingest_academy(dry_run=dry_run)

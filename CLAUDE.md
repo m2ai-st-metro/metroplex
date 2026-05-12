@@ -89,7 +89,6 @@ Service unit: `deploy/metroplex.service` — runs `run-all --cycles 0` with `Res
 | `readers/ideaforge_reader.py` | ideaforge.db | Read + claim (status='classified') |
 | `readers/st_records_reader.py` | persona_metrics.db | Read + patch status updates |
 | `readers/skylynx_reader.py` | persona_metrics.db | Read-only (recommendations) |
-| `readers/linear_reader.py` | Linear API (Arcade) | Read-only |
 | `readers/academy_reader.py` | File system | Read-only (promotions) |
 
 ### Priority Queue
@@ -97,7 +96,6 @@ Service unit: `deploy/metroplex.service` — runs `run-all --cycles 0` with `Res
 All approved/recommended items compete via weighted scores:
 - IdeaForge: weight 1.0
 - Sky-Lynx: weight 1.5
-- Linear: weight 2.0
 - Academy: weight 2.0
 
 ### YCE Dispatch
@@ -195,7 +193,6 @@ After changing any of these, restart the metroplex service (`systemctl --user re
 pydantic>=2.0
 pyyaml
 pytest
-arcadepy
 anthropic>=0.40.0
 ```
 
