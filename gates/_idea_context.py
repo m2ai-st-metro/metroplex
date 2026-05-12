@@ -63,4 +63,9 @@ def load_idea_context(
         "problem_statement": (idea.get("problem_statement") or "").strip(),
         "target_audience": (idea.get("target_audience") or "").strip(),
         "struggling_user": (idea.get("struggling_user") or "").strip(),
+        # R-A 1.6 (2026-05-12): expose the synthesizer-only fields the
+        # Builder + README anchor on. Empty strings (not None) so
+        # downstream prompts can interpolate without None-handling.
+        "agentic_relief": (idea.get("agentic_relief") or "").strip(),
+        "weight_hint": (idea.get("weight_hint") or "").strip(),
     }

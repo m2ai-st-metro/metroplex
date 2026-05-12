@@ -145,7 +145,14 @@ class SkyLynxReader:
 
         The idea_data stored in the priority queue must contain the fields
         expected by SpecGenerator (id, title, description, problem_statement,
-        target_audience, artifact_type).
+        target_audience, artifact_type, scoring_rubric).
+
+        Pivot R-A 1.7 (2026-05-12): every Sky-Lynx-sourced idea is stamped
+        with scoring_rubric='life_domain' and artifact_type='ccos_agent' so
+        the post-pivot dequeue guard (build.py REJECTs non-life_domain
+        rows and non-CCOS artifact types) admits them. Sky-Lynx is the
+        closed-loop learning component and ships its recommendations
+        through the same CCOS-agent build path as the IdeaForge feed.
 
         Args:
             rec: Recommendation dictionary from get_pending_recommendations()
@@ -162,25 +169,17 @@ class SkyLynxReader:
         if suggested_change:
             full_description = f"{description}\n\nSuggested change: {suggested_change}"
 
-        # Map recommendation_type to artifact_type
-        rec_type = rec.get("recommendation_type", "")
-        if rec_type in ("pipeline_change", "infrastructure"):
-            artifact_type = "tool"
-        elif rec_type in ("claude_md_update", "persona_update"):
-            artifact_type = "agent"
-        else:
-            artifact_type = "tool"
-
         return {
             "id": rec["recommendation_id"],
             "title": rec["title"],
             "description": full_description,
             "problem_statement": description,
             "target_audience": f"ST Metro ecosystem ({rec.get('target_system', 'general')})",
-            "artifact_type": artifact_type,
+            "artifact_type": "ccos_agent",
+            "scoring_rubric": "life_domain",
             "weighted_score": self.priority_to_score(rec.get("priority", "medium")) / 10.0,
             "_source": "skylynx",
-            "_recommendation_type": rec_type,
+            "_recommendation_type": rec.get("recommendation_type", ""),
             "_scope": rec.get("scope", ""),
         }
 

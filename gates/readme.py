@@ -57,6 +57,15 @@ the opening scene, not as a section to paste verbatim):
 **Target audience** (who lives this problem daily):
 {target_audience}
 
+**Struggling user** (the specific persona quote -- name them in The Scene
+and The Weight by their first name or role; do NOT paste the quote
+verbatim, dramatize from it):
+{struggling_user}
+
+**Agentic relief** (the moment of relief the agent delivers -- use this
+as raw material for The Turn; describe the feeling, not the mechanism):
+{agentic_relief}
+
 **App Specification**:
 {spec_text}
 
@@ -334,6 +343,8 @@ class ReadmeGate:
             return {"build_job_id": build_job_id, "status": "failed", "error": error}
 
         target_audience = (idea_ctx or {}).get("target_audience", "") or ""
+        struggling_user = (idea_ctx or {}).get("struggling_user", "") or ""
+        agentic_relief = (idea_ctx or {}).get("agentic_relief", "") or ""
 
         # 4. Generate infographic via banana-maker (do this BEFORE README so we
         #    can tell the LLM whether to include the <img> tag)
@@ -361,6 +372,8 @@ class ReadmeGate:
             plain_description=plain_description,
             problem_statement=problem_statement,
             target_audience=target_audience,
+            struggling_user=struggling_user,
+            agentic_relief=agentic_relief,
             clone_url=clone_url,
             has_infographic=infographic_ok,
             compressed_tagline=compressed_tagline,
@@ -484,6 +497,8 @@ class ReadmeGate:
         plain_description: str = "",
         problem_statement: str = "",
         target_audience: str = "",
+        struggling_user: str = "",
+        agentic_relief: str = "",
         clone_url: str = "",
         has_infographic: bool = True,
         compressed_tagline: str = "",
@@ -501,6 +516,12 @@ class ReadmeGate:
                 for The Scene opening). Empty string if not available.
             target_audience: Who lives this problem daily (used for The Scene and
                 The Weight sections). Empty string if not available.
+            struggling_user: First-person persona quote from IdeaForge (R-A 1.6).
+                Used to anchor The Scene and The Weight in a named human, not a
+                category. Empty string falls back to a target-audience prompt.
+            agentic_relief: Description of the relief the agent delivers (R-A 1.6).
+                Raw material for The Turn -- describes the feeling, not the
+                mechanism. Empty string falls back to an abstract turn prompt.
             clone_url: Git clone URL for the Quick Start section.
             has_infographic: Whether an infographic image exists.
             compressed_tagline: Pre-compressed single-sentence tagline for the
@@ -519,6 +540,8 @@ class ReadmeGate:
             plain_description=plain_description or "(not provided -- write a concise one-liner from the spec)",
             problem_statement=problem_statement or "(not provided -- invent a concrete daily struggle for the target audience)",
             target_audience=target_audience or "(not provided -- infer from the spec who would use this daily)",
+            struggling_user=struggling_user or "(not provided -- invent a plausible first-person quote from the target audience)",
+            agentic_relief=agentic_relief or "(not provided -- describe the relief abstractly, in terms of the feeling, not the mechanism)",
             author_line=self._build_author_line(),
             clone_url=clone_url or "(clone URL not available -- use a placeholder)",
             has_infographic="yes" if has_infographic else "no",

@@ -121,14 +121,31 @@ class IdeaForgeReader:
         # any future "switch on env var / config" change inherits the
         # parameterized call shape. Today the value is a hard-coded constant.
         has_rubric = self._detect_scoring_rubric_column()
+        # R-A 1.6 (2026-05-12): probe for agentic_relief + weight_hint and
+        # struggling_user columns. Fall back to NULL-selects when missing
+        # so older ideaforge.db snapshots survive without OperationalError.
+        cols = {row[1] for row in cursor.execute("PRAGMA table_info(ideas)")}
+        has_relief = "agentic_relief" in cols and "weight_hint" in cols
+        has_struggling_user = "struggling_user" in cols
+        relief_select = (
+            "agentic_relief,\n                    weight_hint"
+            if has_relief
+            else "NULL AS agentic_relief,\n                    NULL AS weight_hint"
+        )
+        struggling_user_select = (
+            "struggling_user"
+            if has_struggling_user
+            else "NULL AS struggling_user"
+        )
         if has_rubric:
-            cursor.execute("""
+            cursor.execute(f"""
                 SELECT
                     id,
                     title,
                     description,
                     problem_statement,
                     target_audience,
+                    {struggling_user_select},
                     weighted_score,
                     opportunity_score,
                     problem_score,
@@ -139,7 +156,8 @@ class IdeaForgeReader:
                     signal_count,
                     status,
                     strategic_theme,
-                    scoring_rubric
+                    scoring_rubric,
+                    {relief_select}
                 FROM ideas
                 WHERE status = 'classified'
                     AND weighted_score IS NOT NULL
@@ -153,13 +171,14 @@ class IdeaForgeReader:
             # rubric field in returned dicts. Triage/build paths that
             # depend on the rubric will treat the result as 'tech'-style
             # work (which they already handle).
-            cursor.execute("""
+            cursor.execute(f"""
                 SELECT
                     id,
                     title,
                     description,
                     problem_statement,
                     target_audience,
+                    {struggling_user_select},
                     weighted_score,
                     opportunity_score,
                     problem_score,
@@ -169,7 +188,8 @@ class IdeaForgeReader:
                     artifact_type,
                     signal_count,
                     status,
-                    strategic_theme
+                    strategic_theme,
+                    {relief_select}
                 FROM ideas
                 WHERE status = 'classified'
                     AND weighted_score IS NOT NULL
@@ -274,8 +294,19 @@ class IdeaForgeReader:
         cursor = self.conn.cursor()
 
         has_rubric = self._detect_scoring_rubric_column()
+        # R-A 1.6 (2026-05-12): probe for agentic_relief + weight_hint
+        # columns. They were added by the ideaforge migration of the
+        # same pass. Fall back to NULL-selects when missing so older
+        # ideaforge.db snapshots survive without an OperationalError.
+        cols = {row[1] for row in cursor.execute("PRAGMA table_info(ideas)")}
+        has_relief = "agentic_relief" in cols and "weight_hint" in cols
+        relief_select = (
+            "agentic_relief,\n                    weight_hint"
+            if has_relief
+            else "NULL AS agentic_relief,\n                    NULL AS weight_hint"
+        )
         if has_rubric:
-            cursor.execute("""
+            cursor.execute(f"""
                 SELECT
                     id,
                     title,
@@ -292,12 +323,13 @@ class IdeaForgeReader:
                     artifact_type,
                     signal_count,
                     status,
-                    scoring_rubric
+                    scoring_rubric,
+                    {relief_select}
                 FROM ideas
                 WHERE id = ?
             """, (idea_id,))
         else:
-            cursor.execute("""
+            cursor.execute(f"""
                 SELECT
                     id,
                     title,
@@ -313,7 +345,8 @@ class IdeaForgeReader:
                     competition_score,
                     artifact_type,
                     signal_count,
-                    status
+                    status,
+                    {relief_select}
                 FROM ideas
                 WHERE id = ?
             """, (idea_id,))

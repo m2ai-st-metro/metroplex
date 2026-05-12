@@ -515,13 +515,20 @@ def test_skylynx_recommendation_to_idea(skylynx_test_db):
     assert "Add session tracking" in idea["description"]  # suggested_change appended
     assert idea["problem_statement"] == "0 sessions with 3 completed ideas indicates measurement issue"
     assert "ST Metro ecosystem" in idea["target_audience"]
-    assert idea["artifact_type"] == "tool"  # pipeline_change -> tool
+    # R-A 1.7 (2026-05-12): every Sky-Lynx idea is stamped as a CCOS agent
+    # under the life_domain rubric so the post-pivot dequeue guard admits it.
+    assert idea["artifact_type"] == "ccos_agent"
+    assert idea["scoring_rubric"] == "life_domain"
     assert idea["_source"] == "skylynx"
+    assert idea["_recommendation_type"] == "pipeline_change"
 
-    # claude_md_update -> agent
+    # claude_md_update -> same CCOS agent stamp (R-A 1.7 unifies the
+    # recommendation_type → artifact_type mapping under the pivot)
     rec2 = recs[1]  # sl-002, claude_md_update
     idea2 = reader.recommendation_to_idea(rec2)
-    assert idea2["artifact_type"] == "agent"
+    assert idea2["artifact_type"] == "ccos_agent"
+    assert idea2["scoring_rubric"] == "life_domain"
+    assert idea2["_recommendation_type"] == "claude_md_update"
 
     reader.close()
 
