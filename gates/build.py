@@ -393,6 +393,67 @@ class BuildOrchestrator:
                 except OSError:
                     pass
 
+            # Structured findings injection (added 2026-05-12 for
+            # Ravage->spec-claims feedback). When the daemon's Step 10.5c-bis
+            # writes review-findings.json, format the structured findings as
+            # a "Prior-review-derived claims" markdown table that the next
+            # retry's Planner copies into spec-claims.md verbatim. Closes the
+            # prose-to-table-by-hand gap that previously lived in the
+            # Planner's head.
+            findings_path = state_dir / "review-findings.json"
+            if findings_path.exists():
+                try:
+                    findings_data = json.loads(findings_path.read_text(encoding="utf-8"))
+                    findings = findings_data.get("findings", [])
+                    if findings:
+                        rows = [
+                            "| category | claim | spec source |",
+                            "|----------|-------|-------------|",
+                        ]
+                        for f in findings:
+                            claim_class = f.get("claim_class") or "FAILURE"
+                            title = (f.get("title") or "").strip()
+                            input_shape = f.get("input_shape")
+                            expected = (f.get("expected_behavior") or "").strip().rstrip(".")
+                            observed = (f.get("observed_behavior") or "").strip().rstrip(".")
+                            if input_shape and expected:
+                                claim_text = (
+                                    f'Input class "{input_shape}" must {expected};'
+                                    f" observed: {observed}"
+                                )
+                            elif expected:
+                                claim_text = f"{title}: must {expected}; observed: {observed}"
+                            else:
+                                claim_text = title or "(unspecified)"
+                            finding_id = f.get("finding_id", "F-??")
+                            source = f.get("source", "reviewer")
+                            severity = f.get("severity") or ""
+                            confidence = f.get("confidence")
+                            cite_extras = [p for p in [source, severity] if p]
+                            if confidence is not None:
+                                cite_extras.append(f"confidence {confidence}")
+                            citation = (
+                                f"derived from prior-review {finding_id}"
+                                f" ({', '.join(cite_extras)})"
+                            )
+                            claim_text = claim_text.replace("|", "\\|")
+                            citation = citation.replace("|", "\\|")
+                            rows.append(f"| {claim_class} | {claim_text} | {citation} |")
+                        table = (
+                            "\n## Prior-review-derived claims\n\n"
+                            "AUTO-EXTRACTED from the prior review's structured findings. "
+                            "When running Stage 1A of the Planner, copy each row into "
+                            "`spec-claims.md` verbatim, assigning fresh C-NN ids.\n\n"
+                            + "\n".join(rows)
+                        )
+                        summary_parts.append(table)
+                except (json.JSONDecodeError, OSError) as e:
+                    logger.warning(
+                        "Could not parse review-findings.json for %s: %s",
+                        job_id,
+                        e,
+                    )
+
         summary = "\n".join(summary_parts)
 
         try:
