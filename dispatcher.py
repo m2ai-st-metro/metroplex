@@ -31,7 +31,8 @@ WORKER_ROUTES = {
     ("ideaforge", ""): "ravage",
 }
 
-VALID_WORKER_TYPES = {"starscream", "ravage", "soundwave", "astrotrain", "default", "oz-cloud"}
+# Retired workers (starscream, astrotrain) removed 2026-05-12 clean-slate sweep.
+VALID_WORKER_TYPES = {"ravage", "soundwave", "default", "oz-cloud"}
 
 
 @runtime_checkable
