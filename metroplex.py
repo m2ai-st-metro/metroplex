@@ -1485,7 +1485,7 @@ def main():
     dispatch_parser.add_argument("--dry-run", action="store_true", help="Show what would be dispatched")
     dispatch_parser.add_argument("--item-id", type=int, help="Dispatch specific queue item by ID")
     dispatch_parser.add_argument("--count", type=int, default=1, help="Number of items to dispatch (default: 1)")
-    dispatch_parser.add_argument("--worker", choices=["starscream", "ravage", "soundwave", "astrotrain", "default"],
+    dispatch_parser.add_argument("--worker", choices=["ravage", "soundwave", "default"],
                                 help="Override auto-routed worker type")
 
     # builds command
