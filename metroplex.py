@@ -606,6 +606,95 @@ def cmd_retry(args, config: Config):
         state_db.close()
 
 
+def cmd_recover(args, config: Config):
+    """Re-enable a fully-retry-exhausted build (count_failed_builds >= MAX_RETRIES).
+
+    The `retry` command only flips the latest failed row to queued, which is
+    insufficient at the exhaustion ceiling because get_retryable_builds() counts
+    failed rows directly. This command deletes the most-recent failed rows so
+    the count drops below MAX_RETRIES (one retry slot opens), and re-pends the
+    matching priority_queue row. Optionally also cleans workspace + failed/
+    queue files for a fresh dispatch.
+    """
+    import re as _re
+    import shutil
+    from pathlib import Path
+
+    base_job_id = args.base_job_id
+    if _re.search(r"-r\d+$", base_job_id):
+        print(f"ERROR: --base-job-id must not have a -rN suffix; got {base_job_id!r}")
+        return 1
+
+    state_db = StateDB()
+    state_db.connect()
+
+    try:
+        cursor = state_db.conn.cursor()
+        cursor.execute(
+            "SELECT queue_job_id, status, retry_count, next_retry_at "
+            "FROM build_jobs WHERE base_job_id = ? ORDER BY id",
+            (base_job_id,),
+        )
+        rows = cursor.fetchall()
+        if not rows:
+            print(f"No build_jobs rows found for base_job_id: {base_job_id}")
+            return 1
+        failed_count = sum(1 for r in rows if r["status"] == "failed")
+
+        print(f"Base job: {base_job_id}")
+        print(f"  Total rows: {len(rows)}  (failed: {failed_count})")
+        for r in rows:
+            tag = "  [will delete]" if r["status"] == "failed" else ""
+            print(f"    {r['queue_job_id']:<40} status={r['status']:<10} retry_count={r['retry_count']} next_retry_at={r['next_retry_at'] or '-':<12}{tag}")
+        print(f"  Plan: keep at most {args.keep_failed} failed row(s); delete {max(0, failed_count - args.keep_failed)}")
+        if args.clean_workspace:
+            print("  + Will rm -rf workspace dirs for deleted attempts")
+        if args.clean_failed_queue:
+            print("  + Will rm matching queue files from data/self_healing_queue/failed/")
+
+        if not args.yes:
+            try:
+                resp = input("\nProceed? [y/N] ").strip().lower()
+            except EOFError:
+                resp = ""
+            if resp not in ("y", "yes"):
+                print("Aborted.")
+                return 1
+
+        result = state_db.soft_reset_attempts(base_job_id, keep_max_failed=args.keep_failed)
+
+        print()
+        print(f"Deleted {result['deleted_count']} failed build_jobs row(s):")
+        for qj in result["deleted_queue_job_ids"]:
+            print(f"  - {qj}")
+        print(f"Retained {result['retained_failed_count']} failed row(s)")
+        if result["priority_queue_id"]:
+            print(f"Re-pended priority_queue id={result['priority_queue_id']} (source={result['source']}, source_id={result['source_id']})")
+        else:
+            print("WARNING: no matching priority_queue row found — build_jobs were trimmed but the queue won't re-dispatch automatically.")
+
+        # Optional filesystem cleanup. Best-effort; we already mutated the DB.
+        if args.clean_workspace or args.clean_failed_queue:
+            workspaces_root = Path("data/self_healing_workspaces")
+            failed_root = Path("data/self_healing_queue/failed")
+            for qj in result["deleted_queue_job_ids"]:
+                if args.clean_workspace:
+                    ws = workspaces_root / qj
+                    if ws.exists():
+                        shutil.rmtree(ws)
+                        print(f"Removed workspace: {ws}")
+                if args.clean_failed_queue:
+                    # Match both metroplex-...-rN.json AND metroplex-...-rN_attemptN_TIMESTAMP.json
+                    for f in failed_root.glob(f"{qj}*.json"):
+                        f.unlink()
+                        print(f"Removed failed queue file: {f}")
+
+        print("\nBuild will be re-dispatched on the next orchestrator cycle.")
+        return 0
+    finally:
+        state_db.close()
+
+
 def cmd_cost(args, config: Config):
     """Show cost tracking summary."""
     state_db = StateDB()
@@ -1406,6 +1495,36 @@ def main():
     retry_parser = subparsers.add_parser("retry", help="Re-dispatch a failed build")
     retry_parser.add_argument("build_id", help="Queue job ID to retry (e.g. metroplex-ideaforge-79)")
 
+    # recover command — re-enable a fully-exhausted build (count_failed >= MAX_RETRIES)
+    recover_parser = subparsers.add_parser(
+        "recover",
+        help="Re-enable a fully-retry-exhausted build by trimming failed rows + re-pending priority_queue",
+    )
+    recover_parser.add_argument(
+        "--base-job-id",
+        required=True,
+        help="Base job ID without -rN suffix (e.g. metroplex-ideaforge-427)",
+    )
+    recover_parser.add_argument(
+        "--keep-failed",
+        type=int,
+        default=2,
+        help="How many failed build_jobs rows to retain (default: 2; leaves one retry slot vs MAX_RETRIES=3)",
+    )
+    recover_parser.add_argument(
+        "--clean-workspace",
+        action="store_true",
+        help="Also rm -rf data/self_healing_workspaces/<base>-rN/ for the deleted attempts",
+    )
+    recover_parser.add_argument(
+        "--clean-failed-queue",
+        action="store_true",
+        help="Also remove matching files from data/self_healing_queue/failed/ (incl. _attemptN_TIMESTAMP.json variants)",
+    )
+    recover_parser.add_argument(
+        "--yes", "-y", action="store_true", help="Skip confirmation prompt",
+    )
+
     # cost command
     cost_parser = subparsers.add_parser("cost", help="Show cost tracking summary")
     cost_parser.add_argument("--days", type=int, default=7, help="Number of days for breakdown (default: 7)")
@@ -1495,6 +1614,8 @@ def main():
         sys.exit(cmd_builds(args, config))
     elif args.command == "retry":
         sys.exit(cmd_retry(args, config))
+    elif args.command == "recover":
+        sys.exit(cmd_recover(args, config))
     elif args.command == "cost":
         sys.exit(cmd_cost(args, config))
     elif args.command == "postmortems":

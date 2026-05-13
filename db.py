@@ -1378,6 +1378,96 @@ class StateDB:
         self.conn.commit()
         return build_updated or pq_updated
 
+    def soft_reset_attempts(self, base_job_id: str, keep_max_failed: int = 2) -> dict:
+        """Re-enable a fully-retry-exhausted build by trimming the failed-row count
+        below MAX_RETRIES and re-pending the matching priority_queue row.
+
+        The published `UPDATE build_jobs SET next_retry_at = NULL, retry_count = 0,
+        status = 'failed'` recipe in CLAUDE.md is insufficient at the exhaustion
+        ceiling: get_retryable_builds() counts failed rows directly, so leaving
+        all MAX_RETRIES failed rows in place keeps the build excluded.
+        This helper closes that gap by DELETING the most-recent failed rows
+        until the count drops to keep_max_failed (one retry slot opens).
+
+        Earlier failed rows are preserved as historical record. Decision logs,
+        feasibility predictions, cost ledger entries all key off base_job_id
+        and survive deletion of individual build_jobs rows.
+
+        Args:
+            base_job_id: e.g. "metroplex-ideaforge-427" (no -rN suffix)
+            keep_max_failed: how many failed rows to retain (default 2 — leaves
+                one retry slot open against MAX_RETRIES=3)
+
+        Returns:
+            dict with deleted_count, retained_failed_count, priority_queue_id,
+            source, source_id, deleted_queue_job_ids.
+
+        Raises ValueError if base_job_id has a -rN suffix (caller should strip it).
+        """
+        if re.search(r'-r\d+$', base_job_id):
+            raise ValueError(
+                f"base_job_id must not have a -rN suffix; got {base_job_id!r}"
+            )
+
+        self.connect()
+        cursor = self.conn.cursor()
+
+        cursor.execute(
+            "SELECT id, queue_job_id FROM build_jobs "
+            "WHERE base_job_id = ? AND status = 'failed' "
+            "ORDER BY id DESC",
+            (base_job_id,),
+        )
+        failed_rows = cursor.fetchall()
+        deleted_ids = []
+        deleted_queue_job_ids = []
+        excess = max(0, len(failed_rows) - keep_max_failed)
+        for row in failed_rows[:excess]:
+            deleted_ids.append(row["id"])
+            deleted_queue_job_ids.append(row["queue_job_id"])
+        if deleted_ids:
+            placeholders = ",".join("?" for _ in deleted_ids)
+            cursor.execute(
+                f"DELETE FROM build_jobs WHERE id IN ({placeholders})",
+                deleted_ids,
+            )
+
+        parts = base_job_id.split("-", 2)
+        source = None
+        source_id = None
+        if len(parts) >= 3 and parts[0] == "metroplex" and parts[1] in ("ideaforge", "skylynx"):
+            source = parts[1]
+            source_id = parts[2]
+        elif len(parts) == 2 and parts[0] == "metroplex" and parts[1].isdigit():
+            source = "ideaforge"
+            source_id = parts[1]
+
+        priority_queue_id = None
+        if source and source_id:
+            cursor.execute(
+                "SELECT id FROM priority_queue WHERE source = ? AND source_id = ?",
+                (source, source_id),
+            )
+            row = cursor.fetchone()
+            if row:
+                priority_queue_id = row["id"]
+                cursor.execute(
+                    "UPDATE priority_queue SET status = 'pending', dispatched_at = NULL, "
+                    "completed_at = NULL, claimed_by = NULL, claimed_at = NULL "
+                    "WHERE id = ?",
+                    (priority_queue_id,),
+                )
+
+        self.conn.commit()
+        return {
+            "deleted_count": len(deleted_ids),
+            "retained_failed_count": len(failed_rows) - len(deleted_ids),
+            "priority_queue_id": priority_queue_id,
+            "source": source,
+            "source_id": source_id,
+            "deleted_queue_job_ids": deleted_queue_job_ids,
+        }
+
     # Failure categories that are deterministic — retrying won't help
     NON_RETRYABLE_CATEGORIES = frozenset({
         "dependency_error",  # Missing packages won't appear on retry

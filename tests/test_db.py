@@ -805,6 +805,99 @@ class TestStaleQueuedBuildRecovery:
         assert "metroplex-ideaforge-102" in ids_filtered
 
 
+class TestSoftResetAttempts:
+    """soft_reset_attempts: re-enable a fully-retry-exhausted build by trimming
+    failed rows + re-pending priority_queue. The published UPDATE recipe is
+    insufficient at MAX_RETRIES because get_retryable_builds counts failed rows
+    directly — this helper closes that gap."""
+
+    def _setup_exhausted(self, db, idea_id: int = 427, base: str = "metroplex-ideaforge-427"):
+        """Create the live #427 shape: priority_queue row + MAX_RETRIES failed build_jobs rows."""
+        item = make_pq_item(
+            source="ideaforge",
+            source_id=str(idea_id),
+            title="Nighttime Newborn Triage Copilot",
+            description="d",
+            priority_score=77.0,
+        )
+        pq_id = db.enqueue_item(item)
+        db.update_item_status(pq_id, "dispatched", "dispatched_at")
+        # status='failed' on priority_queue for the exhausted scenario
+        db.conn.execute("UPDATE priority_queue SET status = 'failed' WHERE id = ?", (pq_id,))
+        for suffix in ("", "-r1", "-r2"):
+            db.record_build_job(BuildJob(
+                idea_id=idea_id,
+                title="Nighttime Newborn Triage Copilot",
+                spec_path="/tmp/spec.txt",
+                queue_job_id=f"{base}{suffix}",
+                status="failed",
+                queued_at=datetime.now(),
+            ))
+        db.conn.commit()
+        return pq_id
+
+    def test_exhausted_build_blocked_from_retry_before_reset(self, db):
+        """Sanity: 3 failed rows means get_retryable_builds excludes the build."""
+        self._setup_exhausted(db)
+        retryable = db.get_retryable_builds()
+        assert all(r["base_job_id"] != "metroplex-ideaforge-427" for r in retryable)
+        assert db.count_failed_builds("metroplex-ideaforge-427") == 3
+
+    def test_soft_reset_trims_failed_rows_and_repends_queue(self, db):
+        """3 failed rows + soft_reset -> 2 retained, priority_queue back to pending."""
+        pq_id = self._setup_exhausted(db)
+
+        result = db.soft_reset_attempts("metroplex-ideaforge-427")
+
+        assert result["deleted_count"] == 1
+        assert result["retained_failed_count"] == 2
+        assert result["priority_queue_id"] == pq_id
+        assert result["source"] == "ideaforge"
+        assert result["source_id"] == "427"
+        # The most-recent row should be the one deleted
+        assert "metroplex-ideaforge-427-r2" in result["deleted_queue_job_ids"]
+
+        cursor = db.conn.cursor()
+        cursor.execute("SELECT status, dispatched_at, claimed_by FROM priority_queue WHERE id = ?", (pq_id,))
+        row = cursor.fetchone()
+        assert row["status"] == "pending"
+        assert row["dispatched_at"] is None
+        assert row["claimed_by"] is None
+
+        # Build is now eligible for retry
+        assert db.count_failed_builds("metroplex-ideaforge-427") == 2
+
+    def test_soft_reset_with_rn_suffix_raises(self, db):
+        """Caller mistake: passing a -rN suffix should be rejected loudly."""
+        with pytest.raises(ValueError, match="-rN"):
+            db.soft_reset_attempts("metroplex-ideaforge-427-r2")
+
+    def test_soft_reset_keep_max_failed_zero_clears_all(self, db):
+        """keep_max_failed=0 deletes every failed row (used for full reset)."""
+        self._setup_exhausted(db)
+        result = db.soft_reset_attempts("metroplex-ideaforge-427", keep_max_failed=0)
+        assert result["deleted_count"] == 3
+        assert result["retained_failed_count"] == 0
+        assert db.count_failed_builds("metroplex-ideaforge-427") == 0
+
+    def test_soft_reset_with_no_priority_queue_row_still_trims(self, db):
+        """If priority_queue is missing, build_jobs are still trimmed; pq id is None."""
+        for suffix in ("", "-r1", "-r2"):
+            db.record_build_job(BuildJob(
+                idea_id=999,
+                title="Orphan",
+                spec_path="/tmp/spec.txt",
+                queue_job_id=f"metroplex-ideaforge-999{suffix}",
+                status="failed",
+                queued_at=datetime.now(),
+            ))
+        db.conn.commit()
+
+        result = db.soft_reset_attempts("metroplex-ideaforge-999")
+        assert result["deleted_count"] == 1
+        assert result["priority_queue_id"] is None
+
+
 class TestCostBySource:
     """Test cost ledger aggregation grouped by source."""
 

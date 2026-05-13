@@ -236,6 +236,27 @@ sqlite3 data/metroplex.db "
   WHERE queue_job_id = 'JOB_ID' AND next_retry_at = 'abandoned';"
 ```
 
+#### ⚠ When the UPDATE recipe is insufficient
+
+The `UPDATE` recipe above only works when `count_failed_builds(base_job_id) < MAX_RETRIES` (default 3). `get_retryable_builds()` counts `status='failed'` rows directly — once you hit 3 failed rows for a `base_job_id`, the build is permanently excluded from retry no matter what `next_retry_at` says.
+
+Use `metroplex.py recover` for this case. It deletes the most-recent failed rows so the count drops below MAX_RETRIES, then re-pends the matching `priority_queue` row.
+
+```bash
+# Re-enable a fully-exhausted build (idea 427, base_job_id derived without -rN suffix)
+python metroplex.py recover --base-job-id metroplex-ideaforge-427
+
+# Also nuke workspace + failed/ queue files for a clean dispatch
+python metroplex.py recover --base-job-id metroplex-ideaforge-427 \
+  --clean-workspace --clean-failed-queue --yes
+```
+
+Note: `data/self_healing_queue/failed/` filenames can appear in two forms:
+- `metroplex-ideaforge-427-r2.json` (queue file moved by daemon after Judge fail)
+- `metroplex-ideaforge-427-r2_attemptN_TIMESTAMP.json` (queue file moved by orchestrator after Ravage review rejection — the `_attemptN_TIMESTAMP` suffix matches `build_jobs.retry_count`)
+
+`metroplex.py recover --clean-failed-queue` globs `<queue_job_id>*.json` so both variants are removed.
+
 ### Resetting Circuit Breakers
 
 Gates halt after 3 consecutive failures. Check and reset:
