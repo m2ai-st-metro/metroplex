@@ -693,10 +693,22 @@ class BuildOrchestrator:
                 queue_job_id=job_id,
                 details=details,
             )
-            logger.info(
-                "Recorded build cost for %s: $%.2f (model=%s, tokens=%d/%d)",
-                job_id, cost, model_used, input_tokens, output_tokens,
-            )
+            # Branch the log message so the estimate path isn't mistaken for a tracking bug.
+            # The daemon adapter (self_healing_adapter) cannot surface token data — Agent tool
+            # calls don't expose tokens to skills — so `source_type='estimate'` is the correct
+            # path for self-healing builds, not a missing-data failure. Spec_expander still
+            # records real tokens through the separate `spec_expander` cost source.
+            if input_tokens == 0 and output_tokens == 0:
+                logger.info(
+                    "Recorded estimated build cost for %s: $%.2f (daemon build, "
+                    "no per-build token data — see spec_expander rows for LLM-stage tokens)",
+                    job_id, cost,
+                )
+            else:
+                logger.info(
+                    "Recorded build cost for %s: $%.2f (model=%s, tokens=%d/%d)",
+                    job_id, cost, model_used, input_tokens, output_tokens,
+                )
         except Exception as e:
             logger.warning("Failed to record build cost for %s: %s", job_id, e)
 
