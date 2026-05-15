@@ -109,6 +109,21 @@ Story-driven Scene opening, not a feature list. Four paragraphs.
   hours, no other parenting concerns, no integration with feeding logs
   or sleep trackers at T1.
 
+## Safety constraints
+
+- **triage_voice_memo**: Symptom-keyword matching MUST be negation-aware.
+  Phrases like "she's not lethargic", "no signs of cyanosis", and
+  "didn't seem floppy" must NOT trigger a positive match on the
+  underlying symptom. Word-boundary collisions ("limp" in "limpid",
+  "rash" in "rashly", "pale" in "palette") must NOT trigger positive
+  matches — use `\bword\b` regex with case-insensitive flag. Forbidden
+  silent-failure modes: ambiguous symptom severity must NOT default
+  silently to "watchful waiting" — log the ambiguity and ask the
+  caregiver a clarifying question. Test pair: positive ("she's
+  lethargic and won't take feeds" → triggers urgent triage) AND
+  negative ("she's NOT lethargic, just sleepy after a long day" →
+  does NOT trigger urgent triage).
+
 ## Success criteria
 
 1. agent.yaml validates as YAML and contains all four required fields

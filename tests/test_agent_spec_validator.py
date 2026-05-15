@@ -115,6 +115,33 @@ class TestValidateAgentSpec:
         assert not ok
         assert "README" in reason or "readme" in reason.lower()
 
+    def test_missing_safety_constraints_section_rejected(self, golden):
+        """R-A7 v2 (2026-05-15): specs that omit ## Safety constraints are rejected.
+
+        The LLM previously compressed long prompts and silently dropped the
+        safety section, producing builds that passed Judge but failed Ravage
+        for the same class of bugs every time. The validator now requires an
+        explicit `## Safety constraints` heading OR the N/A opt-out marker.
+        """
+        # Strip the Safety constraints heading and content from the golden
+        # fixture, replacing it with a generic placeholder.
+        tainted = golden.replace("## Safety constraints", "## Notes")
+        ok, reason = validate_agent_spec(tainted)
+        assert not ok
+        assert "safety" in reason.lower()
+
+    def test_no_free_text_skills_opt_out_accepted(self, golden):
+        """Structural-only T0 agents may opt out of the Safety constraints section
+        by writing 'No free-text input skills — N/A' in lieu of the section heading.
+        """
+        # Replace the full Safety constraints block with the N/A opt-out.
+        # Use string boundaries to splice cleanly.
+        before, _, rest = golden.partition("## Safety constraints")
+        _, _, after = rest.partition("## Success criteria")
+        tainted = before + "## Notes\n\nNo free-text input skills — N/A.\n\n## Success criteria" + after
+        ok, reason = validate_agent_spec(tainted)
+        assert ok, f"opt-out should pass validator; got reason: {reason}"
+
     def test_cot_leakage_rejected(self, golden):
         """3+ CoT markers in spec text → reject. Reuses COT_MARKERS."""
         tainted = golden + (

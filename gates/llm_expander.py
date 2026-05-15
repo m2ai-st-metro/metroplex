@@ -262,6 +262,15 @@ def validate_agent_spec(spec_text: str) -> tuple[bool, str]:
         return False, "Missing required section: test_e2e not referenced"
     if "readme" not in spec_lower:
         return False, "Missing required section: README not referenced"
+    # R-A7 v2 (2026-05-15): The LLM compresses long prompts and silently
+    # drops the SAFETY-CLASS IMPLEMENTATION CONSTRAINTS section. Require an
+    # explicit `## Safety constraints` heading OR the N/A opt-out for
+    # structural-only agents. Either satisfies the marker.
+    if "## safety" not in spec_lower and "no free-text input skills" not in spec_lower:
+        return False, (
+            "Missing required section: ## Safety constraints "
+            "(or explicit 'No free-text input skills — N/A' for structural-only agents)"
+        )
 
     # Token leakage defense (Codex Round 2 MEDIUM): if the spec contains
     # a `telegram_bot_token_env:` field, the value MUST be an env-var NAME
@@ -505,6 +514,13 @@ Produce a Markdown document with these sections (use `## ` headings):
 
 ## Constraints
 <Echo the agent-shape constraints from above as they apply to THIS agent.>
+
+## Safety constraints
+<REQUIRED — this section MUST be present and cannot be summarized away. For EACH skill that interprets free-text user input (medication state, symptom reports, scheduling phrases, alerts, scam detection), enumerate the concrete safety guarantees by name. Format as a bulleted list, one bullet per skill:
+
+- **<skill_name>**: <which negation cases must NOT match (give 2-3 concrete example phrases the agent must reject)>; <which word-boundary collisions must NOT trigger (give 2-3 concrete word-fragment counter-examples)>; <which silent-failure modes are forbidden (e.g., "ambiguous patient defaults silently to 'son'" must instead log + ask)>; <positive/negative test pair the Builder must implement>.
+
+If the agent has NO free-text input skills (rare for life_domain — only structural-only T0 agents), write "No free-text input skills — N/A" and stop. Do not omit this section.>
 
 ## Success criteria
 <3-5 verifiable outcomes the Builder LLM's output is graded on.>
