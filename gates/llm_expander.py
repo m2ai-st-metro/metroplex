@@ -459,7 +459,7 @@ The downstream Builder LLM consumes this spec and produces a project directory w
    - `telegram_bot_token_env`: env var NAME (e.g., `MYAGENT_BOT_TOKEN`); T1 stub is allowed — the owner sets the real value at deploy time
    - Optionally an `obsidian:` block if the agent reads from a vault folder
 
-2. **skills/<skill_name>/SKILL.md** (at least one). Each SKILL.md has frontmatter (`name`, `description`, `trigger`) and a 4-8 paragraph body describing the skill's decision logic. Skills are BUNDLED in the agent directory, not loaded from a global skill registry.
+2. **skills/<skill_name>/SKILL.md + implementation** (at least one). Each SKILL.md has frontmatter (`name`, `description`, `trigger`) and a 4-8 paragraph body describing the skill's decision logic. AND each skill MUST be backed by an implementation file (Python module under the agent dir) that the agent invokes at runtime. T1 IS RUNNABLE per PIVOT.md R3 — skills implemented (not stubs), agent invokable via `claude --agent <name>` / `mission-cli`, and ≥1 E2E test that exercises real runtime behavior. Skills are BUNDLED in the agent directory, not loaded from a global skill registry.
 
 3. **tests/test_e2e_*.py** (at least one). Each E2E test asserts a Scene → agent-response shape. Tests must match the gate heuristic (filename starts with `test_e2e_` and ends in `.py`).
 
@@ -468,6 +468,20 @@ The downstream Builder LLM consumes this spec and produces a project directory w
 ## SCENE FIDELITY (CRITICAL)
 
 The agent MUST operate in the user's actual life scenario from the idea data — not a generic "AI assistant" framing. Use the struggling_user and agentic_relief fields as the anchor. Every E2E test must read like a moment from that user's day. If the struggling_user field is empty, INVENT a concrete person from the description and target_audience — name, age, and one concrete daily circumstance — never produce a generic Scene.
+
+## SAFETY-CLASS IMPLEMENTATION CONSTRAINTS
+
+The agent operates in a safety-domain (health, caregiving, household decisions). Any skill that interprets free-text user input — symptom reports, medication state, alerts, scam detection, dosing, scheduling — MUST be implemented with these guarantees, and the E2E test suite MUST exercise them. **A skill failing any of these will be rejected at adversarial review.**
+
+1. **Negation-aware matching.** "I missed my dose" must match; "I didn't miss my dose" / "I almost missed" / "I didn't skip breakfast" must NOT match. Implement with a negation window (~40-60 char prefix) checking for negation tokens (`not`, `no`, `n't`, `without`, `never`, `almost`) before the trigger phrase. Raw substring match (`"missed" in text`) is rejected.
+
+2. **Word-boundary regex.** Trigger phrases like `missed`, `skipped`, `pale`, `cold` must match on whole-word boundaries, not as fragments of other words (`submitted`, `skipper`, `palette`, `coldly`). Use `\b<word>\b` regex with `re.IGNORECASE`, not Python `in` substring.
+
+3. **No bare except.** Dispatch handlers and skill entry points must catch specific exceptions (`yaml.YAMLError`, `KeyError`, `ValueError`, `UnicodeDecodeError`, etc.) and log them. `except Exception:` without a re-raise or structured log is rejected.
+
+4. **No silent drops.** Any code path that ignores a user input, drops a record, or skips processing MUST log at WARNING level with the input + reason. Examples of REJECTED patterns: skill discovery silently dropping malformed `SKILL.md` files; text normalization silently dropping non-str/dict/list values; default-branch reminders silently dropping symptom reports.
+
+5. **Test contract for each safety claim.** The E2E test suite MUST include both a positive test (true match should trigger) AND a negative test (false positive must NOT trigger) for every safety-class trigger phrase the skill recognizes. Include negation cases (`"I didn't skip it"`) and word-boundary collisions (`"skipper"`).
 
 ## CONSTRAINTS
 
@@ -496,12 +510,12 @@ Produce a Markdown document with these sections (use `## ` headings):
 <3-5 verifiable outcomes the Builder LLM's output is graded on.>
 
 ## Out of scope (T1)
-<Explicit bullet list of what the T1 agent does NOT do — multi-user, voice synthesis, cross-session memory, etc.>
+<Note: T1 IS RUNNABLE — skills are implemented (not stubs), agent is invokable, E2E tests exercise real runtime behavior including the safety-class constraints above. T1 does NOT include: multi-user partitioning, voice synthesis, cross-session memory, web frontend, calendar integration, external HTTP services, insurance claim submission. The demo recording (Tier C) is appended by a sibling publish-webhook pipeline at publish time — NOT built here. Be explicit about what this specific agent does NOT do.>
 
 IMPORTANT RULES:
 - The spec must be SPECIFIC to this idea. Reference the struggling_user by name (invent a name if absent). Reference at least one concrete moment from the Scene.
 - Every E2E test name must describe a Scene, not a function (e.g., `test_e2e_2am_normal_hunger_scene`, not `test_e2e_input_validation`).
-- Target length: 120 to 200 lines of markdown. Specs under 80 lines are rejected as under-specified; specs over 350 are over-scoped.
+- Target length: 160 to 280 lines of markdown. Specs under 80 lines are rejected as under-specified; specs over 350 are over-scoped.
 - No external services. No API keys hardcoded.
 - Output ONLY the Markdown spec, no preamble, no reasoning.
 """
