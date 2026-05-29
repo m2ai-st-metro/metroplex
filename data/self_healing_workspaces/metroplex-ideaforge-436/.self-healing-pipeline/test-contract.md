@@ -121,6 +121,15 @@ every spec-claims.md row has ≥1 test citing it.
 |------|-------|-------|
 | test_readme_has_four_paragraphs | C-10 | README.md split on blank lines yields exactly 4 paragraphs (excluding heading line); each paragraph addresses one of {intro, action, invocation, deployment} |
 
+## tests/test_meta_coverage.py
+
+| test | claim | check |
+|------|-------|-------|
+| test_e2e_sarah_logs_incident_file_exists | C-08 | file exists and contains an incident + negation test |
+| test_e2e_sarah_requests_help_file_exists | C-09 | file exists and contains "resource" content |
+| test_negation_and_word_boundary_test_files_exist | C-12, C-16 | both files exist and contain BOTH positive and negative test cases |
+| test_canonical_trigger_tokens_covered | C-29 | test-contract.md exercises all four canonical trigger tokens (incident, argument, aggression, threat) |
+
 ## Pass criteria
 
 1. All tests above pass under `pytest tests/ -v`.
