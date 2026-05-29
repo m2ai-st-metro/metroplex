@@ -295,7 +295,7 @@ def validate_agent_spec(spec_text: str) -> tuple[bool, str]:
     return True, ""
 
 
-# Prompt that produces YCE-compatible app_spec.txt content
+# Prompt that produces a self-healing-pipeline-compatible spec
 SPEC_EXPANSION_PROMPT = """\
 CRITICAL: Output ONLY the final Markdown specification document. No preamble, no reasoning, no alternatives considered, no internal debate. Do not include phrases like "let's consider", "however, note", "alternatively", or any chain-of-thought. Start directly with the markdown heading.
 

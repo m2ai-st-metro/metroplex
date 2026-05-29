@@ -1,6 +1,6 @@
 """
 Publish Gate - Gate 4
-Creates repos for completed YCE builds and pushes code to one or more git hosts
+Creates repos for completed builds and pushes code to one or more git hosts
 (GitHub m2ai-portfolio org and/or GitLab m2ai-portfolio group). Configurable via
 config.publish_targets — first entry is primary (its URL becomes repo_url and
 its failure fails the job); subsequent entries are mirrors (failures recorded

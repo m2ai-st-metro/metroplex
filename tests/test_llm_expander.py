@@ -307,7 +307,7 @@ class TestLLMSpecExpander:
             assert kwargs["source"] == "spec_simplifier"
 
     def test_prompt_template_contains_required_sections(self):
-        """Verify the prompt template asks for all YCE-required sections."""
+        """Verify the prompt template asks for all required sections."""
         required_sections = [
             "Overview",
             "Tech Stack",

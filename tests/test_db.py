@@ -125,7 +125,7 @@ class TestBuildActualCostHelpers:
         self._make_build(db, "metroplex-ideaforge-201")
         db.record_cost("spec_expander", "qwen", 100, 50, 0.05, queue_job_id="metroplex-ideaforge-201")
         db.record_cost("spec_simplifier", "qwen", 200, 100, 0.10, queue_job_id="metroplex-ideaforge-201")
-        db.record_cost("yce_build", "opus", 5000, 2000, 1.20, queue_job_id="metroplex-ideaforge-201")
+        db.record_cost("build", "opus", 5000, 2000, 1.20, queue_job_id="metroplex-ideaforge-201")
         total = db.get_build_actual_cost("metroplex-ideaforge-201")
         assert abs(total - 1.35) < 0.0001
 
@@ -140,7 +140,7 @@ class TestBuildActualCostHelpers:
     def test_update_build_actual_cost_writes_aggregate(self, db):
         self._make_build(db, "metroplex-ideaforge-204")
         db.record_cost("spec_expander", "qwen", 100, 50, 0.05, queue_job_id="metroplex-ideaforge-204")
-        db.record_cost("yce_build", "opus", 5000, 2000, 1.50, queue_job_id="metroplex-ideaforge-204")
+        db.record_cost("build", "opus", 5000, 2000, 1.50, queue_job_id="metroplex-ideaforge-204")
         total = db.update_build_actual_cost("metroplex-ideaforge-204")
         assert abs(total - 1.55) < 0.0001
         cursor = db.conn.cursor()

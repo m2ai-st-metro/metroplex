@@ -257,7 +257,7 @@ def _check_budget_health(conn: sqlite3.Connection, daily_limit: float = 50.0) ->
 def _check_orphan_processes(metroplex_pid: int | None = None) -> CheckResult:
     """WARN if 1-5 orphan build child processes, CRIT if >5.
 
-    Detects leftover processes from YCE builds: http.server, uvicorn, testproj,
+    Detects leftover build processes: http.server, uvicorn, testproj,
     serve_results.py, etc. These accumulate when builds complete or fail without
     cleaning up their spawned servers.
 
@@ -326,7 +326,7 @@ def find_orphan_processes(metroplex_pid: int) -> list[tuple[int, str]]:
     """Find orphan processes in the Metroplex systemd cgroup.
 
     Build processes (http.server, uvicorn, test servers) get reparented to
-    PID 1 when their parent YCE build exits, but they stay in the Metroplex
+    PID 1 when their parent build exits, but they stay in the Metroplex
     cgroup. We use the cgroup process list to find them reliably.
 
     Returns list of (pid, cmdline) tuples for orphan processes.

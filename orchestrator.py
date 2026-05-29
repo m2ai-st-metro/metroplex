@@ -734,7 +734,7 @@ class CycleOrchestrator:
             print(f"! {budget_msg} — skipping builds this cycle")
             self.notifier.notify(f"BUDGET EXCEEDED: {budget_msg}", "error")
 
-        # Gate 2: Build (pulls from priority queue, dispatches to YCE Harness)
+        # Gate 2: Build (pulls from priority queue, dispatches via the configured BuildAdapter)
         if not budget_ok:
             pass  # Skip build gate when over budget
         elif self.circuit_breaker.is_halted("build"):
@@ -834,7 +834,7 @@ class CycleOrchestrator:
                                 idea_id=int(build["idea_id"]) if str(build["idea_id"]).isdigit() else 0,
                                 idea_title=build["title"],
                                 outcome="build_failed",
-                                build_outcome=f"yce_build_failed: {job_id}",
+                                build_outcome=f"build_failed: {job_id}",
                                 tags=["build"],
                             )
 

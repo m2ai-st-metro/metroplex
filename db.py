@@ -1093,7 +1093,7 @@ class StateDB:
         Args:
             exclude_job_ids: Optional set of queue_job_ids to exclude from the
                 result. Used by the poller to skip builds that are actively
-                running in the YCE queue.json, so a race between DB snapshot
+                running in the self-healing queue, so a race between DB snapshot
                 and runner status doesn't kill a live build.
 
         Returns:
@@ -1137,7 +1137,7 @@ class StateDB:
         """Mark a stale queued build as abandoned, preserving lineage.
 
         Fix B: previously DELETED the row, which destroyed feasibility
-        linkage and any late writeback from YCE. Now we UPDATE in place,
+        linkage and any late writeback from the self-healing queue. Now we UPDATE in place,
         setting status='failed' and next_retry_at='abandoned' (same sentinel
         used elsewhere to block retries). The priority_queue item resets
         to 'pending' so other ideas can advance.

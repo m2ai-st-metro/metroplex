@@ -1153,10 +1153,7 @@ class BuildOrchestrator:
             build_target = self.config.build_target
             oz_run_id = None
 
-            if build_target == "cloud" or (
-                build_target == "auto" and self.config.oz_environment_id
-                and self.is_runner_active()
-            ):
+            if build_target == "cloud":
                 if self.config.oz_environment_id:
                     oz_run_id = submit_to_oz(
                         idea,

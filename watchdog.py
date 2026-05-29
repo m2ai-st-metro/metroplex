@@ -5,7 +5,7 @@ External stall detector, runs via systemd timer every 5 minutes.
 Alerts via Telegram when the pipeline is stuck or unhealthy.
 
 On WARN/CRIT:
-  - Sends alert to Metroplex Telegram and (if configured) Galvatron Telegram.
+  - Sends alert to Metroplex Telegram and (if configured) Kup Telegram.
   - Dispatches a diagnostic mission via ccos Mission Control IFF
     WATCHDOG_MISSION_AGENT is set to a real ccos agent id. Default off:
     skip dispatch and rely on Telegram. Introduced 2026-05-07 after the
@@ -160,17 +160,17 @@ def _dispatch_diagnostic_mission(report) -> bool:
         return False
 
 
-def _notify_galvatron(alert_message: str, level: str) -> bool:
-    """Send alert to Galvatron's Telegram chat in addition to Metroplex's."""
-    bot_token = os.environ.get("GALVATRON_BOT_TOKEN", "")
-    chat_id = os.environ.get("GALVATRON_CHAT_ID", "")
+def _notify_kup(alert_message: str, level: str) -> bool:
+    """Send alert to Kup's Telegram chat in addition to Metroplex's."""
+    bot_token = os.environ.get("KUP_BOT_TOKEN", "")
+    chat_id = os.environ.get("KUP_CHAT_ID", "")
 
     if not bot_token or not chat_id:
-        logger.info("Galvatron Telegram not configured -- skipping Galvatron alert")
+        logger.info("Kup Telegram not configured -- skipping Kup alert")
         return False
 
-    galvatron_notifier = create_notifier(bot_token, chat_id)
-    return galvatron_notifier.notify(alert_message, level=level)
+    kup_notifier = create_notifier(bot_token, chat_id)
+    return kup_notifier.notify(alert_message, level=level)
 
 
 def _restart_self_healing_daemon() -> bool:
@@ -206,7 +206,7 @@ def run_watchdog(dry_run: bool = False) -> int:
     2. If orphan processes at CRIT level, kill them (self-healing).
     3. If self_healing_daemon CRIT and METROPLEX_AUTO_RESTART_SELF_HEALING=true,
        run the restart script before alerting.
-    4. If CRIT or WARN, send Telegram alert to both Metroplex and Galvatron.
+    4. If CRIT or WARN, send Telegram alert to both Metroplex and Kup.
     5. If CRIT or WARN AND WATCHDOG_MISSION_AGENT is set, dispatch a
        diagnostic mission to that agent via ccos Mission Control.
     6. If OK, stay silent (no notification).
@@ -264,10 +264,10 @@ def run_watchdog(dry_run: bool = False) -> int:
     if delivered:
         logger.info("Alert sent via Metroplex Telegram (level=%s)", level)
 
-    # Alert 2: Galvatron Telegram
-    galvatron_delivered = _notify_galvatron(alert_message, level)
-    if galvatron_delivered:
-        logger.info("Alert sent via Galvatron Telegram (level=%s)", level)
+    # Alert 2: Kup Telegram
+    kup_delivered = _notify_kup(alert_message, level)
+    if kup_delivered:
+        logger.info("Alert sent via Kup Telegram (level=%s)", level)
 
     # Alert 3: Dispatch diagnostic mission via ccos Mission Control (gated on WATCHDOG_MISSION_AGENT)
     mission_dispatched = _dispatch_diagnostic_mission(report)

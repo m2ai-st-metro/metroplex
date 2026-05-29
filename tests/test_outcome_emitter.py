@@ -91,7 +91,7 @@ class TestOutcomeEmitter:
             idea_id=55,
             idea_title="Failed Build",
             outcome="build_failed",
-            build_outcome="yce_build_failed: metroplex-ideaforge-55",
+            build_outcome="build_failed: metroplex-ideaforge-55",
             tags=["build"],
         )
         assert result is True

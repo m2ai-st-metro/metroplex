@@ -129,9 +129,10 @@ def _build_prompt(idea: dict) -> str:
     return f"""You are a build agent for the ST Metro autonomous software ecosystem.
 
 ## Task
-Build the following project from its specification. Follow the standard
-Ultra-Magnus pipeline: generate app spec, scaffold the project, implement
-all features, run tests until green, then commit and push to a new branch.
+Build the following project from its specification, producing a complete
+CCOS-agent artifact: an `agent.yaml` manifest, the agent's skills, an
+end-to-end test, and a story README. Implement all features, run tests
+until green, then commit and push to a new branch.
 
 ## Idea
 - **ID**: {idea.get('id')}
@@ -142,12 +143,11 @@ all features, run tests until green, then commit and push to a new branch.
 - **Artifact Type**: {idea.get('artifact_type', 'tool')}
 
 ## Instructions
-1. Read the Ultra-Magnus idea-factory codebase to understand the pipeline
-2. Generate an app spec based on the idea above
-3. Use the YCE harness to scaffold and build the project
-4. Run all tests and fix any failures
-5. Create a feature branch and push when green
-6. Report the branch name and test results when done
+1. Derive an app spec from the idea above
+2. Scaffold and build the project as a CCOS-agent artifact (agent.yaml + skills + e2e test + story README)
+3. Run all tests and fix any failures
+4. Create a feature branch and push when green
+5. Report the branch name and test results when done
 
 If you encounter errors, debug and retry up to 3 times before reporting failure.
 """
