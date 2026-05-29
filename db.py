@@ -1424,7 +1424,8 @@ class StateDB:
         Args:
             base_job_id: e.g. "metroplex-ideaforge-427" (no -rN suffix)
             keep_max_failed: how many failed rows to retain (default 2 — leaves
-                one retry slot open against MAX_RETRIES=3)
+                3 retry slots open against MAX_RETRIES=5). Note: retained rows
+                keep any 'abandoned' next_retry_at sentinel; pass 0 to clear it.
 
         Returns:
             dict with deleted_count, retained_failed_count, priority_queue_id,

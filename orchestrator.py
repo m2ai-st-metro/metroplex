@@ -368,6 +368,117 @@ class CycleOrchestrator:
             )
             self.state_db.conn.commit()
 
+    def _process_auto_retries(self) -> None:
+        """Abandon exhausted builds and re-dispatch retryable ones (Phase 13f).
+
+        Extracted from run_cycle for testability. Two steps:
+          1. Abandon builds that have exhausted MAX_RETRIES (the ONLY place a
+             non-deterministic failure is abandoned for retry-count reasons).
+          2. Re-dispatch builds whose backoff has elapsed.
+
+        A non-exhausted build is NEVER abandoned by the retry path. Earlier this
+        method abandoned a build whenever ``mark_build_for_retry`` returned
+        False, conflating "already scheduled for a backoff window" with "stuck".
+        Because the per-row guard in ``mark_build_for_retry`` returns False for
+        any row already carrying ``next_retry_at`` — exactly the rows whose
+        backoff has now elapsed and that ``get_retryable_builds`` re-surfaces —
+        this stranded builds with retry slots still open (idea-436: abandoned
+        with 2 failures against MAX_RETRIES=5, priority_queue left at
+        'dispatched'). The correct action for a non-exhausted build is to
+        re-pend the priority_queue row so Gate 2 picks it up.
+        """
+        try:
+            # 1. Abandon builds that have exhausted all retries
+            exhausted = self.state_db.get_exhausted_builds()
+            for build in exhausted:
+                queue_job_id = build["queue_job_id"]
+                if self.state_db.mark_build_abandoned(queue_job_id):
+                    print(f"  ABANDONED (max {self.state_db.MAX_RETRIES} retries): {build['title']} ({queue_job_id})")
+                    self.audit_logger.log_decision(
+                        "build", "max_retries_exceeded",
+                        {
+                            "queue_job_id": queue_job_id,
+                            "title": build["title"],
+                            "max_retries": self.state_db.MAX_RETRIES,
+                        },
+                    )
+                    self.notifier.notify(
+                        f"Build ABANDONED after {self.state_db.MAX_RETRIES} retries: {build['title']}",
+                        "error",
+                    )
+                    if self.outcome_emitter:
+                        self.outcome_emitter.emit(
+                            idea_id=int(build["idea_id"]) if str(build["idea_id"]).isdigit() else 0,
+                            idea_title=build["title"],
+                            outcome="build_failed",
+                            build_outcome=f"max_retries_exceeded: {queue_job_id}",
+                            tags=["build", "abandoned"],
+                        )
+                    # Close feedback loops for abandoned builds (L5 B2+B3)
+                    try:
+                        resolve_prediction(self.state_db, queue_job_id, "failure")
+                        idea_id = int(build["idea_id"]) if str(build["idea_id"]).isdigit() else None
+                        if idea_id:
+                            self._write_ideaforge_outcome(idea_id, "build_failed")
+                    except Exception as e:
+                        import logging
+                        logging.getLogger(__name__).warning(
+                            "Failed to close feedback loop for abandoned build %s: %s",
+                            queue_job_id, e,
+                        )
+
+            # 2. Retry builds that haven't exhausted retries and whose backoff has expired
+            #    Skip deterministic failures (dependency, test, build errors) — retrying won't help
+            retryable = self.state_db.get_retryable_builds()
+            for build in retryable:
+                queue_job_id = build["queue_job_id"]
+                if not self.state_db.is_retryable_failure(queue_job_id):
+                    category = self.state_db.get_failure_category(queue_job_id)
+                    print(f"  Skip retry (deterministic {category}): {build['title']} ({queue_job_id})")
+                    self.audit_logger.log_decision(
+                        "build", "skip_retry_deterministic",
+                        {"queue_job_id": queue_job_id, "failure_category": category}
+                    )
+                    self.state_db.mark_build_abandoned(queue_job_id)
+                    continue
+                if self.state_db.mark_build_for_retry(queue_job_id):
+                    retry_num = (build.get("retry_count") or 0) + 1
+                    print(f"  Auto-retry #{retry_num}: {build['title']} ({queue_job_id})")
+                    self.audit_logger.log_decision(
+                        "build", "auto_retry",
+                        {"queue_job_id": queue_job_id, "retry_count": retry_num}
+                    )
+                    self.notifier.notify(
+                        f"Build auto-retry #{retry_num}: {build['title']}"
+                    )
+                    # Reset priority_queue to 'pending' so run_from_queue
+                    # re-dispatches on the next cycle (backoff already enforced
+                    # by get_retryable_builds checking next_retry_at).
+                    self._reset_priority_queue_for_retry(queue_job_id)
+                else:
+                    # mark_build_for_retry returned False. Two cases:
+                    #   (a) genuinely exhausted -> step 1 (get_exhausted_builds)
+                    #       owns the abandon; do nothing here.
+                    #   (b) the row was already stamped with next_retry_at on a
+                    #       prior cycle and its backoff window has now elapsed
+                    #       (get_retryable_builds only returns next_retry_at<=now).
+                    #       This is NOT a stuck build -- it needs RE-DISPATCH, not
+                    #       abandonment. Re-pend the priority_queue row (which may
+                    #       be stranded at 'dispatched' or 'failed') so Gate 2
+                    #       picks it up. The MAX_RETRIES cap in get_retryable_builds
+                    #       still bounds the total number of real attempts.
+                    if self.state_db.has_exhausted_retries(build.get("base_job_id", queue_job_id)):
+                        # Exhausted: leave for get_exhausted_builds to abandon cleanly.
+                        continue
+                    print(f"  Re-dispatch (backoff elapsed, row already scheduled): {build['title']} ({queue_job_id})")
+                    self.audit_logger.log_decision(
+                        "build", "retry_redispatch",
+                        {"queue_job_id": queue_job_id, "title": build["title"]}
+                    )
+                    self._reset_priority_queue_for_retry(queue_job_id)
+        except Exception as e:
+            self.audit_logger.log_error("build", f"Auto-retry check failed: {e}")
+
     def dispatch_queue_items(self, dry_run: bool = False) -> int:
         """
         Dispatch non-buildable priority queue items to ClaudeClaw workers.
@@ -878,88 +989,7 @@ class CycleOrchestrator:
                 self.audit_logger.log_error("build", f"Oz build poll failed: {e}")
 
         # Auto-retry failed builds (Phase 13f, hardened against infinite loops)
-        try:
-            # 1. Abandon builds that have exhausted all retries
-            exhausted = self.state_db.get_exhausted_builds()
-            for build in exhausted:
-                queue_job_id = build["queue_job_id"]
-                if self.state_db.mark_build_abandoned(queue_job_id):
-                    print(f"  ABANDONED (max {self.state_db.MAX_RETRIES} retries): {build['title']} ({queue_job_id})")
-                    self.audit_logger.log_decision(
-                        "build", "max_retries_exceeded",
-                        {
-                            "queue_job_id": queue_job_id,
-                            "title": build["title"],
-                            "max_retries": self.state_db.MAX_RETRIES,
-                        },
-                    )
-                    self.notifier.notify(
-                        f"Build ABANDONED after {self.state_db.MAX_RETRIES} retries: {build['title']}",
-                        "error",
-                    )
-                    if self.outcome_emitter:
-                        self.outcome_emitter.emit(
-                            idea_id=int(build["idea_id"]) if str(build["idea_id"]).isdigit() else 0,
-                            idea_title=build["title"],
-                            outcome="build_failed",
-                            build_outcome=f"max_retries_exceeded: {queue_job_id}",
-                            tags=["build", "abandoned"],
-                        )
-                    # Close feedback loops for abandoned builds (L5 B2+B3)
-                    try:
-                        resolve_prediction(self.state_db, queue_job_id, "failure")
-                        idea_id = int(build["idea_id"]) if str(build["idea_id"]).isdigit() else None
-                        if idea_id:
-                            self._write_ideaforge_outcome(idea_id, "build_failed")
-                    except Exception as e:
-                        import logging
-                        logging.getLogger(__name__).warning(
-                            "Failed to close feedback loop for abandoned build %s: %s",
-                            queue_job_id, e,
-                        )
-
-            # 2. Retry builds that haven't exhausted retries and whose backoff has expired
-            #    Skip deterministic failures (dependency, test, build errors) — retrying won't help
-            retryable = self.state_db.get_retryable_builds()
-            for build in retryable:
-                queue_job_id = build["queue_job_id"]
-                if not self.state_db.is_retryable_failure(queue_job_id):
-                    category = self.state_db.get_failure_category(queue_job_id)
-                    print(f"  Skip retry (deterministic {category}): {build['title']} ({queue_job_id})")
-                    self.audit_logger.log_decision(
-                        "build", "skip_retry_deterministic",
-                        {"queue_job_id": queue_job_id, "failure_category": category}
-                    )
-                    self.state_db.mark_build_abandoned(queue_job_id)
-                    continue
-                if self.state_db.mark_build_for_retry(queue_job_id):
-                    retry_num = (build.get("retry_count") or 0) + 1
-                    print(f"  Auto-retry #{retry_num}: {build['title']} ({queue_job_id})")
-                    self.audit_logger.log_decision(
-                        "build", "auto_retry",
-                        {"queue_job_id": queue_job_id, "retry_count": retry_num}
-                    )
-                    self.notifier.notify(
-                        f"Build auto-retry #{retry_num}: {build['title']}"
-                    )
-                    # Reset priority_queue to 'pending' so run_from_queue
-                    # re-dispatches on the next cycle (backoff already enforced
-                    # by get_retryable_builds checking next_retry_at).
-                    self._reset_priority_queue_for_retry(queue_job_id)
-                else:
-                    # mark_build_for_retry returned False -- either exhausted
-                    # (handled by get_exhausted_builds above) or already marked
-                    # for retry but Gate 2 never picked it up. In the latter
-                    # case, abandon to prevent infinite retry loops.
-                    if not self.state_db.has_exhausted_retries(build.get("base_job_id", queue_job_id)):
-                        print(f"  ABANDON (retry stuck, Gate 2 never consumed): {build['title']} ({queue_job_id})")
-                        self.state_db.mark_build_abandoned(queue_job_id)
-                        self.audit_logger.log_decision(
-                            "build", "retry_stuck_abandoned",
-                            {"queue_job_id": queue_job_id, "title": build["title"]}
-                        )
-        except Exception as e:
-            self.audit_logger.log_error("build", f"Auto-retry check failed: {e}")
+        self._process_auto_retries()
 
         # Dispatch: route non-buildable queue items to ClaudeClaw workers
         dispatch_count = 0

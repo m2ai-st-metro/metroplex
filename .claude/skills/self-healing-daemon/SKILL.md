@@ -358,7 +358,13 @@ have to actually read it.
 - It does NOT escalate to humans via Telegram or other channels. Escalations
   are written to `FAILED_DIR` and picked up by Metroplex's existing
   postmortem/notification paths.
-- It does NOT retry on review rejection. Step 10.5 Ravage review is pass/fail
-  only. A `review_rejected` build goes straight to `FAILED_DIR`. The Builder
-  is not re-invoked with review feedback (future enhancement -- would require
-  a new retry trigger type in the self-healing-pipeline).
+- The daemon itself does NOT re-invoke its own Builder on review rejection.
+  Step 10.5 Ravage review is pass/fail within the daemon session; a
+  `review_rejected` build is routed to `FAILED_DIR`. Retry is then
+  **Metroplex-mediated**: the orchestrator treats `review_rejected` as a
+  retryable failure (it is not in `NON_RETRYABLE_CATEGORIES`), re-pends the
+  `priority_queue` row, and dispatches a fresh daemon job whose Planner
+  receives the prior Ravage findings injected as `claim_class`-tagged
+  spec-claims (`review-findings.json` -> `build_sessions` ->
+  `_inject_session_context`). So review feedback *does* reach the next attempt
+  across the daemon/Metroplex boundary, up to `MAX_RETRIES`.

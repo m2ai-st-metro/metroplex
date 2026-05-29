@@ -1509,7 +1509,7 @@ def main():
         "--keep-failed",
         type=int,
         default=2,
-        help="How many failed build_jobs rows to retain (default: 2; leaves one retry slot vs MAX_RETRIES=3)",
+        help="How many failed build_jobs rows to retain (default: 2; leaves 3 retry slots vs MAX_RETRIES=5). Use 0 to also clear the 'abandoned' sentinel.",
     )
     recover_parser.add_argument(
         "--clean-workspace",

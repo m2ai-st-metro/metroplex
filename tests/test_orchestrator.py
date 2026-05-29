@@ -1296,3 +1296,83 @@ class TestQualityScoringForwardsRubric:
         assert scored == 1
         assert mock_score.call_count == 1
         mock_update.assert_not_called()
+
+
+class TestAutoRetryRedispatch:
+    """Regression tests for the idea-436 premature-abandon bug.
+
+    A non-exhausted build whose backoff window has elapsed must be RE-DISPATCHED
+    (priority_queue re-pended), never abandoned. Previously _process_auto_retries
+    abandoned any build for which mark_build_for_retry returned False -- which is
+    True for every row already carrying next_retry_at, i.e. exactly the rows
+    get_retryable_builds re-surfaces once their backoff elapses. That stranded
+    idea-436 with 2 failures against MAX_RETRIES=5 and left priority_queue at
+    'dispatched'.
+    """
+
+    def _setup_elapsed_backoff_build(self, state_db, queue_job_id="metroplex-ideaforge-1"):
+        """Two failed rows; latest stamped with an elapsed next_retry_at, plus a
+        priority_queue row stranded at 'dispatched' (mirrors idea-436 row 359)."""
+        from datetime import timedelta
+        for _ in range(2):
+            state_db.record_build_job(BuildJob(
+                idea_id=1, title="Elder Care", spec_path="/tmp/spec.txt",
+                queue_job_id=queue_job_id, status="failed", queued_at=datetime.now(),
+            ))
+        past = (datetime.now() - timedelta(hours=1)).isoformat()
+        state_db.conn.execute(
+            "UPDATE build_jobs SET next_retry_at = ? WHERE id = (SELECT MAX(id) FROM build_jobs)",
+            (past,),
+        )
+        state_db.conn.execute(
+            "INSERT INTO priority_queue (source, source_id, title, description, "
+            "priority_score, status, idea_data, created_at) "
+            "VALUES ('ideaforge', '1', 'Elder Care', 'd', 1.0, 'dispatched', '{}', ?)",
+            (datetime.now().isoformat(),),
+        )
+        state_db.conn.commit()
+
+    def test_non_exhausted_elapsed_backoff_is_redispatched_not_abandoned(
+        self, orchestrator, state_db,
+    ):
+        self._setup_elapsed_backoff_build(state_db)
+
+        # Sanity: the scenario reproduces the False-returning guard with slots open.
+        assert state_db.get_retryable_builds(), "scenario must surface a retryable build"
+        assert state_db.mark_build_for_retry("metroplex-ideaforge-1") is False
+        assert state_db.has_exhausted_retries("metroplex-ideaforge-1") is False
+
+        orchestrator._process_auto_retries()
+
+        # No row was abandoned.
+        rows = state_db.conn.execute(
+            "SELECT next_retry_at FROM build_jobs WHERE base_job_id = 'metroplex-ideaforge-1'"
+        ).fetchall()
+        assert all(r["next_retry_at"] != "abandoned" for r in rows), \
+            "non-exhausted build must not be abandoned"
+
+        # The stranded priority_queue row was re-pended for Gate 2.
+        pq_status = state_db.conn.execute(
+            "SELECT status FROM priority_queue WHERE source='ideaforge' AND source_id='1'"
+        ).fetchone()["status"]
+        assert pq_status == "pending", f"expected re-dispatch to 'pending', got {pq_status!r}"
+
+    def test_exhausted_build_is_abandoned_by_exhausted_path(self, orchestrator, state_db):
+        """The abandon path still fires for genuinely exhausted builds."""
+        for _ in range(StateDB.MAX_RETRIES):
+            state_db.record_build_job(BuildJob(
+                idea_id=2, title="Exhausted", spec_path="/tmp/spec.txt",
+                queue_job_id="metroplex-ideaforge-2", status="failed",
+                queued_at=datetime.now(),
+            ))
+        state_db.conn.commit()
+
+        assert state_db.has_exhausted_retries("metroplex-ideaforge-2") is True
+
+        orchestrator._process_auto_retries()
+
+        rows = state_db.conn.execute(
+            "SELECT next_retry_at FROM build_jobs WHERE base_job_id = 'metroplex-ideaforge-2'"
+        ).fetchall()
+        assert any(r["next_retry_at"] == "abandoned" for r in rows), \
+            "exhausted build must still be abandoned"
