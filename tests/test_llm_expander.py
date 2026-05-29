@@ -894,9 +894,17 @@ class TestConfigSpecSettings:
             assert config.spec_use_llm is False
 
     def test_spec_llm_model_default(self):
-        """Test default model is Qwen2.5-72B-Instruct."""
-        config = Config()
-        assert "qwen" in config.spec_llm_model.lower()
+        """Default model is Mistral-Small-3.2 (matches the prod env value).
+
+        Clear METROPLEX_SPEC_LLM_MODEL first so this asserts the dataclass
+        default rather than whatever the ambient environment (e.g. a sourced
+        ~/.env.shared) injects — the env-sensitivity is what made this a
+        flaky baseline failure.
+        """
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("METROPLEX_SPEC_LLM_MODEL", None)
+            config = Config()
+        assert "mistral" in config.spec_llm_model.lower()
 
     def test_spec_llm_model_env_override(self):
         """Test model can be overridden via env var."""
