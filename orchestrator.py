@@ -479,6 +479,88 @@ class CycleOrchestrator:
         except Exception as e:
             self.audit_logger.log_error("build", f"Auto-retry check failed: {e}")
 
+    def _reap_stuck_builds(self) -> int:
+        """Reap builds wedged in 'started' past the build timeout (S5).
+
+        ``health._check_stuck_builds`` only emits a CRIT alert; nothing ever
+        transitioned a wedged 'started' row, so a build whose runner died
+        mid-flight rotted indefinitely (idea-441 sat 'started' for 333h). This
+        reaper marks each stale row 'failed' and leaves it for the auto-retry
+        block (which runs immediately after) to RE-DISPATCH through the normal
+        retry path — never abandoned, unless MAX_RETRIES is genuinely exhausted
+        (get_exhausted_builds owns that, after enough real timeouts).
+
+        Routing through the retry path (rather than abandoning, the way
+        reset_stale_queued_build does for stuck-*queued* rows) is deliberate: a
+        timeout is a transient failure mode, so a wedged build deserves the same
+        backoff-bounded retries as any other transient failure.
+
+        Respects:
+          - circuit breaker: skips entirely when the build gate is halted.
+            Re-dispatch would be blocked downstream anyway, and we don't want to
+            manufacture retry churn on a deliberately-halted gate.
+          - per-cycle cap: reaps at most ``max_approve_per_cycle`` builds per
+            cycle and logs how many were deferred (no silent truncation).
+
+        Returns:
+            Number of builds actually reaped this cycle.
+        """
+        if self.circuit_breaker.is_halted("build"):
+            return 0
+
+        try:
+            stuck = self.state_db.get_stuck_started_builds(
+                self.config.build_timeout_seconds
+            )
+        except Exception as e:
+            self.audit_logger.log_error("build", f"Stuck-build reap query failed: {e}")
+            return 0
+
+        if not stuck:
+            return 0
+
+        cap = self.config.max_approve_per_cycle
+        reaped = 0
+        for build in stuck[:cap]:
+            queue_job_id = build["queue_job_id"]
+            try:
+                if self.state_db.update_build_job_status(queue_job_id, "failed"):
+                    reaped += 1
+                    print(
+                        f"  REAPED stuck build (>{self.config.build_timeout_seconds}s "
+                        f"in 'started'): {build['title']} ({queue_job_id})"
+                    )
+                    self.audit_logger.log_decision(
+                        "build", "reaped_stuck_build",
+                        {
+                            "queue_job_id": queue_job_id,
+                            "title": build["title"],
+                            "queued_at": build["queued_at"],
+                            "timeout_seconds": self.config.build_timeout_seconds,
+                        },
+                    )
+                    self.notifier.notify(
+                        f"Reaped stuck build (timeout): {build['title']}",
+                        "warning",
+                    )
+            except Exception as e:
+                self.audit_logger.log_error(
+                    "build", f"Failed to reap stuck build {queue_job_id}: {e}"
+                )
+
+        overflow = len(stuck) - cap
+        if overflow > 0:
+            print(
+                f"  Reaper cap hit: reaped {reaped}/{len(stuck)} stuck build(s) "
+                f"this cycle (cap={cap}); {overflow} deferred to next cycle"
+            )
+            self.audit_logger.log_decision(
+                "build", "reap_cap_deferred",
+                {"total_stuck": len(stuck), "reaped": reaped, "cap": cap},
+            )
+
+        return reaped
+
     def dispatch_queue_items(self, dry_run: bool = False) -> int:
         """
         Dispatch non-buildable priority queue items to ClaudeClaw workers.
@@ -987,6 +1069,14 @@ class CycleOrchestrator:
                     )
             except Exception as e:
                 self.audit_logger.log_error("build", f"Oz build poll failed: {e}")
+
+        # Reap builds wedged in 'started' past the build timeout (S5). Runs
+        # BEFORE auto-retry so reaped rows (now 'failed', next_retry_at=NULL)
+        # are re-dispatched through the normal retry path in the same cycle.
+        try:
+            self._reap_stuck_builds()
+        except Exception as e:
+            self.audit_logger.log_error("build", f"Stuck-build reaper failed: {e}")
 
         # Auto-retry failed builds (Phase 13f, hardened against infinite loops)
         self._process_auto_retries()

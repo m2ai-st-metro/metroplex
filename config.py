@@ -43,6 +43,10 @@ class Config:
     build_max_workers: int = field(default=2)
     max_concurrent_builds: int = field(default=1)
 
+    # Build timeout watchdog: a build sitting in 'started' longer than this is
+    # considered stuck and gets reaped (marked failed + routed to retry). 90 min.
+    build_timeout_seconds: int = field(default=5400)
+
     # Scoring thresholds
     approve_threshold: int = field(default=55)
     reject_threshold: int = field(default=40)
@@ -146,6 +150,10 @@ class Config:
             pass
         try:
             self.max_concurrent_builds = int(os.environ.get("METROPLEX_MAX_CONCURRENT_BUILDS", self.max_concurrent_builds))
+        except ValueError:
+            pass
+        try:
+            self.build_timeout_seconds = int(os.environ.get("METROPLEX_BUILD_TIMEOUT_SECONDS", self.build_timeout_seconds))
         except ValueError:
             pass
 

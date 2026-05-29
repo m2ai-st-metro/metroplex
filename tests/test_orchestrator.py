@@ -1376,3 +1376,149 @@ class TestAutoRetryRedispatch:
         ).fetchall()
         assert any(r["next_retry_at"] == "abandoned" for r in rows), \
             "exhausted build must still be abandoned"
+
+
+class TestStuckBuildReaper:
+    """Tests for the S5 stuck-build reaper.
+
+    health._check_stuck_builds only emits a CRIT alert; nothing transitioned a
+    wedged 'started' row out of that state, so a build whose runner died
+    mid-flight rotted indefinitely (idea-441 sat 'started' for 333h). The
+    reaper marks such rows 'failed' and routes them through the NORMAL retry
+    path — never abandoned (unless MAX_RETRIES is genuinely exhausted) —
+    respecting the build circuit breaker and the per-cycle cap.
+    """
+
+    def _add_started_build(
+        self, state_db, queue_job_id, idea_id, age_seconds, title="Stuck Build",
+    ):
+        """Insert a 'started' build_jobs row aged ``age_seconds`` plus a
+        matching priority_queue row stranded at 'dispatched'."""
+        from datetime import timedelta
+        state_db.record_build_job(BuildJob(
+            idea_id=idea_id, title=title, spec_path="/tmp/spec.txt",
+            queue_job_id=queue_job_id, status="started",
+            queued_at=datetime.now() - timedelta(seconds=age_seconds),
+        ))
+        state_db.conn.execute(
+            "INSERT INTO priority_queue (source, source_id, title, description, "
+            "priority_score, status, idea_data, created_at) "
+            "VALUES ('ideaforge', ?, ?, 'd', 1.0, 'dispatched', '{}', ?)",
+            (str(idea_id), title, datetime.now().isoformat()),
+        )
+        state_db.conn.commit()
+
+    def test_get_stuck_started_builds_respects_timeout(self, state_db):
+        """Only 'started' rows older than the timeout are returned."""
+        self._add_started_build(state_db, "metroplex-ideaforge-1", 1, age_seconds=7200)
+        self._add_started_build(state_db, "metroplex-ideaforge-2", 2, age_seconds=60)
+
+        stuck = state_db.get_stuck_started_builds(5400)  # 90 min
+
+        ids = {b["queue_job_id"] for b in stuck}
+        assert ids == {"metroplex-ideaforge-1"}, \
+            "only the >90-min build should be stuck"
+
+    def test_reaper_marks_failed_and_routes_to_retry_not_abandon(
+        self, orchestrator, state_db, config,
+    ):
+        """A reaped build becomes 'failed' and retryable — never abandoned."""
+        self._add_started_build(
+            state_db, "metroplex-ideaforge-1", 1,
+            age_seconds=config.build_timeout_seconds + 600,
+        )
+
+        reaped = orchestrator._reap_stuck_builds()
+        assert reaped == 1
+
+        row = state_db.conn.execute(
+            "SELECT status, next_retry_at FROM build_jobs "
+            "WHERE queue_job_id = 'metroplex-ideaforge-1'"
+        ).fetchone()
+        assert row["status"] == "failed", "stuck build must be transitioned to failed"
+        assert row["next_retry_at"] != "abandoned", \
+            "reaped build must NOT be abandoned — it routes through retry"
+
+        # The normal retry machinery now surfaces it, and the exhausted/abandon
+        # path does not.
+        retryable_ids = {b["queue_job_id"] for b in state_db.get_retryable_builds()}
+        assert "metroplex-ideaforge-1" in retryable_ids
+        exhausted_ids = {b["queue_job_id"] for b in state_db.get_exhausted_builds()}
+        assert "metroplex-ideaforge-1" not in exhausted_ids
+
+    def test_run_cycle_reaps_then_redispatches(
+        self, orchestrator, state_db, config,
+    ):
+        """End-to-end: a stuck build is reaped and re-dispatched within one
+        cycle (priority_queue back to 'pending'), proving reap feeds the
+        inline auto-retry block."""
+        # Use an idea_id distinct from the mock triage gate's idea (1) so the
+        # cycle's triage intake doesn't touch this priority_queue row.
+        self._add_started_build(
+            state_db, "metroplex-ideaforge-77", 77,
+            age_seconds=config.build_timeout_seconds + 600,
+        )
+
+        orchestrator.run_cycle(dry_run=False)
+
+        pq_status = state_db.conn.execute(
+            "SELECT status FROM priority_queue WHERE source='ideaforge' AND source_id='77'"
+        ).fetchone()["status"]
+        assert pq_status == "pending", \
+            f"reaped build should be re-dispatched to 'pending', got {pq_status!r}"
+
+        # The failed row carries a backoff timer (retry scheduled), not the
+        # abandoned sentinel.
+        row = state_db.conn.execute(
+            "SELECT next_retry_at FROM build_jobs WHERE queue_job_id='metroplex-ideaforge-77'"
+        ).fetchone()
+        assert row["next_retry_at"] not in (None, "abandoned"), \
+            "retry block should have stamped a backoff timer on the reaped row"
+
+    def test_reaper_skips_when_build_gate_halted(
+        self, orchestrator, state_db, circuit_breaker, config,
+    ):
+        """A halted build circuit breaker suppresses reaping (no retry churn)."""
+        self._add_started_build(
+            state_db, "metroplex-ideaforge-1", 1,
+            age_seconds=config.build_timeout_seconds + 600,
+        )
+        for _ in range(3):
+            circuit_breaker.record_failure("build", "boom")
+        assert circuit_breaker.is_halted("build")
+
+        assert orchestrator._reap_stuck_builds() == 0
+
+        status = state_db.conn.execute(
+            "SELECT status FROM build_jobs WHERE queue_job_id='metroplex-ideaforge-1'"
+        ).fetchone()["status"]
+        assert status == "started", "build must remain untouched while gate is halted"
+
+    def test_reaper_respects_per_cycle_cap(self, orchestrator, state_db, config):
+        """No more than max_approve_per_cycle builds are reaped per cycle."""
+        cap = config.max_approve_per_cycle
+        total = cap + 2
+        for i in range(total):
+            self._add_started_build(
+                state_db, f"metroplex-ideaforge-{10 + i}", 10 + i,
+                age_seconds=config.build_timeout_seconds + 600,
+            )
+
+        reaped = orchestrator._reap_stuck_builds()
+        assert reaped == cap, f"expected cap={cap} reaps, got {reaped}"
+
+        still_started = state_db.conn.execute(
+            "SELECT COUNT(*) FROM build_jobs WHERE status='started'"
+        ).fetchone()[0]
+        assert still_started == total - cap, \
+            "builds beyond the cap must remain 'started' for the next cycle"
+
+    def test_reaper_noop_when_nothing_stuck(self, orchestrator, state_db, config):
+        """A fresh 'started' build inside the timeout is not reaped."""
+        self._add_started_build(state_db, "metroplex-ideaforge-1", 1, age_seconds=60)
+
+        assert orchestrator._reap_stuck_builds() == 0
+        status = state_db.conn.execute(
+            "SELECT status FROM build_jobs WHERE queue_job_id='metroplex-ideaforge-1'"
+        ).fetchone()["status"]
+        assert status == "started"

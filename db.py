@@ -1183,6 +1183,45 @@ class StateDB:
         )
         self.conn.commit()
 
+    # --- Stuck Started Build Reaper (S5) ---
+
+    def get_stuck_started_builds(self, timeout_seconds: int) -> list[dict]:
+        """Get builds wedged in 'started' status past the build timeout.
+
+        Once a build's runner reports 'running', gates/build.py transitions the
+        row 'queued' -> 'started' so the 30-min stale-queued recovery won't kill
+        a legitimately long Opus build. But nothing bounded the 'started' state:
+        if the runner/daemon dies mid-build, the row rots indefinitely (idea-441
+        sat 'started' for 333h). health._check_stuck_builds only ALERTS on this;
+        this query feeds the reaper that actually transitions such rows.
+
+        A build is stuck-started when:
+        - build_jobs.status = 'started'
+        - queued_at is older than ``timeout_seconds`` ago
+
+        build_jobs carries no started_at column; queued_at is the only timestamp
+        and is stamped immediately before dispatch, so it is a safe lower bound
+        on elapsed runtime (mirrors get_stale_queued_builds' use of queued_at).
+
+        Returns:
+            List of dicts with queue_job_id, base_job_id, idea_id, title,
+            queued_at, retry_count — oldest first.
+        """
+        self.connect()
+        cursor = self.conn.cursor()
+        cutoff = (datetime.now() - timedelta(seconds=timeout_seconds)).isoformat()
+        cursor.execute(
+            """
+            SELECT queue_job_id, base_job_id, idea_id, title, queued_at, retry_count
+            FROM build_jobs
+            WHERE status = 'started'
+              AND queued_at < ?
+            ORDER BY queued_at ASC
+            """,
+            (cutoff,),
+        )
+        return [dict(row) for row in cursor.fetchall()]
+
     # --- Build Retry (Phase 13f) ---
 
     MAX_RETRIES = 5
