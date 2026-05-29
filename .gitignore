@@ -5,6 +5,9 @@ venv/
 data/
 *.egg-info/
 .env
+.env.*
+!.env.example
+*.bak-rotate
 screenshots/
 .pytest_cache/
 .coverage
