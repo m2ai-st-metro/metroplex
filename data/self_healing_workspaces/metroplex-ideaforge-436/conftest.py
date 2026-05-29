@@ -1,11 +1,8 @@
-"""Pytest config — make workspace root importable so tests can `import agent`, `import matcher`."""
-
-from __future__ import annotations
+"""Pytest config: make the workspace importable as a flat module set."""
 
 import sys
 from pathlib import Path
 
-WORKSPACE_ROOT = Path(__file__).resolve().parent
-
-if str(WORKSPACE_ROOT) not in sys.path:
-    sys.path.insert(0, str(WORKSPACE_ROOT))
+ROOT = Path(__file__).resolve().parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))

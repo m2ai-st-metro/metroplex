@@ -1,24 +1,16 @@
 {
-  "task": "Build Elder-Care Safety & Support Companion agent per spec.md",
+  "task": "Build the Elder-Care Safety & Support Companion agent per spec.md (idea #436)",
   "target_dir": "/home/apexaipc/projects/metroplex/data/self_healing_workspaces/metroplex-ideaforge-436",
-  "status": "passed",
+  "status": "planning",
   "attempt": 1,
   "max_attempts": 3,
-  "started_at": "2026-05-16T10:17:00Z",
-  "updated_at": "2026-05-16T10:35:00Z",
-  "planner_done": true,
-  "builder_done": true,
-  "judge_verdict": "pass",
+  "started_at": "2026-05-29T04:15:00Z",
+  "updated_at": "2026-05-29T04:15:00Z",
+  "planner_done": false,
+  "builder_done": false,
+  "judge_verdict": null,
   "escalation_reason": null,
-  "feature_branch": "feature/self-heal-ideaforge-436",
-  "red_commit_sha": "516bb73",
-  "history": [
-    {
-      "attempt": 1,
-      "builder_result": "pass",
-      "judge_verdict": "pass",
-      "failure_summary": null,
-      "timestamp": "2026-05-16T10:35:00Z"
-    }
-  ]
+  "feature_branch": null,
+  "red_commit_sha": null,
+  "history": []
 }

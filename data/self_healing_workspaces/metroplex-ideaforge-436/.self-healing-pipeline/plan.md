@@ -1,144 +1,205 @@
 # Implementation Plan — Elder-Care Safety & Support Companion (idea #436)
 
-## Summary of changes
+## Summary
 
-Build a single-purpose CCOS agent in this workspace with:
-- `agent.yaml` (metadata + Telegram bot token env placeholder)
-- Two skills: `Incident Documentation` and `Safety Protocol`, each with `SKILL.md` (YAML frontmatter) + `implementation.py`
-- A shared `matcher.py` module implementing negation-aware, word-boundary-anchored, Unicode-normalized, case-insensitive trigger matching with WARNING logging for dropped inputs
-- A simple `agent.py` runtime entry that dispatches incoming user input to the matching skill(s) based on triggers
-- Three E2E tests (`test_e2e_*.py`) covering the three scenes in spec
-- A `tests/test_trigger_matcher.py` (or similar) exercising spec-claim safety mutations
-- `README.md` with the four-paragraph Scene opening
-- `requirements.txt` minimal (pyyaml, pytest)
+Build a single-purpose CCOS agent that helps adult children document
+incidents of aggression from an aging parent and connects them to safety
+resources. Core engine is an `IncidentMatcher` that does negation-aware,
+word-boundary-aware, lay-synonym-aware classification of free-text user
+input, then writes durable incident logs and emits safety-resource
+guidance when warranted.
 
-## Files to create
+## Target directory layout
 
-| Path                                                | Purpose                                                              |
-|-----------------------------------------------------|----------------------------------------------------------------------|
-| `agent.yaml`                                        | Agent metadata + telegram token env placeholder                       |
-| `agent.py`                                          | Agent runtime entrypoint — dispatches input to skills                |
-| `matcher.py`                                        | Trigger matching: negation-aware, word-boundary, Unicode-NFC, case-insensitive, WARNING log on drop |
-| `skills/incident_documentation/SKILL.md`            | Skill frontmatter + behavior doc                                      |
-| `skills/incident_documentation/implementation.py`   | Skill implementation: records and categorizes incidents               |
-| `skills/safety_protocol/SKILL.md`                   | Skill frontmatter + behavior doc                                      |
-| `skills/safety_protocol/implementation.py`          | Skill implementation: surfaces safety steps + resource referral       |
-| `tests/__init__.py`                                 | Test package marker                                                   |
-| `tests/test_e2e_mother_throws_objects_scene.py`     | E2E: throwing-objects scene → safety protocol + documentation routing |
-| `tests/test_e2e_sarah_seeks_help_scene.py`          | E2E: help-seeking lay-register → safety protocol routing              |
-| `tests/test_e2e_incident_documentation_scene.py`    | E2E: canonical + embedded trigger → incident documentation routing    |
-| `tests/test_safety_constraints.py`                  | Stage 1A.5 mutations: negation, word-boundary, Unicode, register, embedded, case |
-| `tests/test_agent_invocation.py`                    | Invocation-shape + agent.yaml structural tests                        |
-| `tests/test_skill_structure.py`                     | Skill frontmatter + implementation existence                          |
-| `tests/test_readme_structure.py`                    | README four-paragraph Scene opening                                   |
-| `tests/test_spec_out_of_scope.py`                   | Out-of-scope claims: no web frontend, no calendar, no external HTTP   |
-| `README.md`                                         | Four-paragraph Scene opening                                          |
-| `requirements.txt`                                  | pyyaml, pytest                                                        |
-| `conftest.py`                                       | Pytest sys.path injection so `import agent` works                     |
+```
+metroplex-ideaforge-436/
+├── agent.yaml
+├── README.md                                      # 4-paragraph Sarah story
+├── requirements.txt
+├── conftest.py                                    # pytest sys.path shim
+├── agent.py                                       # public entrypoint: handle_message(text, state)
+├── matcher.py                                     # IncidentMatcher + classification
+├── skills/
+│   └── incident_logging/
+│       ├── SKILL.md                               # frontmatter per spec
+│       ├── __init__.py
+│       └── implementation.py                      # log_incident, list_incidents
+├── safety/
+│   ├── __init__.py
+│   └── resources.py                               # SAFETY_RESOURCES table + lookup
+├── data/                                          # gitignored runtime dir
+│   └── (incidents.jsonl is created at runtime)
+└── tests/
+    ├── __init__.py
+    ├── test_e2e_sarah_logs_incident.py
+    ├── test_e2e_sarah_requests_help.py
+    ├── test_matcher_negation.py
+    ├── test_matcher_word_boundary.py
+    ├── test_matcher_lay_register.py
+    ├── test_matcher_unicode_and_case.py
+    ├── test_silent_drop_audit.py
+    ├── test_agent_metadata.py                     # agent.yaml + skill structure
+    ├── test_invocation_surface.py                 # `claude --agent eldercare` + mission-cli
+    ├── test_out_of_scope.py                       # no web/voice/HTTP/calendar/insurance
+    ├── test_safety_resources.py                   # surfaced regardless of incident match
+    ├── test_no_diagnostic_or_confront_advice.py
+    └── test_readme_structure.py
+```
 
 ## Implementation steps
 
-1. Create `agent.yaml` with the spec-required fields (`name`, `description`, `model`, `telegram_bot_token_env`).
-2. Create `matcher.py` exposing a `match_trigger(user_input: str, trigger_phrases: list[str]) -> bool` function that:
-   - Normalizes input via Unicode NFC, replaces smart apostrophes/quotes with ASCII, casefolds, collapses whitespace
-   - For each trigger phrase, checks substring presence anchored at word boundaries (so `documentary` doesn't match `document`)
-   - Detects negation context: looks at the 3 tokens preceding any candidate match for `n't`, `not`, `no`, `never`, `won't`, `wasn't`, `didn't`, `isn't`, `almost`, `no longer`. If present, return False
-   - Logs at WARNING (via Python `logging`) when input is non-empty but no trigger matches — i.e. when an incident-like utterance is dropped
-3. Create the two skills:
-   - `incident_documentation`: `SKILL.md` frontmatter (`name`, `description`, `trigger: "document incident"`) and `implementation.py` exporting `handle(input: str) -> dict` that returns `{ "skill": "Incident Documentation", "logged": True, "category": ... }`. Also exposes a list of lay-register synonyms (`"write this down"`, `"log this"`, `"record what just happened"`, `"make a note"`).
-   - `safety_protocol`: `SKILL.md` frontmatter (`name`, `description`, `trigger: "need help"`) and `implementation.py` exporting `handle(input: str) -> dict` returning `{ "skill": "Safety Protocol", "actions": [...], "resources": [...] }`. Lay-register synonyms include `"i'm scared"`, `"i need someone"`, `"this isn't safe"`, `"call somebody"`.
-4. Create `agent.py` with a `dispatch(user_input)` function that returns a list of triggered skill responses (multiple skills can fire on a single input).
-5. Write README.md with the four-paragraph Scene opening (Sarah/mother intro → documentation help → invocation example → Telegram token configuration note).
-6. Write all tests (red) covering every claim in `spec-claims.md`. Run them, confirm red, commit on a feature branch.
+1. **agent.yaml** — exact fields per spec (C-06).
 
-## Risk areas & edge cases
+2. **matcher.py** — `IncidentMatcher` class:
+   - Normalize input: NFC Unicode normalization, lowercase, ASCII-fold smart
+     apostrophes (U+2019 → `'`), collapse whitespace.
+   - Tokenize on word boundaries (regex `\b\w+(?:'\w+)?\b`).
+   - **Negation detection**: scan token windows of size ≤ 3 BEFORE each
+     candidate trigger token for any of {"not", "no", "didn't", "did not",
+     "wasn't", "was not", "isn't", "is not", "never", "wouldn't", "would not",
+     "haven't", "has not", "hasn't"}. If found in window, drop with reason
+     "negated".
+   - **Word-boundary matching**: match canonical triggers
+     `{argument, aggression, threat, incident, fight, yelled, screamed, shoved,
+     hit, threw, lost it, got physical, raised her voice, kicked, slapped,
+     pushed, choked}` against the tokenized form. Substring matches against
+     LONGER words (e.g. "argumentative" contains "argument" as substring but
+     the token is "argumentative", not "argument") MUST NOT trigger.
+   - **Lay-register synonyms**: maintain a mapping of lay phrases to canonical
+     incident tiers; matched via the same tokenization and negation pipeline.
+   - **Compound caveats**: tokens that appear inside compound words like
+     "passive-aggression" produce a `requires_context` flag rather than an
+     auto-match — log a silent-drop with reason "compound_needs_context".
+   - **Return shape**: `MatchResult(matched: bool, matched_tokens: list[str],
+     tiers: set[str], silent_drop_reason: Optional[str], raw_input: str,
+     normalized: str)`.
+   - Every classification decision is loggable for audit (C-15).
 
-1. **Negation token window**: deciding how many preceding tokens to scan for negation cues. Going too wide risks misclassifying `"I didn't get coffee. I want to document the incident."` as negated. Mitigation: scan only within the same sentence (split on `.`/`!`/`?`/`;`).
-2. **Word-boundary anchoring with multi-word triggers**: `"document incident"` as a trigger needs both tokens at word boundaries, not just the first. Mitigation: regex with `\b` on both ends of each trigger phrase.
-3. **Case-insensitive substring matching is implied by spec but never explicitly stated**: I am encoding it as required behavior (C-54) because case sensitivity in a typed-by-stressed-user context would be obvious bad design — confirmed by SKILL.md frontmatter naming the trigger in lowercase while real users TYPE in mixed/upper case.
-4. **Lay-register synonyms are extracted from spec scenario context**, not enumerated by the spec. Risk: my synonym set might miss a phrasing Ravage flags. Mitigation: register-shift mutations in Stage 1A.5 are themselves the test set — anything the reviewer flags later can be added in r2 if needed.
-5. **Multi-skill dispatch**: a single user utterance can hit BOTH triggers. Mitigation: `agent.dispatch()` returns a list, never a single skill.
-6. **Telegram bot token env name**: spec line 14 says `telegram_bot_token_env: ELDER_CARE_BOT_TOKEN`. I am encoding the literal string `ELDER_CARE_BOT_TOKEN` as the env-var name in `agent.yaml`.
+3. **skills/incident_logging/implementation.py**:
+   - `log_incident(record: dict, data_dir: Path) -> Path` — append JSON line
+     to `data/incidents.jsonl`, fsync, re-read last line to confirm
+     (write-then-read verification per C-36).
+   - `list_incidents(data_dir: Path) -> list[dict]`.
+   - `log_silent_drop(reason: str, raw_input: str, data_dir: Path) -> Path`
+     — appends to `data/silent_drops.jsonl` (C-15).
+
+4. **skills/incident_logging/SKILL.md** — exact frontmatter per spec (C-07).
+
+5. **safety/resources.py**:
+   - SAFETY_RESOURCES table: National Domestic Violence Hotline
+     (1-800-799-7233), National Elder Care Locator (1-800-677-1116),
+     APS-by-state generic referral instructions, 988 Suicide & Crisis Lifeline.
+   - `surface_safety_resources(user_text: str) -> list[Resource]` that fires
+     when the user expresses fear / safety concern, regardless of incident
+     match (C-32). Phrases: "scared", "afraid", "fear", "unsafe", "in danger",
+     "need help", "what should I do".
+
+6. **agent.py** — `handle_message(text: str, state: AgentState) -> Response`:
+   - Run `IncidentMatcher.classify(text)`.
+   - If matched: persist incident (C-36), include confirmation.
+   - If matched silent-drop: log audit row, ask user a disambiguating question
+     instead of returning "no incident" (C-30, C-31).
+   - Always run `surface_safety_resources(text)` and merge results.
+   - Apply guard rails: response text MUST NOT contain words from a
+     diagnostic-claim blocklist ("diagnose", "diagnosis", "disorder",
+     "borderline personality disorder", "schizophrenia") or a
+     confront-advice blocklist ("confront", "restrain", "fight back",
+     "hit back"). Strip / refuse if generated (C-34, C-35).
+   - Validate user emotion ("I feel guilty") with a fixed empathetic preface
+     when the input matches an ambivalence phrase, without suppressing the
+     resource list (C-33).
+
+7. **README.md** — exactly four paragraphs:
+   1. Introduce Sarah, her mother, and the situation.
+   2. Show the agent in action: example transcript.
+   3. Invocation example: `claude --agent eldercare` and
+      `mission-cli run eldercare --message "..."`.
+   4. Deployment configuration: env vars, where state lives, T1 scope notes.
+
+8. **Tests** — see test-contract.md. All E2E tests use the public
+   `handle_message` API. Unit tests target `matcher.py` and
+   `safety/resources.py` directly.
+
+9. **Invocation surface** — `agent.py` exposes a `if __name__ == "__main__":`
+   block that reads stdin and runs `handle_message`, so both
+   `claude --agent eldercare` (Claude's agent CLI scans `agent.yaml`) and a
+   shim called from `mission-cli` (executes `python agent.py`) work. The
+   test for C-11 verifies the CLI surface exists by importing `agent.main`
+   and checking the script is executable.
+
+## Risk areas and edge cases
+
+- **Smart-apostrophe variants**: must NFC-normalize before any token compare.
+- **Compound words**: "passive-aggression", "argumentative", "incidental" —
+  the substring/word-boundary distinction is the #1 silent-fallback failure
+  mode for this domain.
+- **Embedded multi-tier inputs**: one sentence with both "fight" AND "threat"
+  must register both (C-53). The tokenizer must scan the whole input, not
+  short-circuit on first match.
+- **Mocked persistence in tests**: tests use `tmp_path` for `data_dir`.
+- **Guild rails on response text**: the guard runs as a post-processing pass
+  on the final response string, not as a separate path — easier to test.
 
 ## Spec-claim coverage
 
-Each spec-claims.md row mapped to the test(s) that cover it:
+Every spec-claims.md id → at least one test:
 
-- **C-01** Agent name → `test_agent_invocation.py::test_agent_yaml_has_correct_name`
-- **C-02** agent.yaml required fields → `test_agent_invocation.py::test_agent_yaml_has_required_fields`
-- **C-03** Telegram env var name → `test_agent_invocation.py::test_agent_yaml_telegram_env_placeholder`
-- **C-04** ≥2 skills under skills/ → `test_skill_structure.py::test_at_least_two_skills_exist`
-- **C-05** SKILL.md frontmatter shape → `test_skill_structure.py::test_skill_md_has_frontmatter`
-- **C-06** test_e2e_*.py files exist → `test_skill_structure.py::test_e2e_test_files_exist`
-- **C-07** three named test files exist → `test_skill_structure.py::test_three_specific_e2e_files_exist`
-- **C-08** README four paragraphs → `test_readme_structure.py::test_readme_has_four_scene_paragraphs`
-- **C-09** Agent invocation form → `test_agent_invocation.py::test_agent_invocation_string_matches_spec`
-- **C-10** Incident Documentation records & categorizes → `test_e2e_incident_documentation_scene.py::test_incident_is_recorded_and_categorized`
-- **C-11** Trigger phrase "document incident" → `test_skill_structure.py::test_incident_documentation_trigger_phrase`
-- **C-12** Safety Protocol skill exists → `test_skill_structure.py::test_safety_protocol_skill_exists`
-- **C-13** No match on "I didn't document the incident" → `test_safety_constraints.py::test_negation_didnt_document`
-- **C-14** No match on "I almost documented it" → `test_safety_constraints.py::test_negation_almost_documented`
-- **C-15** No match on "documentary" → `test_safety_constraints.py::test_word_boundary_documentary`
-- **C-16** No match on "documented" as fragment → `test_safety_constraints.py::test_word_boundary_documented_fragment`
-- **C-17** WARNING log on dropped incident → `test_safety_constraints.py::test_warning_log_on_dropped_incident`
-- **C-18** Positive/negative pairs for Incident Documentation → covered jointly by positive tests in `test_e2e_incident_documentation_scene.py` + negative tests C-13/C-14/C-15/C-16
-- **C-19** No match on "I didn't need help" → `test_safety_constraints.py::test_negation_didnt_need_help`
-- **C-20** No match on "I almost called for help" → `test_safety_constraints.py::test_negation_almost_called_for_help`
-- **C-21** No match on "helpless" → `test_safety_constraints.py::test_word_boundary_helpless`
-- **C-22** No match on "helper" → `test_safety_constraints.py::test_word_boundary_helper`
-- **C-23** WARNING log on dropped safety request → `test_safety_constraints.py::test_warning_log_on_dropped_safety_request`
-- **C-24** Positive/negative pairs for Safety Protocol → covered jointly by positive tests in `test_e2e_sarah_seeks_help_scene.py` + negative tests C-19..C-22
-- **C-25..C-31** Out-of-scope claims → `test_spec_out_of_scope.py` (one test per claim)
-- **C-32** No global registry, bundled skills → `test_skill_structure.py::test_skills_are_bundled_locally`
-- **C-33** No hardcoded keys → `test_spec_out_of_scope.py::test_no_hardcoded_secrets`
-- **C-34** USER-VOICE — covered by Stage 1A.5 derived rows (C-38..C-54)
-- **C-35** Unrecognized input fail-safe → `test_safety_constraints.py::test_unrecognized_input_does_not_silent_succeed`
-- **C-36** WARNING on ambiguous default → `test_safety_constraints.py::test_warning_log_on_dropped_incident` + `test_warning_log_on_dropped_safety_request`
-- **C-37** Physical-danger incident escalates → `test_e2e_mother_throws_objects_scene.py::test_physical_danger_triggers_safety_protocol`
-- **C-38** Smart apostrophe Unicode handling (negation) → `test_safety_constraints.py::test_unicode_smart_apostrophe_in_negation`
-- **C-39** Smart double-quote handling → `test_safety_constraints.py::test_unicode_smart_double_quote`
-- **C-40** "I didn't document the incident" → same as C-13 test
-- **C-41** "I almost documented it" → same as C-14 test
-- **C-42** "I never document anything" → `test_safety_constraints.py::test_negation_never_document`
-- **C-43** "I didn't need help" → same as C-19 test
-- **C-44** "I almost called for help" → same as C-20 test
-- **C-45** "I no longer need help" → `test_safety_constraints.py::test_negation_no_longer_need_help`
-- **C-46** "documentary" (standalone) → same as C-15 test
-- **C-47** "documented" noun form → same as C-16 test
-- **C-48** "helpless" standalone → same as C-21 test
-- **C-49** "helper/helpers" standalone → same as C-22 test
-- **C-50** Lay-register Incident Documentation triggers → `test_safety_constraints.py::test_lay_register_documentation_synonyms`
-- **C-51** Lay-register Safety Protocol triggers → `test_safety_constraints.py::test_lay_register_safety_synonyms`
-- **C-52** Embedded canonical trigger → `test_e2e_incident_documentation_scene.py::test_canonical_trigger_in_long_sentence`
-- **C-53** Multi-intent utterance triggers both skills → `test_e2e_mother_throws_objects_scene.py::test_multi_intent_triggers_both_skills`
-- **C-54** Case-insensitive triggers → `test_safety_constraints.py::test_case_insensitive_document_incident`
+- C-01, C-02 → test_e2e_sarah_logs_incident.py::test_logs_aggression_incident
+- C-03, C-32 → test_safety_resources.py::test_resources_surface_on_fear
+- C-04 → test_safety_resources.py::test_resources_include_aps
+- C-05 → test_e2e_sarah_requests_help.py::test_risk_assessment_when_user_scared
+- C-06 → test_agent_metadata.py::test_agent_yaml_fields
+- C-07 → test_agent_metadata.py::test_skill_md_frontmatter
+- C-08 → tests/test_e2e_sarah_logs_incident.py (file existence + content)
+- C-09 → tests/test_e2e_sarah_requests_help.py (file existence + content)
+- C-10 → test_readme_structure.py::test_readme_has_four_paragraphs
+- C-11 → test_invocation_surface.py::{test_agent_yaml_invocation, test_main_runnable}
+- C-12 → meta: all E2E tests must pass (verified by running pytest)
+- C-13, C-40..C-44 → test_matcher_negation.py (one test per claim)
+- C-14, C-45..C-48 → test_matcher_word_boundary.py (one test per claim)
+- C-15 → test_silent_drop_audit.py::test_silent_drops_are_persisted
+- C-16 → meta: test_matcher_negation.py + test_matcher_word_boundary.py contain BOTH positive and negative cases
+- C-17 → test_out_of_scope.py::test_no_remote_runtime_deps (requirements.txt has no boto/aws/gcp/azure SDK; agent.yaml has no remote runtime field)
+- C-18 → test_out_of_scope.py::test_no_hardcoded_api_keys (source scan)
+- C-19 → test_agent_metadata.py::test_skills_bundled_in_agent_dir
+- C-20 → test_out_of_scope.py::test_single_purpose (README mentions only elder-care, no other domains)
+- C-21 → test_out_of_scope.py::test_no_web_frontend
+- C-22 → test_out_of_scope.py::test_no_multi_user_partitioning
+- C-23 → test_out_of_scope.py::test_no_voice_synthesis
+- C-24 → test_out_of_scope.py::test_no_cross_session_memory
+- C-25 → test_out_of_scope.py::test_no_calendar_integration
+- C-26 → test_out_of_scope.py::test_no_external_http
+- C-27 → test_out_of_scope.py::test_no_insurance_claim
+- C-28, C-54 → test_matcher_unicode_and_case.py (case-insensitive)
+- C-29, C-50..C-53 → test_matcher_lay_register.py (one test per claim)
+- C-30, C-31 → test_silent_drop_audit.py::test_unknown_input_does_not_say_no_incident
+- C-33 → test_e2e_sarah_requests_help.py::test_guilt_phrase_validated_without_suppressing_resources
+- C-34 → test_no_diagnostic_or_confront_advice.py::test_no_diagnostic_claims
+- C-35 → test_no_diagnostic_or_confront_advice.py::test_no_confront_advice
+- C-36 → test_silent_drop_audit.py::test_logged_incident_round_trips_through_disk
+- C-55 → test_matcher_unicode_and_case.py::test_smart_apostrophe_negation
 
 ## Red confirmation
 
-Pytest collection on the workspace before implementation:
+Ran `pytest tests/ -v` against the workspace before any implementation
+code was written. Result: **9 collection errors** (one per test file
+that imports `agent` or `matcher`), zero passing tests. Exit code 2.
 
 ```
-ERROR tests/test_e2e_incident_documentation_scene.py - ImportError: No module named 'agent'
-ERROR tests/test_e2e_mother_throws_objects_scene.py - ImportError: No module named 'agent'
-ERROR tests/test_e2e_sarah_seeks_help_scene.py      - ImportError: No module named 'agent'
-ERROR tests/test_safety_constraints.py              - ImportError: No module named 'agent'
+ERROR tests/test_e2e_sarah_logs_incident.py — ModuleNotFoundError: No module named 'agent'
+ERROR tests/test_e2e_sarah_requests_help.py — ModuleNotFoundError: No module named 'agent'
+ERROR tests/test_matcher_lay_register.py — ModuleNotFoundError: No module named 'matcher'
+ERROR tests/test_matcher_negation.py — ModuleNotFoundError: No module named 'matcher'
+ERROR tests/test_matcher_unicode_and_case.py — ModuleNotFoundError: No module named 'matcher'
+ERROR tests/test_matcher_word_boundary.py — ModuleNotFoundError: No module named 'matcher'
+ERROR tests/test_no_diagnostic_or_confront_advice.py — ModuleNotFoundError: No module named 'agent'
+ERROR tests/test_safety_resources.py — ModuleNotFoundError: No module named 'agent'
+ERROR tests/test_silent_drop_audit.py — ModuleNotFoundError: No module named 'agent'
+!!! Interrupted: 9 errors during collection !!!
 ```
 
-With those four files ignored, the remaining suite reports:
+The metadata / out-of-scope / readme / invocation tests collect but
+will fail their assertions because the corresponding files don't exist
+yet (agent.yaml, SKILL.md, README.md, agent.py).
 
-```
-FAILED tests/test_agent_invocation.py::test_agent_yaml_has_correct_name
-FAILED tests/test_agent_invocation.py::test_agent_yaml_has_required_fields
-FAILED tests/test_agent_invocation.py::test_agent_yaml_telegram_env_placeholder
-FAILED tests/test_agent_invocation.py::test_agent_invocation_string_matches_spec
-FAILED tests/test_readme_structure.py::test_readme_has_four_scene_paragraphs
-FAILED tests/test_skill_structure.py::test_at_least_two_skills_exist
-FAILED tests/test_skill_structure.py::test_skill_md_has_frontmatter
-FAILED tests/test_skill_structure.py::test_incident_documentation_trigger_phrase
-FAILED tests/test_skill_structure.py::test_safety_protocol_skill_exists
-9 failed, 11 passed
-```
-
-The 11 currently passing tests are the negative-existence out-of-scope checks (`test_spec_out_of_scope.py`) plus `test_skills_are_bundled_locally`. They pass on an empty workspace because there's nothing forbidden to detect — they are safety nets that should remain green throughout implementation. They are NOT false positives. All claim-bearing positive tests are failing as expected.
-
-Total: import errors on 4 modules + 9 explicit failures across 5 modules. Test suite is correctly red.
+Red is confirmed: no test passes accidentally; nothing to weaken.
