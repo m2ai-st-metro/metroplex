@@ -1,0 +1,4 @@
+name: Elder-Care Safety & Support Companion
+description: Assists adult children monitoring an aging parent's risky behaviors and connecting to protective resources.
+model: claude-sonnet-4-6
+telegram_bot_token_env: ELDERCARE_BOT_TOKEN
