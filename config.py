@@ -72,7 +72,7 @@ class Config:
 
     # Spec generation (LLM expansion)
     spec_use_llm: bool = field(default=True)
-    spec_llm_model: str = field(default="Qwen/Qwen2.5-72B-Instruct")
+    spec_llm_model: str = field(default="mistralai/Mistral-Small-3.2-24B-Instruct-2506")
     spec_llm_max_tokens: int = field(default=8192)
 
     # Dispatch (EA-Claude worker queue)
