@@ -824,7 +824,10 @@ class TestSoftResetAttempts:
         db.update_item_status(pq_id, "dispatched", "dispatched_at")
         # status='failed' on priority_queue for the exhausted scenario
         db.conn.execute("UPDATE priority_queue SET status = 'failed' WHERE id = ?", (pq_id,))
-        for suffix in ("", "-r1", "-r2"):
+        # Create exactly MAX_RETRIES failed rows so the build is genuinely
+        # exhausted (count >= MAX_RETRIES). Suffixes: "", "-r1", ... "-r{N-1}".
+        suffixes = [""] + [f"-r{i}" for i in range(1, db.MAX_RETRIES)]
+        for suffix in suffixes:
             db.record_build_job(BuildJob(
                 idea_id=idea_id,
                 title="Nighttime Newborn Triage Copilot",
@@ -837,25 +840,27 @@ class TestSoftResetAttempts:
         return pq_id
 
     def test_exhausted_build_blocked_from_retry_before_reset(self, db):
-        """Sanity: 3 failed rows means get_retryable_builds excludes the build."""
+        """Sanity: MAX_RETRIES failed rows means get_retryable_builds excludes
+        the build."""
         self._setup_exhausted(db)
         retryable = db.get_retryable_builds()
         assert all(r["base_job_id"] != "metroplex-ideaforge-427" for r in retryable)
-        assert db.count_failed_builds("metroplex-ideaforge-427") == 3
+        assert db.count_failed_builds("metroplex-ideaforge-427") == db.MAX_RETRIES
 
     def test_soft_reset_trims_failed_rows_and_repends_queue(self, db):
-        """3 failed rows + soft_reset -> 2 retained, priority_queue back to pending."""
+        """MAX_RETRIES failed rows + soft_reset -> keep_max_failed (2) retained,
+        priority_queue back to pending."""
         pq_id = self._setup_exhausted(db)
 
         result = db.soft_reset_attempts("metroplex-ideaforge-427")
 
-        assert result["deleted_count"] == 1
+        assert result["deleted_count"] == db.MAX_RETRIES - 2
         assert result["retained_failed_count"] == 2
         assert result["priority_queue_id"] == pq_id
         assert result["source"] == "ideaforge"
         assert result["source_id"] == "427"
-        # The most-recent row should be the one deleted
-        assert "metroplex-ideaforge-427-r2" in result["deleted_queue_job_ids"]
+        # The most-recent row should be among those deleted
+        assert f"metroplex-ideaforge-427-r{db.MAX_RETRIES - 1}" in result["deleted_queue_job_ids"]
 
         cursor = db.conn.cursor()
         cursor.execute("SELECT status, dispatched_at, claimed_by FROM priority_queue WHERE id = ?", (pq_id,))
@@ -866,6 +871,7 @@ class TestSoftResetAttempts:
 
         # Build is now eligible for retry
         assert db.count_failed_builds("metroplex-ideaforge-427") == 2
+        assert db.count_failed_builds("metroplex-ideaforge-427") < db.MAX_RETRIES
 
     def test_soft_reset_with_rn_suffix_raises(self, db):
         """Caller mistake: passing a -rN suffix should be rejected loudly."""
@@ -876,7 +882,7 @@ class TestSoftResetAttempts:
         """keep_max_failed=0 deletes every failed row (used for full reset)."""
         self._setup_exhausted(db)
         result = db.soft_reset_attempts("metroplex-ideaforge-427", keep_max_failed=0)
-        assert result["deleted_count"] == 3
+        assert result["deleted_count"] == db.MAX_RETRIES
         assert result["retained_failed_count"] == 0
         assert db.count_failed_builds("metroplex-ideaforge-427") == 0
 

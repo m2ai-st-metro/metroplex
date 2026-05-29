@@ -1077,6 +1077,34 @@ class StateDB:
         self.conn.commit()
         return cursor.rowcount > 0
 
+    def set_build_review_status(self, queue_job_id: str, review_status: str) -> bool:
+        """Set review_status on a build regardless of its status.
+
+        Sibling to update_build_review_status() (which guards WHERE status='completed').
+        This setter has NO status guard, so it can tag a build whose status is
+        already 'failed' — e.g. when the self-healing daemon's adversarial
+        (Ravage) review rejected the build (review_rejected) but the poll loop
+        mapped the job to metroplex status 'failed'. Recording the review_status
+        here keeps the daemon's review verdict from being lost so the postmortem
+        classifier can label it 'review_rejected' instead of falling through to
+        the spec_unclear default.
+
+        Args:
+            queue_job_id: Build job queue ID
+            review_status: e.g. 'review_rejected'
+
+        Returns:
+            True if a row was updated.
+        """
+        self.connect()
+        cursor = self.conn.cursor()
+        cursor.execute(
+            "UPDATE build_jobs SET review_status = ? WHERE queue_job_id = ?",
+            (review_status, queue_job_id),
+        )
+        self.conn.commit()
+        return cursor.rowcount > 0
+
     # --- Stale Queued Build Detection ---
 
     STALE_QUEUED_THRESHOLD_MINUTES = 30
@@ -1157,8 +1185,8 @@ class StateDB:
 
     # --- Build Retry (Phase 13f) ---
 
-    MAX_RETRIES = 3
-    RETRY_BACKOFF_MINUTES = [5, 20, 60]  # Exponential-ish backoff
+    MAX_RETRIES = 5
+    RETRY_BACKOFF_MINUTES = [5, 20, 60, 120, 240]  # Exponential-ish backoff
 
     def count_failed_builds(self, base_job_id: str) -> int:
         """Count failed build attempts for a base job ID (any suffix)."""

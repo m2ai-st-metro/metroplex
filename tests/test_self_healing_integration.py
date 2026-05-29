@@ -279,3 +279,169 @@ def test_self_healing_guard_skips_when_heartbeat_stale(
         "self-healing daemon" in rec.message.lower()
         for rec in caplog.records
     )
+
+
+def test_poll_sets_review_rejected_on_ravage_reject(
+    orchestrator, adapter, state_db, spec_file, fresh_heartbeat
+):
+    """When the daemon's poll dict carries review_verdict='rejected' (Ravage
+    rejected on safety-class findings), the failed-branch of poll_and_sync_status
+    must persist review_status='review_rejected' so the postmortem classifier
+    can label it correctly instead of falling through to spec_unclear.
+
+    Drives the REAL adapter.poll() via a hand-written state.json with
+    status='passed' + review_verdict='rejected', which _resolve_metroplex_status
+    maps to 'failed' while still surfacing review_verdict in the poll dict.
+    """
+    idea = _idea(idea_id=5, title="Elder-care companion")
+    job = orchestrator.queue_build(idea, spec_file, dry_run=False)
+    assert job is not None
+    assert job.queue_job_id == "metroplex-ideaforge-5"
+
+    target_dir = adapter.workspace_root / "metroplex-ideaforge-5"
+
+    # Ravage finished and REJECTED — Judge had written passed, review_verdict
+    # flips it to a failed metroplex status (defense-in-depth path).
+    _write_state(
+        target_dir,
+        {
+            "status": "passed",
+            "attempt": 1,
+            "judge_verdict": "pass",
+            "review_verdict": "rejected",
+            "review_critical_count": 2,
+        },
+    )
+
+    poll_result = orchestrator.poll_and_sync_status()
+    assert "metroplex-ideaforge-5" in poll_result["failed"]
+
+    row = state_db.get_build_by_queue_job_id("metroplex-ideaforge-5")
+    assert row["status"] == "failed"
+    # The fix: the Ravage rejection verdict is preserved, not lost.
+    assert row["review_status"] == "review_rejected"
+
+
+def test_poll_review_rejected_via_loop_status_escalated(
+    orchestrator, adapter, state_db, spec_file, fresh_heartbeat
+):
+    """self_healing_state in ('review_rejected','escalated') also triggers the
+    review_rejected tag, even without an explicit review_verdict on the dict."""
+    idea = _idea(idea_id=6, title="Escalated build")
+    job = orchestrator.queue_build(idea, spec_file, dry_run=False)
+    assert job is not None
+
+    target_dir = adapter.workspace_root / "metroplex-ideaforge-6"
+    _write_state(
+        target_dir,
+        {
+            "status": "review_rejected",
+            "attempt": 3,
+            "review_critical_count": 1,
+        },
+    )
+
+    poll_result = orchestrator.poll_and_sync_status()
+    assert "metroplex-ideaforge-6" in poll_result["failed"]
+
+    row = state_db.get_build_by_queue_job_id("metroplex-ideaforge-6")
+    assert row["status"] == "failed"
+    assert row["review_status"] == "review_rejected"
+
+
+def test_poll_non_self_healing_dict_does_not_crash(
+    orchestrator, adapter, state_db, spec_file, fresh_heartbeat
+):
+    """Defensive: a poll dict lacking review_verdict/self_healing_state keys
+    (non-self-healing adapter shape, e.g. OzAdapter) must not raise and must
+    NOT tag review_status. Mocks check_status directly to produce the bare
+    failed-job shape that has none of the self-healing review keys."""
+    idea = _idea(idea_id=7, title="Plain failure")
+    job = orchestrator.queue_build(idea, spec_file, dry_run=False)
+    assert job is not None
+
+    # Bare poll dict: a failed job with NO review_verdict / self_healing_state.
+    orchestrator.check_status = MagicMock(return_value={
+        "jobs": [{"id": "metroplex-ideaforge-7", "status": "failed"}]
+    })
+
+    poll_result = orchestrator.poll_and_sync_status()
+    assert "metroplex-ideaforge-7" in poll_result["failed"]
+
+    row = state_db.get_build_by_queue_job_id("metroplex-ideaforge-7")
+    assert row["status"] == "failed"
+    # No review verdict on the dict → review_status left untouched.
+    assert row["review_status"] is None
+
+
+def test_ravage_findings_reach_retry_planner_context(
+    orchestrator, adapter, state_db, spec_file, fresh_heartbeat, tmp_path
+):
+    """Part 2b: assert the Ravage review findings actually reach the retry
+    Planner. _record_build_session captures review_verdict + review-report.md +
+    structured review-findings.json into a session record; _inject_session_context
+    then appends that summary to the retry's spec file. This is the end-to-end
+    Ravage->Planner feedback channel (already wired); the test guards it.
+    """
+    idea = _idea(idea_id=8, title="Safety-class build")
+    job = orchestrator.queue_build(idea, spec_file, dry_run=False)
+    assert job is not None
+    base_job_id = "metroplex-ideaforge-8"
+
+    target_dir = adapter.workspace_root / base_job_id
+    state_dir = target_dir / ".self-healing-pipeline"
+    state_dir.mkdir(parents=True, exist_ok=True)
+
+    # Daemon artifacts: terminal state + Ravage review report + structured findings.
+    (state_dir / "state.json").write_text(json.dumps({
+        "status": "passed",
+        "attempt": 1,
+        "judge_verdict": "pass",
+        "review_verdict": "rejected",
+        "review_critical_count": 1,
+    }))
+    (state_dir / "review-report.md").write_text(
+        "# Ravage Review\nCRITICAL: unbounded medication-dose input accepted "
+        "without validation — safety hazard for elder-care dosing."
+    )
+    (state_dir / "review-findings.json").write_text(json.dumps({
+        "findings": [
+            {
+                "finding_id": "F-01",
+                "claim_class": "FAILURE",
+                "title": "Medication dose not validated",
+                "input_shape": "negative_dose",
+                "expected_behavior": "reject negative or out-of-range doses",
+                "observed_behavior": "accepts any float",
+                "severity": "critical",
+                "source": "ravage",
+                "confidence": 0.95,
+            }
+        ]
+    }))
+
+    # Poll: failed branch records the session snapshot (and tags review_rejected).
+    orchestrator.poll_and_sync_status()
+
+    # The session record must contain the Ravage findings text.
+    session = state_db.get_latest_session(base_job_id)
+    assert session is not None, "session snapshot was not recorded"
+    summary = session["session_summary"]
+    assert "verdict=rejected" in summary
+    assert "Ravage" in summary or "review" in summary.lower()
+    # Structured findings injected as the auto-extracted claims table.
+    assert "Prior-review-derived claims" in summary
+    assert "reject negative or out-of-range doses" in summary
+    assert "F-01" in summary
+
+    # Now simulate a retry dispatch: _inject_session_context must append the
+    # captured Ravage context (incl. findings) into the retry's spec file.
+    retry_spec = tmp_path / "retry_spec.md"
+    retry_spec.write_text("# Retry spec\nBuild the elder-care companion.\n")
+    orchestrator._inject_session_context(base_job_id, attempt=1, spec_path=retry_spec)
+
+    injected = retry_spec.read_text()
+    assert "Prior Build Attempts" in injected
+    assert "reject negative or out-of-range doses" in injected, (
+        "Ravage findings did not reach the retry Planner's spec input"
+    )

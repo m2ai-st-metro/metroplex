@@ -605,6 +605,30 @@ class BuildOrchestrator:
                 try:
                     if self.state_db.update_build_job_status(job_id, "failed"):
                         result["newly_synced"].append(job_id)
+                        # Preserve the self-healing daemon's adversarial (Ravage)
+                        # review verdict on failed builds. The SelfHealingAdapter
+                        # surfaces review_verdict / self_healing_state in the poll
+                        # dict when Ravage rejected the build on safety-class
+                        # findings, but the failed-branch above only records
+                        # status='failed'. Without this, the review_rejected
+                        # verdict is lost and the postmortem classifier falls
+                        # through to the spec_unclear default. Be defensive:
+                        # non-self-healing adapters won't carry these keys.
+                        try:
+                            review_verdict = job_data.get("review_verdict")
+                            self_healing_state = job_data.get("self_healing_state")
+                            if review_verdict == "rejected" or self_healing_state in (
+                                "review_rejected",
+                                "escalated",
+                            ):
+                                self.state_db.set_build_review_status(
+                                    job_id, "review_rejected"
+                                )
+                        except Exception as e:
+                            logger.warning(
+                                "Could not record review_rejected status for %s: %s",
+                                job_id, e,
+                            )
                         # Backfill project_dir even for failed/interrupted builds
                         project_dir = job_data.get("project_dir")
                         if project_dir:
