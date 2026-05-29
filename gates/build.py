@@ -1,25 +1,24 @@
 """
 Build Gate - Gate 2
 Generates specs from approved ideas via LLM, runs Tyrest pre-build
-review, then dispatches to YCE Harness for autonomous building.
+review, then dispatches to the configured BuildAdapter for autonomous building.
 """
 import json
 import logging
 import os
-import signal
 import sys
-import subprocess
 from pathlib import Path
 from typing import Optional
 from datetime import datetime
-from jinja2 import Environment, FileSystemLoader, Template, TemplateNotFound
-
 from config import Config
 from models import BuildJob, PriorityItem
 from db import StateDB
 from audit import AuditLogger
 from cost_rates import estimate_cost
-from gates.llm_expander import LLMSpecExpander, validate_spec, format_failure_feedback
+from gates.llm_expander import (
+    LLMSpecExpander,
+    validate_agent_spec,
+)
 from postmortem import capture_postmortem, get_failure_patterns
 from oz_bridge import submit_to_oz
 from readers.ideaforge_reader import IdeaForgeReader
@@ -30,7 +29,7 @@ RUNNER_PID_FILE = Path(__file__).parent.parent / "data" / "runner.pid"
 
 
 class SpecGenerator:
-    """Gate 2: Spec Generation - LLM expansion with Jinja2 fallback."""
+    """Gate 2: Spec Generation - LLM expansion (life_domain rubric only)."""
 
     def __init__(self, config: Config, template_dir: Path, state_db: Optional[StateDB] = None):
         """
@@ -51,14 +50,6 @@ class SpecGenerator:
         if not template_dir.exists():
             raise FileNotFoundError(f"Template directory not found at {template_dir}")
 
-        # Set up Jinja2 environment (fallback)
-        self.env = Environment(
-            loader=FileSystemLoader(str(template_dir)),
-            trim_blocks=True,
-            lstrip_blocks=True,
-            keep_trailing_newline=True
-        )
-
         # Initialize LLM expander if configured
         self.llm_expander: Optional[LLMSpecExpander] = None
         if config.spec_use_llm:
@@ -73,7 +64,7 @@ class SpecGenerator:
                 )
             except (ValueError, Exception) as e:
                 logger.warning(
-                    "LLM spec expansion unavailable, using Jinja2 fallback: %s", e
+                    "LLM spec expansion unavailable; builds will fail until configured: %s", e
                 )
 
     def generate_spec(
@@ -83,10 +74,7 @@ class SpecGenerator:
         queue_job_id: str | None = None,
     ) -> Path:
         """
-        Generate app spec file from idea data.
-
-        Uses LLM expansion when available for idea-specific specs.
-        Falls back to Jinja2 template rendering on LLM failure or when disabled.
+        Generate app spec file from idea data via LLM expansion.
 
         Args:
             idea: Idea dictionary with required fields:
@@ -104,8 +92,9 @@ class SpecGenerator:
             Path to generated spec file
 
         Raises:
-            FileNotFoundError: If template file not found (Jinja2 fallback only)
-            ValueError: If required fields missing from idea
+            ValueError: If required fields missing from idea, scoring_rubric
+                is not 'life_domain', or LLM output fails validation.
+            RuntimeError: If LLM expander is not configured.
         """
         # Validate required fields
         required_fields = [
@@ -115,6 +104,16 @@ class SpecGenerator:
         missing_fields = [f for f in required_fields if f not in idea or idea[f] is None]
         if missing_fields:
             raise ValueError(f"Idea missing required fields: {missing_fields}")
+
+        # R-A item 1: strict rubric dispatch. Builder is now agent-shape only.
+        # The queue-level guard (R-A item 3) rejects non-life_domain at dequeue;
+        # this is defense-in-depth for any future code path that bypasses the
+        # queue. Raise BEFORE any LLM call so cost ledger stays clean.
+        rubric = idea.get("scoring_rubric")
+        if rubric != "life_domain":
+            raise ValueError(
+                f"Builder requires scoring_rubric='life_domain'; got {rubric!r}"
+            )
 
         # Create output directory if it doesn't exist
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -136,6 +135,14 @@ class SpecGenerator:
             except Exception as e:
                 logger.warning("Failed to fetch failure patterns for spec feedback: %s", e)
 
+        # Observable signal — log which prompt path this build used.
+        # Cost ledger entries land under source='spec_expander_agent' so
+        # operator can grep agent vs tech generation without parsing logs.
+        logger.info(
+            "SpecGenerator: agent-shape dispatch for idea %s (rubric=%s)",
+            idea["id"], rubric,
+        )
+
         # Retry loop: Nemotron-3 leaks CoT ~43% of the time and occasionally
         # parrots prompt instructions. These are stochastic -- a second call
         # usually produces a clean spec. Retry here instead of burning a
@@ -144,7 +151,7 @@ class SpecGenerator:
         last_rejection = ""
         for spec_attempt in range(max_spec_attempts):
             try:
-                rendered_spec = self.llm_expander.expand(
+                rendered_spec = self.llm_expander.expand_agent(
                     idea,
                     failure_patterns=failure_patterns,
                     queue_job_id=queue_job_id,
@@ -154,12 +161,12 @@ class SpecGenerator:
                     f"LLM expansion failed for idea {idea['id']} ({idea['title']}): {e}"
                 ) from e
 
-            is_valid, rejection_reason = validate_spec(rendered_spec)
+            is_valid, rejection_reason = validate_agent_spec(rendered_spec)
             if is_valid:
                 break
             last_rejection = rejection_reason
             logger.warning(
-                "Spec validation failed for idea %s (attempt %d/%d): %s",
+                "Agent spec validation failed for idea %s (attempt %d/%d): %s",
                 idea["id"], spec_attempt + 1, max_spec_attempts, rejection_reason,
             )
         else:
@@ -175,46 +182,6 @@ class SpecGenerator:
         )
 
         return output_path
-
-    def _render_jinja2(self, idea: dict) -> str:
-        """Render spec using Jinja2 template (fallback path).
-
-        Selects template based on source:
-        - Academy promotions use tier1_agent_template.md
-        - All other sources use app_spec_template.md
-        """
-        # Select template based on source
-        is_academy = idea.get("_source") == "academy"
-        template_name = "tier1_agent_template.md" if is_academy else "app_spec_template.md"
-
-        try:
-            template = self.env.get_template(template_name)
-        except TemplateNotFound:
-            raise FileNotFoundError(
-                f"Template not found: {template_name} in {self.template_dir}"
-            )
-
-        template_vars = {
-            "title": idea["title"],
-            "description": idea["description"],
-            "problem_statement": idea["problem_statement"],
-            "target_audience": idea["target_audience"],
-            "artifact_type": idea["artifact_type"],
-            "tech_stack": idea.get("tech_stack", None),
-        }
-
-        # Add Academy-specific template variables for agent builds
-        if is_academy:
-            template_vars.update({
-                "persona_id": idea.get("_persona_id", "unknown"),
-                "model": idea.get("_model", "sonnet"),
-                "tool_groups": idea.get("_tool_groups", ["file_readonly"]),
-                "prompt_file": idea.get("_prompt_file", "agent_prompt.md"),
-                "promotion_reason": idea.get("_promotion_reason", "Graduation gates passed"),
-            })
-
-        return template.render(**template_vars)
-
 
 class BuildOrchestrator:
     """Gate 2: Build Orchestration - Queue Runner Integration.
@@ -241,14 +208,18 @@ class BuildOrchestrator:
         self.spec_generator = spec_generator
         self.audit_logger = audit_logger
         self.ideaforge_reader = ideaforge_reader
+        if adapter is None:
+            raise ValueError(
+                "BuildOrchestrator requires a BuildAdapter; the inline "
+                "yce-harness subprocess fallback was removed in CLEANUP-B "
+                "(2026-05-12). Construct with one of: SelfHealingAdapter, "
+                "OzAdapter."
+            )
         self.adapter = adapter
-        self.queue_runner_path = Path(config.yce_dir) / "queue_runner.py"
-        self.yce_python = Path(config.yce_dir) / "venv" / "bin" / "python"
 
     def queue_build(self, idea: dict, spec_path: Path, dry_run: bool = False, attempt: int = 0) -> BuildJob | None:
         """
-        Queue a build job. Delegates to adapter if available, otherwise
-        falls back to inline subprocess logic.
+        Queue a build job via the configured BuildAdapter.
 
         Args:
             idea: Idea dictionary with id and title
@@ -272,7 +243,6 @@ class BuildOrchestrator:
 
         if (
             self.config.build_target == "self_healing"
-            and self.adapter is not None
             and not self.adapter.is_active()
         ):
             logger.warning(
@@ -284,49 +254,23 @@ class BuildOrchestrator:
             )
             return None
 
-        if self.adapter is not None:
-            # Delegate to pluggable adapter
-            result = self.adapter.queue(
-                spec_path=spec_path,
-                job_id=job_id,
-                model=self.config.build_model,
-                parallel=self.config.build_parallel,
-                max_workers=self.config.build_max_workers,
-            )
-            status = result.status
-            error_msg = result.error
-        else:
-            # Inline subprocess fallback (original implementation)
-            command = [
-                str(self.yce_python),
-                str(self.queue_runner_path),
-                "add",
-                str(spec_path.resolve()),
-                "--id",
-                job_id,
-                "--model",
-                self.config.build_model,
-            ]
-            if self.config.build_parallel:
-                command.append("--parallel")
-                command.extend(["--max-workers", str(self.config.build_max_workers)])
+        # Delegate to pluggable adapter
+        result = self.adapter.queue(
+            spec_path=spec_path,
+            job_id=job_id,
+            model=self.config.build_model,
+            parallel=self.config.build_parallel,
+            max_workers=self.config.build_max_workers,
+        )
+        status = result.status
+        error_msg = result.error
 
-            try:
-                proc_result = subprocess.run(
-                    command, capture_output=True, text=True, timeout=30
-                )
-                if proc_result.returncode == 0:
-                    status = "queued"
-                else:
-                    status = "failed"
-                    error_msg = proc_result.stderr.strip() or proc_result.stdout.strip() or "Unknown error"
-            except subprocess.TimeoutExpired:
-                status = "failed"
-                error_msg = "queue_build command timed out after 30 seconds"
-            except Exception as e:
-                status = "failed"
-                error_msg = f"Unexpected error queuing build: {e}"
-
+        # R-A item 3: propagate scoring_rubric from ideas.scoring_rubric onto
+        # build_jobs so the orchestrator and CLI score callers can pass it
+        # through to score_project(scoring_rubric=...). idea.get('scoring_rubric')
+        # is populated for ideaforge sources by IdeaForgeReader; non-ideaforge
+        # sources (skylynx/linear/academy) leave it None — those streams
+        # bypass the life_domain category gate by design.
         job = BuildJob(
             idea_id=idea["id"],
             title=idea["title"],
@@ -334,6 +278,7 @@ class BuildOrchestrator:
             queue_job_id=job_id,
             status=status,
             queued_at=queued_at,
+            scoring_rubric=idea.get("scoring_rubric"),
         )
         self.state_db.record_build_job(job)
 
@@ -350,25 +295,11 @@ class BuildOrchestrator:
         return job
 
     def is_runner_active(self) -> bool:
-        """Check if a queue_runner process is still running from a previous dispatch."""
-        if self.adapter is not None:
-            return self.adapter.is_active()
-        if not RUNNER_PID_FILE.exists():
-            return False
-        try:
-            pid = int(RUNNER_PID_FILE.read_text().strip())
-            os.kill(pid, 0)  # Signal 0 = check if process exists
-            return True
-        except (ValueError, ProcessLookupError, PermissionError):
-            # Stale PID file -- clean up
-            RUNNER_PID_FILE.unlink(missing_ok=True)
-            return False
+        """Check if the build adapter's runner is alive."""
+        return self.adapter.is_active()
 
     def start_queue_background(self, dry_run: bool = False) -> bool:
-        """
-        Start queue_runner.py as a background process (non-blocking).
-        Stores PID in data/runner.pid for later monitoring.
-        Delegates to adapter if available.
+        """Start the build adapter's runner (non-blocking).
 
         Args:
             dry_run: If True, print command without executing
@@ -377,153 +308,18 @@ class BuildOrchestrator:
             True if started, False otherwise
         """
         concurrency = self.config.max_concurrent_builds
-
         if dry_run:
             print(f"[DRY RUN] Would start queue runner (concurrency={concurrency})")
             return True
-
-        if self.adapter is not None:
-            return self.adapter.start(concurrency)
-
-        command = [
-            str(self.yce_python),
-            str(self.queue_runner_path),
-            "start",
-            "--concurrency",
-            str(concurrency),
-        ]
-
-        if self.is_runner_active():
-            print("Queue runner already active, skipping start")
-            return True
-
-        try:
-            log_path = Path(__file__).parent.parent / "data" / "runner.log"
-            log_path.parent.mkdir(parents=True, exist_ok=True)
-            log_file = open(log_path, "a")
-
-            proc = subprocess.Popen(
-                command,
-                stdout=log_file,
-                stderr=subprocess.STDOUT,
-                cwd=str(Path(self.config.yce_dir)),
-                start_new_session=True,  # Detach from parent process group
-            )
-
-            # Write PID for later monitoring
-            RUNNER_PID_FILE.parent.mkdir(parents=True, exist_ok=True)
-            RUNNER_PID_FILE.write_text(str(proc.pid))
-
-            self.audit_logger.log_decision(
-                gate="build",
-                action="start_queue_background",
-                details={"pid": proc.pid, "log": str(log_path)}
-            )
-            print(f"Queue runner started (PID {proc.pid})")
-            return True
-
-        except Exception as e:
-            self.audit_logger.log_error(
-                gate="build",
-                error=f"Failed to start queue runner: {str(e)}",
-                details={}
-            )
-            return False
-
-    def start_queue(self, dry_run: bool = False) -> bool:
-        """
-        Start the queue runner (blocking, kept for backward compatibility / CLI use).
-
-        Args:
-            dry_run: If True, print command without executing
-
-        Returns:
-            True if successful, False otherwise
-        """
-        command = [
-            str(self.yce_python),
-            str(self.queue_runner_path),
-            "start"
-        ]
-
-        if dry_run:
-            print(f"[DRY RUN] Would execute: {' '.join(command)}")
-            return True
-
-        try:
-            result = subprocess.run(
-                command,
-                capture_output=True,
-                text=True,
-                timeout=None  # Long-running process
-            )
-
-            if result.returncode == 0:
-                self.audit_logger.log_decision(
-                    gate="build",
-                    action="start_queue",
-                    details={"status": "success"}
-                )
-                return True
-            else:
-                error_msg = result.stderr.strip() or result.stdout.strip() or "Unknown error"
-                self.audit_logger.log_error(
-                    gate="build",
-                    error=f"Failed to start queue: {error_msg}",
-                    details={"returncode": result.returncode}
-                )
-                return False
-
-        except Exception as e:
-            self.audit_logger.log_error(
-                gate="build",
-                error=f"Failed to start queue: {str(e)}",
-                details={}
-            )
-            return False
+        return self.adapter.start(concurrency)
 
     def check_status(self) -> dict:
-        """
-        Check queue status. Delegates to adapter if available.
+        """Check the build adapter's queue status.
 
         Returns:
             Parsed status dict, or empty dict on error
         """
-        if self.adapter is not None:
-            return self.adapter.poll()
-
-        command = [
-            str(self.yce_python),
-            str(self.queue_runner_path),
-            "status",
-            "--json"
-        ]
-
-        try:
-            result = subprocess.run(
-                command,
-                capture_output=True,
-                text=True,
-                timeout=30
-            )
-
-            if result.returncode == 0:
-                return json.loads(result.stdout)
-            else:
-                self.audit_logger.log_error(
-                    gate="build",
-                    error="Failed to check queue status",
-                    details={"returncode": result.returncode}
-                )
-                return {}
-
-        except Exception as e:
-            self.audit_logger.log_error(
-                gate="build",
-                error=f"Failed to check queue status: {str(e)}",
-                details={}
-            )
-            return {}
+        return self.adapter.poll()
 
     def _record_build_session(self, job_id: str, project_dir: str) -> None:
         """Record a session snapshot after a build reaches terminal state.
@@ -596,6 +392,67 @@ class BuildOrchestrator:
                     summary_parts.append(f"\nReview report:\n{report_text}")
                 except OSError:
                     pass
+
+            # Structured findings injection (added 2026-05-12 for
+            # Ravage->spec-claims feedback). When the daemon's Step 10.5c-bis
+            # writes review-findings.json, format the structured findings as
+            # a "Prior-review-derived claims" markdown table that the next
+            # retry's Planner copies into spec-claims.md verbatim. Closes the
+            # prose-to-table-by-hand gap that previously lived in the
+            # Planner's head.
+            findings_path = state_dir / "review-findings.json"
+            if findings_path.exists():
+                try:
+                    findings_data = json.loads(findings_path.read_text(encoding="utf-8"))
+                    findings = findings_data.get("findings", [])
+                    if findings:
+                        rows = [
+                            "| category | claim | spec source |",
+                            "|----------|-------|-------------|",
+                        ]
+                        for f in findings:
+                            claim_class = f.get("claim_class") or "FAILURE"
+                            title = (f.get("title") or "").strip()
+                            input_shape = f.get("input_shape")
+                            expected = (f.get("expected_behavior") or "").strip().rstrip(".")
+                            observed = (f.get("observed_behavior") or "").strip().rstrip(".")
+                            if input_shape and expected:
+                                claim_text = (
+                                    f'Input class "{input_shape}" must {expected};'
+                                    f" observed: {observed}"
+                                )
+                            elif expected:
+                                claim_text = f"{title}: must {expected}; observed: {observed}"
+                            else:
+                                claim_text = title or "(unspecified)"
+                            finding_id = f.get("finding_id", "F-??")
+                            source = f.get("source", "reviewer")
+                            severity = f.get("severity") or ""
+                            confidence = f.get("confidence")
+                            cite_extras = [p for p in [source, severity] if p]
+                            if confidence is not None:
+                                cite_extras.append(f"confidence {confidence}")
+                            citation = (
+                                f"derived from prior-review {finding_id}"
+                                f" ({', '.join(cite_extras)})"
+                            )
+                            claim_text = claim_text.replace("|", "\\|")
+                            citation = citation.replace("|", "\\|")
+                            rows.append(f"| {claim_class} | {claim_text} | {citation} |")
+                        table = (
+                            "\n## Prior-review-derived claims\n\n"
+                            "AUTO-EXTRACTED from the prior review's structured findings. "
+                            "When running Stage 1A of the Planner, copy each row into "
+                            "`spec-claims.md` verbatim, assigning fresh C-NN ids.\n\n"
+                            + "\n".join(rows)
+                        )
+                        summary_parts.append(table)
+                except (json.JSONDecodeError, OSError) as e:
+                    logger.warning(
+                        "Could not parse review-findings.json for %s: %s",
+                        job_id,
+                        e,
+                    )
 
         summary = "\n".join(summary_parts)
 
@@ -672,7 +529,7 @@ class BuildOrchestrator:
 
     def poll_and_sync_status(self) -> dict:
         """
-        Poll queue_runner status and sync completed/failed jobs back to metroplex DB.
+        Poll the build adapter status and sync completed/failed jobs back to metroplex DB.
 
         Writes terminal statuses (completed/failed) back to both build_jobs
         and priority_queue tables so dispatched items don't stay stuck forever.
@@ -748,6 +605,30 @@ class BuildOrchestrator:
                 try:
                     if self.state_db.update_build_job_status(job_id, "failed"):
                         result["newly_synced"].append(job_id)
+                        # Preserve the self-healing daemon's adversarial (Ravage)
+                        # review verdict on failed builds. The SelfHealingAdapter
+                        # surfaces review_verdict / self_healing_state in the poll
+                        # dict when Ravage rejected the build on safety-class
+                        # findings, but the failed-branch above only records
+                        # status='failed'. Without this, the review_rejected
+                        # verdict is lost and the postmortem classifier falls
+                        # through to the spec_unclear default. Be defensive:
+                        # non-self-healing adapters won't carry these keys.
+                        try:
+                            review_verdict = job_data.get("review_verdict")
+                            self_healing_state = job_data.get("self_healing_state")
+                            if review_verdict == "rejected" or self_healing_state in (
+                                "review_rejected",
+                                "escalated",
+                            ):
+                                self.state_db.set_build_review_status(
+                                    job_id, "review_rejected"
+                                )
+                        except Exception as e:
+                            logger.warning(
+                                "Could not record review_rejected status for %s: %s",
+                                job_id, e,
+                            )
                         # Backfill project_dir even for failed/interrupted builds
                         project_dir = job_data.get("project_dir")
                         if project_dir:
@@ -770,75 +651,20 @@ class BuildOrchestrator:
 
         result["running_count"] = len(result["running"])
 
-        # Filesystem fallback: detect orphaned builds where the queue_runner
-        # shows "pending" but a completed generation directory already exists.
-        # This covers the case where the runner process was killed before it
-        # could persist completion status back to queue.json.
-        yce_generations = Path(self.config.yce_dir) / "generations"
-        for job_data in status["jobs"]:
-            job_status = job_data.get("status", "")
-            job_id = job_data.get("id", "")
-            if job_status == "pending" and job_id and not job_data.get("project_dir"):
-                candidate_dir = yce_generations / job_id
-                if candidate_dir.is_dir() and self._has_source_code(candidate_dir):
-                    try:
-                        changed = self.state_db.update_build_job_status(job_id, "completed")
-                        if changed:
-                            logger.info(
-                                "Filesystem fallback: detected orphaned completed build for %s at %s",
-                                job_id, candidate_dir,
-                            )
-                            result["newly_synced"].append(job_id)
-                            self.state_db.update_build_job_project_dir(job_id, str(candidate_dir))
-                            result["completed"].append(job_id)
-                            self.audit_logger.log_decision(
-                                gate="build",
-                                action="filesystem_fallback_sync",
-                                details={
-                                    "job_id": job_id,
-                                    "project_dir": str(candidate_dir),
-                                },
-                            )
-                    except Exception as e:
-                        self.audit_logger.log_error(
-                            gate="build",
-                            error=f"Failed filesystem fallback sync for {job_id}: {e}",
-                            details={"job_id": job_id},
-                        )
-
-        # Fix C: Before checking for stale queued builds, read the YCE
-        # queue.json directly to find jobs the runner is ACTIVELY working on.
-        # Without this, a build that just transitioned to running in YCE but
-        # hasn't been picked up by this poll's `check_status()` snapshot could
-        # still be classified stale and marked abandoned.  Excluding these
-        # IDs from the stale check prevents that race.
+        # CLEANUP-B (2026-05-12): the yce-harness filesystem-fallback paths
+        # that previously lived here (orphan-detection by scanning
+        # yce-harness/generations/, plus stale-exclusion by reading
+        # yce-harness/data/queue.json directly) were retired with yce-harness.
+        # SelfHealingAdapter and OzAdapter both write project_dir back via
+        # their own status update paths, so the orphan recovery the
+        # filesystem fallback covered no longer happens. If a future
+        # adapter needs equivalent stale-exclusion, expose it via
+        # `adapter.poll()` rather than reaching into adapter-specific
+        # on-disk state from BuildOrchestrator.
         excluded_running_jobs: set[str] = set()
-        try:
-            yce_queue_path = Path(self.config.yce_dir) / "data" / "queue.json"
-            if yce_queue_path.exists():
-                with open(yce_queue_path, "r", encoding="utf-8") as f:
-                    yce_data = json.load(f)
-                # YCE's queue.json is {"version": N, "jobs": [...]}; older
-                # fixtures and tests used a bare list. Handle both shapes.
-                yce_jobs = (
-                    yce_data.get("jobs", [])
-                    if isinstance(yce_data, dict)
-                    else yce_data
-                )
-                for yj in yce_jobs:
-                    if yj.get("status") in ("running", "pending"):
-                        yjid = yj.get("job_id") or yj.get("id")
-                        if yjid:
-                            excluded_running_jobs.add(yjid)
-        except Exception as e:
-            self.audit_logger.log_error(
-                gate="build",
-                error=f"Failed to read YCE queue.json for stale exclusion: {e}",
-                details={},
-            )
 
         # Stale queued build recovery: detect builds stuck in 'queued' status
-        # where priority_queue says 'dispatched' but the YCE runner never picked
+        # where priority_queue says 'dispatched' but the runner never picked
         # them up.  Reset to 'pending' so the next cycle re-dispatches.
         try:
             stale_builds = self.state_db.get_stale_queued_builds(
@@ -944,7 +770,7 @@ class BuildOrchestrator:
                 })
 
             self.state_db.record_cost(
-                source="yce_build",
+                source="adapter_build",
                 model=model_used,
                 input_tokens=input_tokens,
                 output_tokens=output_tokens,
@@ -952,10 +778,22 @@ class BuildOrchestrator:
                 queue_job_id=job_id,
                 details=details,
             )
-            logger.info(
-                "Recorded build cost for %s: $%.2f (model=%s, tokens=%d/%d)",
-                job_id, cost, model_used, input_tokens, output_tokens,
-            )
+            # Branch the log message so the estimate path isn't mistaken for a tracking bug.
+            # The daemon adapter (self_healing_adapter) cannot surface token data — Agent tool
+            # calls don't expose tokens to skills — so `source_type='estimate'` is the correct
+            # path for self-healing builds, not a missing-data failure. Spec_expander still
+            # records real tokens through the separate `spec_expander` cost source.
+            if input_tokens == 0 and output_tokens == 0:
+                logger.info(
+                    "Recorded estimated build cost for %s: $%.2f (daemon build, "
+                    "no per-build token data — see spec_expander rows for LLM-stage tokens)",
+                    job_id, cost,
+                )
+            else:
+                logger.info(
+                    "Recorded build cost for %s: $%.2f (model=%s, tokens=%d/%d)",
+                    job_id, cost, model_used, input_tokens, output_tokens,
+                )
         except Exception as e:
             logger.warning("Failed to record build cost for %s: %s", job_id, e)
 
@@ -1028,7 +866,8 @@ class BuildOrchestrator:
                     spec_path="",
                     queue_job_id=f"metroplex-ideaforge-{idea.get('id', 0)}",
                     status="failed",
-                    queued_at=datetime.now()
+                    queued_at=datetime.now(),
+                    scoring_rubric=idea.get("scoring_rubric"),
                 )
                 self.state_db.record_build_job(job)
                 jobs.append(job)
@@ -1043,10 +882,10 @@ class BuildOrchestrator:
 
     def run_from_queue(self, state_db: StateDB, dry_run: bool = False) -> list[BuildJob]:
         """
-        Pull items from the priority queue, generate specs, and dispatch to YCE.
+        Pull items from the priority queue, generate specs, and dispatch via the adapter.
 
         Flow: pull pending idea → generate spec (LLMSpecExpander) → Tyrest
-        pre-build review → queue YCE build → start runner.
+        pre-build review → queue build via adapter → start adapter runner.
 
         Args:
             state_db: StateDB instance (for priority queue access)
@@ -1104,19 +943,111 @@ class BuildOrchestrator:
             # Refresh fields that may be stale in the priority queue snapshot.
             # The triage gate snapshots idea_data at enqueue time, but fields
             # like artifact_type may be populated by a later classification step.
-            if idea.get("artifact_type") is None and self.ideaforge_reader and item.source == "ideaforge":
+            #
+            # R-A item 3 (2026-05-12): we now ALSO refresh whenever the
+            # priority_queue snapshot lacks scoring_rubric, even if
+            # artifact_type is already populated. The rubric is the new
+            # gate input and must be present for life_domain enforcement.
+            needs_refresh = self.ideaforge_reader and item.source == "ideaforge" and (
+                idea.get("artifact_type") is None
+                or idea.get("scoring_rubric") is None
+            )
+            if needs_refresh:
                 try:
                     fresh = self.ideaforge_reader.get_idea_by_id(int(item.source_id))
                     if fresh:
-                        for field in ("artifact_type", "problem_statement", "target_audience"):
+                        # R-A item 3: include scoring_rubric in the refresh
+                        # field set so the rubric carried by the reader makes
+                        # it onto the BuildJob even when the priority_queue
+                        # snapshot pre-dated the rubric column.
+                        for field in (
+                            "artifact_type", "problem_statement",
+                            "target_audience", "scoring_rubric",
+                        ):
                             if fresh.get(field) and not idea.get(field):
                                 idea[field] = fresh[field]
                         logger.info(
-                            "Refreshed stale snapshot for idea %s: artifact_type=%s",
+                            "Refreshed stale snapshot for idea %s: artifact_type=%s rubric=%s",
                             item.source_id, idea.get("artifact_type"),
+                            idea.get("scoring_rubric"),
                         )
                 except Exception as e:
                     logger.warning("Failed to refresh idea %s from IdeaForge: %s", item.source_id, e)
+
+            # R-A item 3 defense-in-depth (fail-closed; Codex Round 2 Medium 3):
+            # drop ideaforge items whose rubric is anything other than the
+            # exact string 'life_domain'. The reader filter is the primary
+            # enforcement point (only life_domain rows enter the priority
+            # queue going forward), but stale tech-rubric entries that were
+            # enqueued before this code-deploy could still sit in
+            # priority_queue — AND a refresh failure (no upstream reader,
+            # DB unreachable, etc.) could leave scoring_rubric=None on a row
+            # that should have been tech. Failing closed (require explicit
+            # 'life_domain') eliminates the gap: an ideaforge row without a
+            # known-good rubric is rejected rather than silently dispatched.
+            # Sources other than ideaforge (skylynx/linear/academy) are
+            # pass-through: they bypass the rubric gate by design.
+            if item.source == "ideaforge":
+                rubric = idea.get("scoring_rubric")
+                if rubric != "life_domain":
+                    logger.info(
+                        "Build dequeue REJECT for %s: scoring_rubric=%r is not "
+                        "'life_domain' (fail-closed; tech path deprecated, "
+                        "D1 archive 2026-05-11; NULL rubric also rejected to "
+                        "close the refresh-failure gap)",
+                        idea.get("title", "?"), rubric,
+                    )
+                    self.audit_logger.log_decision(
+                        gate="build",
+                        action="rubric_rejected",
+                        details={
+                            "idea_id": idea.get("id"),
+                            "title": idea.get("title"),
+                            "scoring_rubric": rubric,
+                            "reason": (
+                                "non-life_domain rubric — pre-pivot queue "
+                                "entry or refresh failure"
+                            ),
+                        },
+                    )
+                    if not dry_run and item.id:
+                        state_db.update_item_status(item.id, "failed", "completed_at")
+                    continue
+            else:
+                # R-A item 1 (Codex Round 1 HIGH): non-ideaforge sources
+                # (skylynx, linear, academy) do not carry scoring_rubric and
+                # SpecGenerator.generate_spec now hard-fails non-life_domain.
+                # Gate these at the queue so the failure is loud, observable,
+                # and does NOT burn a build slot. The pivot doc §10 R5 (R-A
+                # plan, 2026-05-11) freezes the active pool to ideaforge
+                # life_domain; until a non-ideaforge source grows a rubric,
+                # those sources are bypassed by design.
+                #
+                # If we ever re-enable a non-ideaforge source: stamp
+                # scoring_rubric='life_domain' upstream (in the reader) and
+                # remove this branch — do NOT bypass the agent-shape gate.
+                logger.info(
+                    "Build dequeue REJECT for non-ideaforge source=%r item=%r: "
+                    "Builder now requires scoring_rubric='life_domain' which "
+                    "only ideaforge carries today (R-A item 1)",
+                    item.source, item.id,
+                )
+                self.audit_logger.log_decision(
+                    gate="build",
+                    action="source_rubric_rejected",
+                    details={
+                        "idea_id": idea.get("id"),
+                        "title": idea.get("title"),
+                        "source": item.source,
+                        "reason": (
+                            "non-ideaforge source has no scoring_rubric; "
+                            "agent-shape Builder requires life_domain"
+                        ),
+                    },
+                )
+                if not dry_run and item.id:
+                    state_db.update_item_status(item.id, "failed", "completed_at")
+                continue
 
             # Idea quality gate: reject ideas with insufficient data
             idea_description = idea.get("description") or ""
@@ -1246,10 +1177,7 @@ class BuildOrchestrator:
             build_target = self.config.build_target
             oz_run_id = None
 
-            if build_target == "cloud" or (
-                build_target == "auto" and self.config.oz_environment_id
-                and self.is_runner_active()
-            ):
+            if build_target == "cloud":
                 if self.config.oz_environment_id:
                     oz_run_id = submit_to_oz(
                         idea,
@@ -1268,12 +1196,13 @@ class BuildOrchestrator:
                     queue_job_id=job_id,
                     status="queued",
                     queued_at=queued_at,
+                    scoring_rubric=idea.get("scoring_rubric"),
                 )
                 self.state_db.record_build_job(job)
                 jobs.append(job)
                 current_job = job
             else:
-                # Local build: generate spec → queue YCE
+                # Adapter build: generate spec → queue via BuildAdapter
                 try:
                     output_dir = Path(__file__).parent.parent / "data" / "specs"
                     spec_path = self.spec_generator.generate_spec(
@@ -1284,7 +1213,7 @@ class BuildOrchestrator:
                     if attempt > 0 and not dry_run:
                         self._inject_session_context(base_job_id, attempt, spec_path)
 
-                    # Queue build via YCE queue_runner
+                    # Queue build via the configured adapter
                     job = self.queue_build(idea, spec_path, dry_run=dry_run, attempt=attempt)
                     if job is None:
                         # Skip dispatch (e.g., self-healing daemon down). Release the
@@ -1322,6 +1251,7 @@ class BuildOrchestrator:
                         queue_job_id=job_id,
                         status="failed",
                         queued_at=queued_at,
+                        scoring_rubric=idea.get("scoring_rubric"),
                     )
                     self.state_db.record_build_job(job)
                     jobs.append(job)
@@ -1346,7 +1276,7 @@ class BuildOrchestrator:
                     "job_id": job_id,
                     "title": idea["title"],
                     "status": current_job.status if current_job is not None else "unknown",
-                    "route": "oz-cloud" if oz_run_id else "yce-local",
+                    "route": "oz-cloud" if oz_run_id else "adapter",
                 },
             )
 
@@ -1360,7 +1290,7 @@ class BuildOrchestrator:
         if not jobs:
             print("No pending items in priority queue")
 
-        # Start YCE queue runner if any jobs were queued
+        # Start the adapter's runner if any jobs were queued
         if not dry_run and queued_jobs:
             self.start_queue_background(dry_run=dry_run)
 

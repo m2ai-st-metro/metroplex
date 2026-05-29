@@ -42,6 +42,31 @@ IGNORED_DIRS = {
     "target", "vendor", ".git",
 }
 
+# Directory names that indicate a runtime/persisted data store (per-user state,
+# incident logs, append-only audit trails). Presence of one of these gates the
+# safety hard-checks below — projects with no data dir are unaffected.
+DATA_DIR_NAMES = {"data", "logs", "log", "var", "store", "storage"}
+
+# Marker that lets a fixture/maintainer opt a file out of the PII/data-path
+# hard-checks (e.g. a legitimate sample log). Must appear in the file's first
+# 4KB. Kept as an explicit, greppable allowlist to avoid silent false positives.
+SAFETY_ALLOWLIST_MARKER = "metroplex:review-allow"
+
+# Static source-scan signal: a default data path that resolves to the install
+# directory. Any of these substrings in a *.py source file is a hard-fail —
+# per-user runtime data must never default into the package install dir
+# (the #436 #4 cross-user comingling failure).
+INSTALL_DIR_DATA_PATTERNS = (
+    "Path(__file__).parent / 'data'",
+    'Path(__file__).parent / "data"',
+    "Path(__file__).parent/'data'",
+    'Path(__file__).parent/"data"',
+    "Path(__file__).resolve().parent / 'data'",
+    'Path(__file__).resolve().parent / "data"',
+    "os.path.dirname(__file__), 'data'",
+    'os.path.dirname(__file__), "data"',
+)
+
 
 @dataclass
 class ReviewResult:
@@ -234,7 +259,129 @@ class ReviewGate:
                 f"tests={test_count},src={non_test_count})"
             )
 
+        # 8-10. Safety hard-checks (zero-LLM, conditional on artifact presence).
+        # These run only when the relevant artifact exists, so a minimal project
+        # with no data dir / .gitignore is unaffected.
+        self._check_safety(project_dir, files, passed, failed)
+
         return passed, failed
+
+    def _is_data_artifact(self, path: Path, project_dir: Path) -> bool:
+        """True if path lives under a runtime data dir OR is a *.jsonl log."""
+        try:
+            parts = path.relative_to(project_dir).parts
+        except ValueError:
+            return False
+        if path.suffix == ".jsonl":
+            return True
+        return any(p in DATA_DIR_NAMES for p in parts[:-1])
+
+    def _is_allowlisted(self, path: Path) -> bool:
+        """True if the file carries the explicit review-allow marker."""
+        try:
+            head = path.read_text(encoding="utf-8", errors="replace")[:4096]
+        except OSError:
+            return False
+        return SAFETY_ALLOWLIST_MARKER in head
+
+    def _check_safety(
+        self,
+        project_dir: Path,
+        files: list[Path],
+        passed: list[str],
+        failed: list[str],
+    ) -> None:
+        """Publish-time safety hard-checks (each blocking, clear message).
+
+        Conditional on artifact presence:
+          (a) runtime data dir / *.jsonl logs present  -> .gitignore must cover them
+          (b) no tracked populated *.jsonl under a data dir (PII-shaped content)
+          (c) default data path must not resolve to the install dir (static scan)
+
+        Files carrying SAFETY_ALLOWLIST_MARKER are exempt from (a)/(b).
+        """
+        data_artifacts = [
+            f for f in files
+            if self._is_data_artifact(f, project_dir) and not self._is_allowlisted(f)
+        ]
+
+        # (a) gitignore-covers-data: only when a data artifact actually exists.
+        if data_artifacts:
+            gitignore = project_dir / ".gitignore"
+            covered = False
+            if gitignore.exists():
+                try:
+                    ign = gitignore.read_text(encoding="utf-8")
+                except OSError:
+                    ign = ""
+                patterns = [
+                    ln.strip() for ln in ign.splitlines()
+                    if ln.strip() and not ln.strip().startswith("#")
+                ]
+                rels = {
+                    "/".join(f.relative_to(project_dir).parts) for f in data_artifacts
+                }
+                for pat in patterns:
+                    norm = pat.strip("/").rstrip("/")
+                    if not norm:
+                        continue
+                    if norm.endswith("*.jsonl") or norm == "*.jsonl":
+                        if any(r.endswith(".jsonl") for r in rels):
+                            covered = True
+                            break
+                    if any(norm == r.split("/")[0] or r.startswith(norm + "/") or norm in r.split("/")
+                           for r in rels):
+                        covered = True
+                        break
+            if covered:
+                passed.append("gitignore_covers_data")
+            else:
+                failed.append(
+                    "gitignore_covers_data(runtime data dir / *.jsonl present "
+                    "but not covered by .gitignore — would publish per-user data)"
+                )
+
+        # (b) no populated PII-shaped jsonl tracked at publish.
+        populated_logs = []
+        for f in data_artifacts:
+            if f.suffix != ".jsonl":
+                continue
+            try:
+                if f.stat().st_size > 0 and f.read_text(encoding="utf-8", errors="replace").strip():
+                    populated_logs.append("/".join(f.relative_to(project_dir).parts))
+            except OSError:
+                pass
+        if data_artifacts:
+            if populated_logs:
+                failed.append(
+                    f"no_pii_artifact(populated runtime log(s) tracked at publish: "
+                    f"{','.join(populated_logs)})"
+                )
+            else:
+                passed.append("no_pii_artifact")
+
+        # (c) default data path must not resolve to the install dir.
+        offenders = []
+        for f in files:
+            if f.suffix != ".py":
+                continue
+            if self._is_test_file(f, project_dir):
+                continue
+            try:
+                src = f.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            if SAFETY_ALLOWLIST_MARKER in src:
+                continue
+            if any(pat in src for pat in INSTALL_DIR_DATA_PATTERNS):
+                offenders.append("/".join(f.relative_to(project_dir).parts))
+        if offenders:
+            failed.append(
+                f"data_path_not_install_dir(default data path resolves to install "
+                f"dir in: {','.join(offenders)})"
+            )
+        else:
+            passed.append("data_path_not_install_dir")
 
     def _is_test_file(self, path: Path, project_root: Path) -> bool:
         """Check if a file is a test file based on naming patterns.

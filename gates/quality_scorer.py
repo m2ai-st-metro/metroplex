@@ -6,9 +6,21 @@ No code execution — all metrics are file-system based.
 Score components:
   Static metrics  (60 points max): file structure, tests, docs, hygiene
   Tyrest scores   (40 points max): LLM-assessed quality (if available)
+
+Category gate (added 2026-05-11 per R-A item 4 of ST_METRO_LIFE_DOMAIN_PIVOT):
+  When called with ``scoring_rubric='life_domain'``, the scorer first checks
+  that the project conforms to the CCOS agent shape:
+    - ``agent.yaml`` at project root
+    - at least one ``skills/<name>/SKILL.md``
+    - at least one detectable E2E test
+  If any check fails, the result has ``category_failed=True``,
+  ``total_score=0.0``, and a ``category_failure_reason`` string. No further
+  numeric scoring is performed. Without the rubric arg (or with
+  ``scoring_rubric='tech'``), the gate is bypassed entirely.
 """
 import logging
-from dataclasses import dataclass, field
+import re
+from dataclasses import dataclass
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -37,6 +49,37 @@ IGNORED_DIRS = {
 }
 
 
+# Category-gate constants
+VALID_RUBRICS = {"life_domain", "tech"}
+
+# E2E test file recognized by filename or by being under an e2e/ directory.
+# Python: test_e2e.py, test_e2e_anything.py, anything_e2e_test.py
+# JS/TS:  *.e2e.ts, *.e2e.spec.ts, *.e2e.test.ts (and .js/.tsx/.jsx variants)
+_E2E_FILENAME_RE = re.compile(
+    r"^("
+    r"test_e2e.*\.py"                                   # python
+    r"|.*_e2e_test\.py"                                 # python alt
+    r"|.*\.e2e(?:\.(?:spec|test))?\.(?:js|jsx|ts|tsx)"  # js/ts e2e
+    r"|e2e\.(?:spec|test)\.(?:js|jsx|ts|tsx)"           # bare e2e.spec.ts
+    r")$",
+    re.IGNORECASE,
+)
+
+# Test-shaped file (any language) when located under an e2e/ directory.
+_TEST_UNDER_E2E_DIR_RE = re.compile(
+    r"^("
+    r"test_.*\.py|.*_test\.py"                          # python
+    r"|.*\.(?:spec|test)\.(?:js|jsx|ts|tsx)"            # js/ts spec/test
+    r"|.*_test\.(?:js|jsx|ts|tsx)"                      # go-style js/ts
+    r")$",
+    re.IGNORECASE,
+)
+
+# Extensions scanned when looking for E2E tests. Mirrors CODE_EXTENSIONS for
+# test-bearing languages used in the ClaudeClaw agent ecosystem.
+_E2E_SCAN_EXTENSIONS = {".py", ".js", ".jsx", ".ts", ".tsx"}
+
+
 @dataclass
 class QualityBreakdown:
     """Breakdown of quality score components."""
@@ -59,6 +102,10 @@ class QualityBreakdown:
     total_file_count: int = 0
     tyrest_available: bool = False
 
+    # Category gate (R-A item 4)
+    category_failed: bool = False
+    category_failure_reason: str | None = None
+
     @property
     def static_score(self) -> float:
         """Sum of static metric points (0-60)."""
@@ -70,7 +117,9 @@ class QualityBreakdown:
 
     @property
     def total_score(self) -> float:
-        """Total quality score (0-100)."""
+        """Total quality score (0-100). 0.0 when category_failed."""
+        if self.category_failed:
+            return 0.0
         return round(self.static_score + self.tyrest_overall, 1)
 
 
@@ -116,9 +165,109 @@ def _is_test_file(path: Path, project_root: Path | None = None) -> bool:
     return False
 
 
+def _has_agent_yaml(project_dir: Path) -> bool:
+    """Check for agent.yaml at the project root.
+
+    Does not follow symlinks (defends against symlink-to-outside-tree
+    spoofing the gate). Empty files pass — YAML parsing is out of scope
+    for this presence-only gate.
+    """
+    candidate = project_dir / "agent.yaml"
+    try:
+        # Path.is_file() follows symlinks by default; reject symlinks
+        # explicitly so a symlink pointing outside the project tree
+        # cannot satisfy the gate.
+        if candidate.is_symlink():
+            return False
+        return candidate.is_file()
+    except OSError:
+        return False
+
+
+def _has_skill_manifest(project_dir: Path) -> bool:
+    """Check for at least one ``skills/<name>/SKILL.md`` two levels deep.
+
+    A bare ``SKILL.md`` at project root or ``skills/SKILL.md`` (one level
+    deep) does NOT qualify — the bundled-skills convention is exactly
+    ``skills/<name>/SKILL.md``.
+    """
+    skills_root = project_dir / "skills"
+    if not skills_root.is_dir() or skills_root.is_symlink():
+        return False
+    try:
+        for child in skills_root.iterdir():
+            if child.is_symlink():
+                continue  # don't follow symlinks across the gate
+            if not child.is_dir():
+                continue
+            manifest = child / "SKILL.md"
+            if manifest.is_file() and not manifest.is_symlink():
+                return True
+    except OSError:
+        return False
+    return False
+
+
+def _has_e2e_test(project_dir: Path) -> bool:
+    """Detect at least one E2E test via filesystem heuristics.
+
+    Qualifying patterns (any language in the ClaudeClaw agent ecosystem):
+      - Python filename matches ``^test_e2e.*\\.py$`` (case-insensitive)
+      - Python filename matches ``.*_e2e_test\\.py$`` (case-insensitive)
+      - JS/TS filename matches ``*.e2e[.spec|test]?.{js,jsx,ts,tsx}``
+      - JS/TS filename matches ``e2e.{spec|test}.{js,jsx,ts,tsx}``
+      - file lives under any directory segment named ``e2e`` AND has a
+        test-shaped filename for its language
+
+    Symlinks are NOT followed. Excludes IGNORED_DIRS (node_modules,
+    venv, etc.).
+    """
+    try:
+        for f in project_dir.rglob("*"):
+            if f.suffix.lower() not in _E2E_SCAN_EXTENSIONS:
+                continue
+            try:
+                rel = f.relative_to(project_dir)
+            except ValueError:
+                continue
+            if IGNORED_DIRS & set(rel.parts):
+                continue
+            if not f.is_file() or f.is_symlink():
+                continue
+            name = f.name
+            if _E2E_FILENAME_RE.match(name):
+                return True
+            # Under an e2e/ directory, treat any test-shaped file as E2E
+            if "e2e" in [p.lower() for p in rel.parts[:-1]]:
+                if _TEST_UNDER_E2E_DIR_RE.match(name):
+                    return True
+    except OSError:
+        return False
+    return False
+
+
+def _check_category_gate(project_dir: Path) -> str | None:
+    """Apply the life_domain category gate.
+
+    Returns:
+        None if all three shape checks pass; otherwise a reason string
+        identifying the first failed check. Failure precedence:
+        agent_yaml -> skill_manifest -> e2e_test.
+    """
+    if not _has_agent_yaml(project_dir):
+        return "missing_agent_yaml"
+    if not _has_skill_manifest(project_dir):
+        return "missing_skill_manifest"
+    if not _has_e2e_test(project_dir):
+        return "missing_e2e_test"
+    return None
+
+
 def score_project(
     project_dir: Path,
     tyrest_overall: float | None = None,
+    scoring_rubric: str | None = None,
+    strict_rubric: bool = False,
 ) -> QualityBreakdown:
     """
     Score a project directory for structural quality.
@@ -126,14 +275,68 @@ def score_project(
     Args:
         project_dir: Path to the project root
         tyrest_overall: Tyrest overall score (0.0-1.0) if available
+        scoring_rubric: Optional rubric selector. When ``'life_domain'``,
+            applies the category gate (agent.yaml + skills/<n>/SKILL.md
+            + E2E test); on failure returns category_failed result with
+            total_score=0.0. When ``'tech'`` or ``None`` (default), no
+            gate is applied — existing behavior is preserved exactly.
+            Unknown values fall open to default behavior (logged as a
+            WARNING so misconfigurations are visible in operator logs;
+            failing closed would unnecessarily reject good builds on the
+            publish path).
+        strict_rubric: When True, an unknown ``scoring_rubric`` value
+            raises ``ValueError`` instead of falling open. Defaults
+            False to preserve fail-open behavior on the publish path;
+            opt-in for callers in security-sensitive paths or for tests.
+
+    Caller wiring (R-A item 3, separate self-healing-claudex run):
+        This function accepts the rubric; production callers in
+        ``metroplex.py`` and ``orchestrator.py`` do NOT yet forward
+        ``ideaforge.scoring_rubric`` from the build queue. Until R-A
+        item 3 lands, the gate is callable but unused in production —
+        intentional: R-A item 4 (this run) ships the gate only.
 
     Returns:
-        QualityBreakdown with per-metric scores and total
+        QualityBreakdown with per-metric scores and total. When
+        category_failed, all numeric fields stay at defaults (0.0) and
+        category_failure_reason is populated.
+
+    Raises:
+        ValueError: only when ``strict_rubric=True`` and ``scoring_rubric``
+            is not in the set of valid rubrics.
     """
     breakdown = QualityBreakdown()
 
     if not project_dir.is_dir():
         return breakdown
+
+    # Category gate — opt-in via scoring_rubric='life_domain'.
+    # Default policy on unknown rubric: fail OPEN with WARNING (publish-path
+    # safety). Callers in security-sensitive paths can pass strict_rubric=True
+    # to convert this into a hard ValueError instead.
+    if scoring_rubric is not None and scoring_rubric not in VALID_RUBRICS:
+        if strict_rubric:
+            raise ValueError(
+                f"unknown scoring_rubric={scoring_rubric!r}; "
+                f"expected one of {sorted(VALID_RUBRICS)} or None"
+            )
+        logger.warning(
+            "score_project: unknown scoring_rubric=%r; falling open to "
+            "default behavior (no category gate)",
+            scoring_rubric,
+        )
+        scoring_rubric = None
+
+    if scoring_rubric == "life_domain":
+        reason = _check_category_gate(project_dir)
+        if reason is not None:
+            breakdown.category_failed = True
+            breakdown.category_failure_reason = reason
+            logger.info(
+                "category_failed: project=%s reason=%s",
+                project_dir, reason,
+            )
+            return breakdown
 
     files = _walk_project_files(project_dir)
     breakdown.total_file_count = len(files)

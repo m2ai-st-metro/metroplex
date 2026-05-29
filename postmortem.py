@@ -66,7 +66,8 @@ def classify_failure(log_text: str) -> tuple[str, str, str]:
         (failure_category, failure_stage, error_signature)
 
     failure_category: one of 'build_error', 'test_failure', 'timeout',
-        'dependency_error', 'environment_error', 'spec_unclear'
+        'dependency_error', 'environment_error', 'spec_unclear',
+        'review_failed', 'review_rejected', 'low_quality'
     failure_stage: rough stage where failure occurred (e.g. 'install', 'test', 'build')
     error_signature: first 500 chars of the most relevant traceback
     """
@@ -121,6 +122,12 @@ def _classify_from_gate_status(
     Returns:
         (failure_category, failure_stage, error_signature)
     """
+    if review_status == "review_rejected":
+        return (
+            "review_rejected",
+            "review",
+            "Adversarial (Ravage) review rejected the build (safety-class findings)",
+        )
     if review_status == "review_failed":
         sig = f"Automated review checks failed (quality_score={quality_score})"
         return ("review_failed", "review", sig)

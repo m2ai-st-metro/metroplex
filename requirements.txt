@@ -1,8 +1,6 @@
 pydantic>=2.0
-jinja2
 pyyaml
 pytest
-arcadepy
 anthropic>=0.40.0
 openai>=1.50.0,<2
 oz-agent-sdk>=0.6.0

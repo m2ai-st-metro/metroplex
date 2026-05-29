@@ -1,7 +1,7 @@
 """
 Oz Cloud Build Adapter — wraps oz_bridge.py for cloud-based builds.
 
-Routes builds to Oz/Warp cloud agents instead of local YCE Harness.
+Routes builds to Oz/Warp cloud agents instead of the local SelfHealing daemon.
 """
 import logging
 from pathlib import Path

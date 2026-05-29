@@ -9,7 +9,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
-from models import TriageDecision, BuildJob, PatchApplication, AgentPatchApplication, CycleResult, GateStatus, PriorityItem, PublishJob
+from models import TriageDecision, BuildJob, CycleResult, GateStatus, PriorityItem, PublishJob
 
 
 class StateDB:
@@ -221,6 +221,14 @@ class StateDB:
             # Backfill: no suffixed IDs exist yet, so base = queue_job_id
             cursor.execute("UPDATE build_jobs SET base_job_id = queue_job_id WHERE base_job_id IS NULL")
 
+        # Migrate: add scoring_rubric to build_jobs (R-A item 3, 2026-05-12).
+        # Carries ideas.scoring_rubric forward so orchestrator/CLI score callers
+        # can pass it to quality_scorer.score_project. NULL on legacy rows is
+        # backward-compat (no rubric arg -> no category gate applied).
+        # Idempotent: PRAGMA-driven, skipped if column already exists.
+        if "scoring_rubric" not in bj_columns:
+            cursor.execute("ALTER TABLE build_jobs ADD COLUMN scoring_rubric TEXT DEFAULT NULL")
+
         # Migrate: add a2a_task_id to build_jobs (Phase E A2A dispatch tracking)
         if "a2a_task_id" not in bj_columns:
             cursor.execute("ALTER TABLE build_jobs ADD COLUMN a2a_task_id TEXT DEFAULT NULL")
@@ -421,7 +429,7 @@ class StateDB:
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_build_jobs_base_job_id ON build_jobs(base_job_id)")
 
         # Initialize gate status for all gates
-        for gate in ["triage", "build", "patch", "publish"]:
+        for gate in ["triage", "build", "publish"]:
             cursor.execute("""
                 INSERT OR IGNORE INTO gate_status (gate, consecutive_failures, halted)
                 VALUES (?, 0, 0)
@@ -470,8 +478,8 @@ class StateDB:
         inherited_retry = (row[0] or 0) if row and row[0] is not None else 0
 
         cursor.execute("""
-            INSERT INTO build_jobs (idea_id, title, spec_path, queue_job_id, status, queued_at, retry_count, base_job_id)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO build_jobs (idea_id, title, spec_path, queue_job_id, status, queued_at, retry_count, base_job_id, scoring_rubric)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             job.idea_id,
             job.title,
@@ -481,6 +489,7 @@ class StateDB:
             job.queued_at.isoformat(),
             inherited_retry,
             base_job_id,
+            job.scoring_rubric,
         ))
 
         self.conn.commit()
@@ -525,48 +534,6 @@ class StateDB:
         )
         return cursor.fetchone()[0]
 
-    def record_patch_application(self, patch: PatchApplication):
-        """Record a patch application."""
-        self.connect()
-        cursor = self.conn.cursor()
-
-        cursor.execute("""
-            INSERT INTO patch_applications (patch_id, persona_id, from_version, to_version, status, reason, applied_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-        """, (
-            patch.patch_id,
-            patch.persona_id,
-            patch.from_version,
-            patch.to_version,
-            patch.status,
-            patch.reason,
-            patch.applied_at.isoformat()
-        ))
-
-        self.conn.commit()
-
-    def record_agent_patch_application(self, patch: AgentPatchApplication):
-        """Record an agent patch application."""
-        self.connect()
-        cursor = self.conn.cursor()
-
-        cursor.execute("""
-            INSERT INTO agent_patch_applications
-            (patch_id, agent_id, target, section, operation, status, reason, applied_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            patch.patch_id,
-            patch.agent_id,
-            patch.target,
-            patch.section,
-            patch.operation,
-            patch.status,
-            patch.reason,
-            patch.applied_at.isoformat()
-        ))
-
-        self.conn.commit()
-
     def start_cycle(self, cycle_id: str) -> CycleResult:
         """Start a new cycle."""
         self.connect()
@@ -587,7 +554,6 @@ class StateDB:
             completed_at=None,
             triage_count=0,
             build_count=0,
-            patch_count=0,
             errors=[]
         )
 
@@ -905,7 +871,7 @@ class StateDB:
         """Update a build job's status by its queue_job_id.
 
         Supports all queue_job_id formats:
-        - New:    'metroplex-{source}-{source_id}' (e.g. 'metroplex-linear-TOO-42')
+        - New:    'metroplex-{source}-{source_id}' (e.g. 'metroplex-skylynx-abc123')
         - Legacy: 'metroplex-{numeric_id}' (assumes ideaforge source)
 
         Also updates the corresponding priority_queue item if the status
@@ -931,10 +897,6 @@ class StateDB:
             )
         changed = cursor.rowcount > 0
 
-        # Discover and set project_dir if not already set
-        if status in ("completed", "failed"):
-            self._backfill_project_dir(cursor, queue_job_id)
-
         # Parse queue_job_id to extract source and source_id
         # Strip -rN retry suffix before parsing
         base_id = re.sub(r'-r\d+$', '', queue_job_id)
@@ -943,7 +905,7 @@ class StateDB:
 
         parts = base_id.split("-", 2)  # Split into at most 3 parts
 
-        if len(parts) >= 3 and parts[0] == "metroplex" and parts[1] in ("ideaforge", "skylynx", "linear", "academy"):
+        if len(parts) >= 3 and parts[0] == "metroplex" and parts[1] in ("ideaforge", "skylynx"):
             # New format: metroplex-source-source_id (source_id may contain hyphens)
             source = parts[1]
             source_id = parts[2]
@@ -1017,7 +979,7 @@ class StateDB:
         source = None
         source_id = None
 
-        if len(parts) >= 3 and parts[0] == "metroplex" and parts[1] in ("ideaforge", "skylynx", "linear", "academy"):
+        if len(parts) >= 3 and parts[0] == "metroplex" and parts[1] in ("ideaforge", "skylynx"):
             source = parts[1]
             source_id = parts[2]
         elif len(parts) == 2 and parts[0] == "metroplex" and parts[1].isdigit():
@@ -1034,46 +996,6 @@ class StateDB:
 
         self.conn.commit()
         return True
-
-    def _backfill_project_dir(self, cursor, queue_job_id: str) -> None:
-        """Discover and set project_dir on a build_job if not already set.
-
-        Searches YCE generations directory for both naming conventions:
-        1. Directory named after queue_job_id (e.g., metroplex-ideaforge-43/)
-        2. um-{title}-{uuid} pattern (UM bridge naming)
-        """
-        from pathlib import Path as _Path
-
-        # Check if project_dir already set
-        cursor.execute(
-            "SELECT project_dir FROM build_jobs WHERE queue_job_id = ?",
-            (queue_job_id,),
-        )
-        row = cursor.fetchone()
-        if not row or (row["project_dir"] and row["project_dir"].strip()):
-            return
-
-        yce_generations = _Path(__file__).parent.parent / "yce-harness" / "generations"
-        if not yce_generations.is_dir():
-            return
-
-        # Convention 1: directory named after queue_job_id
-        candidate = yce_generations / queue_job_id
-        if candidate.is_dir():
-            cursor.execute(
-                "UPDATE build_jobs SET project_dir = ? WHERE queue_job_id = ?",
-                (str(candidate), queue_job_id),
-            )
-            return
-
-        # Convention 2: scan for any directory containing the queue_job_id as substring
-        for entry in yce_generations.iterdir():
-            if entry.is_dir() and queue_job_id in entry.name:
-                cursor.execute(
-                    "UPDATE build_jobs SET project_dir = ? WHERE queue_job_id = ?",
-                    (str(entry), queue_job_id),
-                )
-                return
 
     # --- Review Gate (Phase 13c) ---
 
@@ -1155,6 +1077,34 @@ class StateDB:
         self.conn.commit()
         return cursor.rowcount > 0
 
+    def set_build_review_status(self, queue_job_id: str, review_status: str) -> bool:
+        """Set review_status on a build regardless of its status.
+
+        Sibling to update_build_review_status() (which guards WHERE status='completed').
+        This setter has NO status guard, so it can tag a build whose status is
+        already 'failed' — e.g. when the self-healing daemon's adversarial
+        (Ravage) review rejected the build (review_rejected) but the poll loop
+        mapped the job to metroplex status 'failed'. Recording the review_status
+        here keeps the daemon's review verdict from being lost so the postmortem
+        classifier can label it 'review_rejected' instead of falling through to
+        the spec_unclear default.
+
+        Args:
+            queue_job_id: Build job queue ID
+            review_status: e.g. 'review_rejected'
+
+        Returns:
+            True if a row was updated.
+        """
+        self.connect()
+        cursor = self.conn.cursor()
+        cursor.execute(
+            "UPDATE build_jobs SET review_status = ? WHERE queue_job_id = ?",
+            (review_status, queue_job_id),
+        )
+        self.conn.commit()
+        return cursor.rowcount > 0
+
     # --- Stale Queued Build Detection ---
 
     STALE_QUEUED_THRESHOLD_MINUTES = 30
@@ -1171,7 +1121,7 @@ class StateDB:
         Args:
             exclude_job_ids: Optional set of queue_job_ids to exclude from the
                 result. Used by the poller to skip builds that are actively
-                running in the YCE queue.json, so a race between DB snapshot
+                running in the self-healing queue, so a race between DB snapshot
                 and runner status doesn't kill a live build.
 
         Returns:
@@ -1215,7 +1165,7 @@ class StateDB:
         """Mark a stale queued build as abandoned, preserving lineage.
 
         Fix B: previously DELETED the row, which destroyed feasibility
-        linkage and any late writeback from YCE. Now we UPDATE in place,
+        linkage and any late writeback from the self-healing queue. Now we UPDATE in place,
         setting status='failed' and next_retry_at='abandoned' (same sentinel
         used elsewhere to block retries). The priority_queue item resets
         to 'pending' so other ideas can advance.
@@ -1233,10 +1183,49 @@ class StateDB:
         )
         self.conn.commit()
 
+    # --- Stuck Started Build Reaper (S5) ---
+
+    def get_stuck_started_builds(self, timeout_seconds: int) -> list[dict]:
+        """Get builds wedged in 'started' status past the build timeout.
+
+        Once a build's runner reports 'running', gates/build.py transitions the
+        row 'queued' -> 'started' so the 30-min stale-queued recovery won't kill
+        a legitimately long Opus build. But nothing bounded the 'started' state:
+        if the runner/daemon dies mid-build, the row rots indefinitely (idea-441
+        sat 'started' for 333h). health._check_stuck_builds only ALERTS on this;
+        this query feeds the reaper that actually transitions such rows.
+
+        A build is stuck-started when:
+        - build_jobs.status = 'started'
+        - queued_at is older than ``timeout_seconds`` ago
+
+        build_jobs carries no started_at column; queued_at is the only timestamp
+        and is stamped immediately before dispatch, so it is a safe lower bound
+        on elapsed runtime (mirrors get_stale_queued_builds' use of queued_at).
+
+        Returns:
+            List of dicts with queue_job_id, base_job_id, idea_id, title,
+            queued_at, retry_count — oldest first.
+        """
+        self.connect()
+        cursor = self.conn.cursor()
+        cutoff = (datetime.now() - timedelta(seconds=timeout_seconds)).isoformat()
+        cursor.execute(
+            """
+            SELECT queue_job_id, base_job_id, idea_id, title, queued_at, retry_count
+            FROM build_jobs
+            WHERE status = 'started'
+              AND queued_at < ?
+            ORDER BY queued_at ASC
+            """,
+            (cutoff,),
+        )
+        return [dict(row) for row in cursor.fetchall()]
+
     # --- Build Retry (Phase 13f) ---
 
-    MAX_RETRIES = 3
-    RETRY_BACKOFF_MINUTES = [5, 20, 60]  # Exponential-ish backoff
+    MAX_RETRIES = 5
+    RETRY_BACKOFF_MINUTES = [5, 20, 60, 120, 240]  # Exponential-ish backoff
 
     def count_failed_builds(self, base_job_id: str) -> int:
         """Count failed build attempts for a base job ID (any suffix)."""
@@ -1437,7 +1426,7 @@ class StateDB:
         parts = base_job_id.split("-", 2)
         source = None
         source_id = None
-        if len(parts) >= 3 and parts[0] == "metroplex" and parts[1] in ("ideaforge", "skylynx", "linear", "academy"):
+        if len(parts) >= 3 and parts[0] == "metroplex" and parts[1] in ("ideaforge", "skylynx"):
             source = parts[1]
             source_id = parts[2]
         elif len(parts) == 2 and parts[0] == "metroplex" and parts[1].isdigit():
@@ -1455,6 +1444,97 @@ class StateDB:
 
         self.conn.commit()
         return build_updated or pq_updated
+
+    def soft_reset_attempts(self, base_job_id: str, keep_max_failed: int = 2) -> dict:
+        """Re-enable a fully-retry-exhausted build by trimming the failed-row count
+        below MAX_RETRIES and re-pending the matching priority_queue row.
+
+        The published `UPDATE build_jobs SET next_retry_at = NULL, retry_count = 0,
+        status = 'failed'` recipe in CLAUDE.md is insufficient at the exhaustion
+        ceiling: get_retryable_builds() counts failed rows directly, so leaving
+        all MAX_RETRIES failed rows in place keeps the build excluded.
+        This helper closes that gap by DELETING the most-recent failed rows
+        until the count drops to keep_max_failed (one retry slot opens).
+
+        Earlier failed rows are preserved as historical record. Decision logs,
+        feasibility predictions, cost ledger entries all key off base_job_id
+        and survive deletion of individual build_jobs rows.
+
+        Args:
+            base_job_id: e.g. "metroplex-ideaforge-427" (no -rN suffix)
+            keep_max_failed: how many failed rows to retain (default 2 — leaves
+                3 retry slots open against MAX_RETRIES=5). Note: retained rows
+                keep any 'abandoned' next_retry_at sentinel; pass 0 to clear it.
+
+        Returns:
+            dict with deleted_count, retained_failed_count, priority_queue_id,
+            source, source_id, deleted_queue_job_ids.
+
+        Raises ValueError if base_job_id has a -rN suffix (caller should strip it).
+        """
+        if re.search(r'-r\d+$', base_job_id):
+            raise ValueError(
+                f"base_job_id must not have a -rN suffix; got {base_job_id!r}"
+            )
+
+        self.connect()
+        cursor = self.conn.cursor()
+
+        cursor.execute(
+            "SELECT id, queue_job_id FROM build_jobs "
+            "WHERE base_job_id = ? AND status = 'failed' "
+            "ORDER BY id DESC",
+            (base_job_id,),
+        )
+        failed_rows = cursor.fetchall()
+        deleted_ids = []
+        deleted_queue_job_ids = []
+        excess = max(0, len(failed_rows) - keep_max_failed)
+        for row in failed_rows[:excess]:
+            deleted_ids.append(row["id"])
+            deleted_queue_job_ids.append(row["queue_job_id"])
+        if deleted_ids:
+            placeholders = ",".join("?" for _ in deleted_ids)
+            cursor.execute(
+                f"DELETE FROM build_jobs WHERE id IN ({placeholders})",
+                deleted_ids,
+            )
+
+        parts = base_job_id.split("-", 2)
+        source = None
+        source_id = None
+        if len(parts) >= 3 and parts[0] == "metroplex" and parts[1] in ("ideaforge", "skylynx"):
+            source = parts[1]
+            source_id = parts[2]
+        elif len(parts) == 2 and parts[0] == "metroplex" and parts[1].isdigit():
+            source = "ideaforge"
+            source_id = parts[1]
+
+        priority_queue_id = None
+        if source and source_id:
+            cursor.execute(
+                "SELECT id FROM priority_queue WHERE source = ? AND source_id = ?",
+                (source, source_id),
+            )
+            row = cursor.fetchone()
+            if row:
+                priority_queue_id = row["id"]
+                cursor.execute(
+                    "UPDATE priority_queue SET status = 'pending', dispatched_at = NULL, "
+                    "completed_at = NULL, claimed_by = NULL, claimed_at = NULL "
+                    "WHERE id = ?",
+                    (priority_queue_id,),
+                )
+
+        self.conn.commit()
+        return {
+            "deleted_count": len(deleted_ids),
+            "retained_failed_count": len(failed_rows) - len(deleted_ids),
+            "priority_queue_id": priority_queue_id,
+            "source": source,
+            "source_id": source_id,
+            "deleted_queue_job_ids": deleted_queue_job_ids,
+        }
 
     # Failure categories that are deterministic — retrying won't help
     NON_RETRYABLE_CATEGORIES = frozenset({

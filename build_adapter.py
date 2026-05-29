@@ -2,7 +2,7 @@
 Build Adapter Protocol — runtime-agnostic interface for build dispatch.
 
 Inspired by Paperclip's AdapterExecutionContext/AdapterExecutionResult pattern.
-Each adapter wraps a specific agent runtime (local YCE, Oz cloud, etc.) behind
+Each adapter wraps a specific agent runtime (SelfHealing daemon, Oz cloud) behind
 a common interface so the build gate doesn't need runtime-specific logic.
 """
 from __future__ import annotations

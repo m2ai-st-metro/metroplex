@@ -79,9 +79,12 @@ One row per build job queued by Gate 2.
 - `next_retry_at` is a TEXT column that normally holds an ISO 8601 datetime. The sentinel value `'abandoned'` is stored here to mark builds that have exhausted all retries — this is **not** a `status` enum value.
 - `queue_job_id` format: `metroplex-{source}-{id}` for first attempts, `metroplex-{source}-{id}-r{N}` for retry N. Use `base_job_id` to group all attempts for the same idea.
 
-#### `patch_applications`
+#### `patch_applications` *(deprecated 2026-05-12 — orphan)*
 
-One row per persona patch processed by Gate 3.
+Historically: one row per persona patch processed by Gate 3. Gate 3 was
+removed in CLEANUP-A Scope 2 (2026-05-12). The DDL still creates the
+table for backward compatibility with existing `metroplex.db` files, but
+no code path writes to it anymore.
 
 | Column | Type | Constraints | Description |
 |--------|------|-------------|-------------|
@@ -155,7 +158,7 @@ The `cost_ledger.source` column identifies which gate or component incurred the 
 | `readiness_description` | `gates/readiness.py:_fix_generate_description` — Gate 4.9 (3-attempt retry loop, recorded as totals) | YES |
 | `ego_mutator` | `learning/mutator.py` — EGO constraint variant generation | NO (pre-build experimentation) |
 | `ego_evaluator` | `learning/evaluator.py` — EGO judge | NO (pre-build experimentation) |
-| `yce_build` | Post-completion estimate from build subprocess (legacy) | YES |
+| `adapter_build` | Post-completion estimate from build subprocess (renamed from `yce_build` in CLEANUP-B 2026-05-12; historical rows under `yce_build` remain unchanged) | YES |
 
 **Per-build attribution rule**: Any `record_cost(...)` call inside a per-build code path (a path that has a `queue_job_id` in scope) MUST pass `queue_job_id=...` so `update_build_actual_cost(queue_job_id)` can roll the totals onto `build_jobs.actual_cost_usd`. Pre-build code (EGO learning, scheduled jobs, etc.) leaves `queue_job_id=None` — those costs still appear in daily totals but are not attributed to any specific build.
 

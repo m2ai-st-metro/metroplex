@@ -1,9 +1,16 @@
 """
-Pipeline Watchdog — Phase D + Phase I (Galvatron Integration)
-External stall detector, runs via systemd timer every 15 minutes.
+Pipeline Watchdog — Phase D + Phase I
+
+External stall detector, runs via systemd timer every 5 minutes.
 Alerts via Telegram when the pipeline is stuck or unhealthy.
-On WARN/CRIT: sends alert to Galvatron's Telegram chat and dispatches
-a diagnostic mission via ClaudeClaw Mission Control.
+
+On WARN/CRIT:
+  - Sends alert to Metroplex Telegram and (if configured) Kup Telegram.
+  - Dispatches a diagnostic mission via ccos Mission Control IFF
+    WATCHDOG_MISSION_AGENT is set to a real ccos agent id. Default off:
+    skip dispatch and rely on Telegram. Introduced 2026-05-07 after the
+    prior hard-coded "galvatron" target — a retired bot — silently
+    accumulated 968 zombie tasks in the ccos queue.
 """
 import argparse
 import logging
@@ -58,8 +65,8 @@ def _build_alert_message(report) -> str:
     return "\n".join(lines)
 
 
-def _build_galvatron_prompt(report) -> str:
-    """Build a diagnostic prompt for Galvatron based on failing health checks."""
+def _build_diagnostic_prompt(report) -> str:
+    """Build a diagnostic prompt for the auto-dispatch agent based on failing health checks."""
     failing = [c for c in report.checks if c.status != HealthStatus.OK]
     status_label = "CRITICAL" if report.overall_status == HealthStatus.CRIT else "WARNING"
 
@@ -87,16 +94,27 @@ def _build_galvatron_prompt(report) -> str:
     return "\n".join(lines)
 
 
-def _dispatch_to_galvatron(report) -> bool:
-    """Dispatch a diagnostic mission to Galvatron via ClaudeClaw Mission Control.
+def _dispatch_diagnostic_mission(report) -> bool:
+    """Dispatch a diagnostic mission to a configured ccos agent via Mission Control.
+
+    Gated on `WATCHDOG_MISSION_AGENT`. Default OFF: when the env var is unset
+    or empty, no mission is dispatched (Telegram alerts still fire). Set to a
+    real ccos agent id (e.g. "ops") to opt in. This default-off behaviour was
+    introduced 2026-05-07 after the prior hard-coded "galvatron" target —
+    a retired bot — quietly accumulated 968 zombie tasks in ccos.
 
     Returns True if the mission was dispatched successfully.
     """
-    if not MISSION_CLI.exists():
-        logger.warning("Mission CLI not found at %s -- skipping Galvatron dispatch", MISSION_CLI)
+    agent = os.environ.get("WATCHDOG_MISSION_AGENT", "").strip()
+    if not agent:
+        logger.info("WATCHDOG_MISSION_AGENT unset -- skipping mission dispatch (Telegram only)")
         return False
 
-    prompt = _build_galvatron_prompt(report)
+    if not MISSION_CLI.exists():
+        logger.warning("Mission CLI not found at %s -- skipping mission dispatch", MISSION_CLI)
+        return False
+
+    prompt = _build_diagnostic_prompt(report)
     status_label = "CRITICAL" if report.overall_status == HealthStatus.CRIT else "WARNING"
     priority = "10" if report.overall_status == HealthStatus.CRIT else "7"
 
@@ -115,7 +133,7 @@ def _dispatch_to_galvatron(report) -> bool:
             [
                 "node", str(MISSION_CLI),
                 "create",
-                "--agent", "galvatron",
+                "--agent", agent,
                 "--title", f"Watchdog {status_label}: auto-diagnostic",
                 "--priority", priority,
                 prompt,
@@ -128,28 +146,31 @@ def _dispatch_to_galvatron(report) -> bool:
         )
 
         if result.returncode == 0:
-            logger.info("Galvatron mission dispatched: %s", result.stdout.strip())
+            logger.info("Diagnostic mission dispatched to %s: %s", agent, result.stdout.strip())
             return True
         else:
-            logger.warning("Mission dispatch failed (rc=%d): %s", result.returncode, result.stderr.strip())
+            logger.warning(
+                "Mission dispatch to %s failed (rc=%d): %s",
+                agent, result.returncode, result.stderr.strip(),
+            )
             return False
 
     except (subprocess.TimeoutExpired, OSError) as e:
-        logger.warning("Failed to dispatch Galvatron mission: %s", e)
+        logger.warning("Failed to dispatch diagnostic mission to %s: %s", agent, e)
         return False
 
 
-def _notify_galvatron(alert_message: str, level: str) -> bool:
-    """Send alert to Galvatron's Telegram chat in addition to Metroplex's."""
-    bot_token = os.environ.get("GALVATRON_BOT_TOKEN", "")
-    chat_id = os.environ.get("GALVATRON_CHAT_ID", "")
+def _notify_kup(alert_message: str, level: str) -> bool:
+    """Send alert to Kup's Telegram chat in addition to Metroplex's."""
+    bot_token = os.environ.get("KUP_BOT_TOKEN", "")
+    chat_id = os.environ.get("KUP_CHAT_ID", "")
 
     if not bot_token or not chat_id:
-        logger.info("Galvatron Telegram not configured -- skipping Galvatron alert")
+        logger.info("Kup Telegram not configured -- skipping Kup alert")
         return False
 
-    galvatron_notifier = create_notifier(bot_token, chat_id)
-    return galvatron_notifier.notify(alert_message, level=level)
+    kup_notifier = create_notifier(bot_token, chat_id)
+    return kup_notifier.notify(alert_message, level=level)
 
 
 def _restart_self_healing_daemon() -> bool:
@@ -185,8 +206,9 @@ def run_watchdog(dry_run: bool = False) -> int:
     2. If orphan processes at CRIT level, kill them (self-healing).
     3. If self_healing_daemon CRIT and METROPLEX_AUTO_RESTART_SELF_HEALING=true,
        run the restart script before alerting.
-    4. If CRIT or WARN, send Telegram alert to both Metroplex and Galvatron.
-    5. If CRIT or WARN, dispatch a diagnostic mission to Galvatron via Mission Control.
+    4. If CRIT or WARN, send Telegram alert to both Metroplex and Kup.
+    5. If CRIT or WARN AND WATCHDOG_MISSION_AGENT is set, dispatch a
+       diagnostic mission to that agent via ccos Mission Control.
     6. If OK, stay silent (no notification).
 
     Args:
@@ -242,15 +264,15 @@ def run_watchdog(dry_run: bool = False) -> int:
     if delivered:
         logger.info("Alert sent via Metroplex Telegram (level=%s)", level)
 
-    # Alert 2: Galvatron Telegram
-    galvatron_delivered = _notify_galvatron(alert_message, level)
-    if galvatron_delivered:
-        logger.info("Alert sent via Galvatron Telegram (level=%s)", level)
+    # Alert 2: Kup Telegram
+    kup_delivered = _notify_kup(alert_message, level)
+    if kup_delivered:
+        logger.info("Alert sent via Kup Telegram (level=%s)", level)
 
-    # Alert 3: Dispatch diagnostic mission to Galvatron via Mission Control
-    mission_dispatched = _dispatch_to_galvatron(report)
+    # Alert 3: Dispatch diagnostic mission via ccos Mission Control (gated on WATCHDOG_MISSION_AGENT)
+    mission_dispatched = _dispatch_diagnostic_mission(report)
     if mission_dispatched:
-        logger.info("Galvatron diagnostic mission dispatched via Mission Control")
+        logger.info("Diagnostic mission dispatched via ccos Mission Control")
 
     return int(report.overall_status)
 

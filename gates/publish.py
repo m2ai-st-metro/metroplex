@@ -1,6 +1,6 @@
 """
 Publish Gate - Gate 4
-Creates repos for completed YCE builds and pushes code to one or more git hosts
+Creates repos for completed builds and pushes code to one or more git hosts
 (GitHub m2ai-portfolio org and/or GitLab m2ai-portfolio group). Configurable via
 config.publish_targets — first entry is primary (its URL becomes repo_url and
 its failure fails the job); subsequent entries are mirrors (failures recorded
@@ -535,15 +535,15 @@ class PublishGate:
     def _resolve_project_dir(
         self, queue_job_id: str, title: str = "", stored_dir: str | None = None
     ) -> Path | None:
+        # CLEANUP-B (2026-05-12): the legacy yce-harness/generations fallback
+        # path was removed. SelfHealingAdapter and OzAdapter both persist
+        # project_dir via build_jobs.project_dir, which the caller passes
+        # in as stored_dir. If stored_dir is missing or not a git repo,
+        # there's nothing to fall back to anymore.
         if stored_dir:
             stored = Path(stored_dir)
             if stored.is_dir() and (stored / ".git").is_dir():
                 return stored
-
-        generations_dir = Path(self.config.yce_dir) / "generations"
-        project_dir = generations_dir / queue_job_id
-        if project_dir.is_dir() and (project_dir / ".git").is_dir():
-            return project_dir
 
         return None
 

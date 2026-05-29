@@ -27,29 +27,11 @@ class BuildJob(BaseModel):
     status: Literal["queued", "started", "completed", "failed"]
     queued_at: datetime
     strategic_theme: str | None = None
-
-
-class PatchApplication(BaseModel):
-    """Persona patch application record."""
-    patch_id: str
-    persona_id: str
-    from_version: str | None = None
-    to_version: str | None = None
-    status: Literal["applied", "failed", "skipped"]
-    reason: str
-    applied_at: datetime
-
-
-class AgentPatchApplication(BaseModel):
-    """Agent patch application record (CLAUDE.md / agent.yaml section patches)."""
-    patch_id: str
-    agent_id: str
-    target: str  # "claude_md" | "agent_yaml"
-    section: str
-    operation: str  # "add" | "replace" | "remove"
-    status: Literal["applied", "failed", "skipped"]
-    reason: str
-    applied_at: datetime
+    # R-A item 3: rubric carried from ideas.scoring_rubric -> build_jobs.scoring_rubric
+    # so the quality scorer (R-A item 4) can apply the life_domain category gate.
+    # None on non-ideaforge sources (skylynx/linear/academy) — those streams bypass
+    # the gate by design.
+    scoring_rubric: str | None = None
 
 
 class CycleResult(BaseModel):
@@ -60,13 +42,12 @@ class CycleResult(BaseModel):
     triage_count: int = 0
     build_count: int = 0
     publish_count: int = 0
-    patch_count: int = 0
     errors: list[str] = Field(default_factory=list)
 
 
 class GateStatus(BaseModel):
-    """Status of a gate (triage, build, publish, patch) for circuit breaker."""
-    gate: Literal["triage", "build", "publish", "patch"]
+    """Status of a gate (triage, build, publish) for circuit breaker."""
+    gate: Literal["triage", "build", "publish"]
     consecutive_failures: int = 0
     halted: bool = False
     last_error: str | None = None

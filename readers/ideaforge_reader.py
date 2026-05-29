@@ -2,9 +2,12 @@
 IdeaForge Database Reader
 Read-only SQLite interface for IdeaForge ideas database.
 """
+import logging
 import sqlite3
 from pathlib import Path
 from typing import Optional
+
+logger = logging.getLogger(__name__)
 
 
 class IdeaForgeReader:
@@ -22,6 +25,12 @@ class IdeaForgeReader:
         """
         self.db_path = db_path
         self.conn: Optional[sqlite3.Connection] = None
+        # Cached PRAGMA-detected column presence (populated lazily).
+        # R-A item 3 (2026-05-12) introduced scoring_rubric on the IdeaForge
+        # ideas table; older snapshots (or out-of-band test fixtures) may
+        # lack the column. Falling back gracefully prevents an
+        # OperationalError from halting the triage/build refresh path.
+        self._has_scoring_rubric: Optional[bool] = None
 
         if not Path(db_path).exists():
             raise FileNotFoundError(f"IdeaForge database not found at {db_path}")
@@ -34,6 +43,37 @@ class IdeaForgeReader:
             # Open in read-only mode using URI
             self.conn = sqlite3.connect(f"file:{self.db_path}?mode=ro", uri=True)
             self.conn.row_factory = sqlite3.Row
+
+    def _detect_scoring_rubric_column(self) -> bool:
+        """Cache and return whether the ideas table has a scoring_rubric column.
+
+        Used to make get_unprocessed_ideas / get_idea_by_id resilient against
+        older IdeaForge snapshots that pre-date the rubric column. Caching
+        avoids a PRAGMA round-trip per call.
+        """
+        if self._has_scoring_rubric is not None:
+            return self._has_scoring_rubric
+        self._connect()
+        cursor = self.conn.cursor()
+        try:
+            cursor.execute("PRAGMA table_info(ideas)")
+            cols = {row["name"] for row in cursor.fetchall()}
+        except sqlite3.Error as exc:
+            logger.warning(
+                "PRAGMA table_info(ideas) failed; assuming no scoring_rubric: %s",
+                exc,
+            )
+            cols = set()
+        self._has_scoring_rubric = "scoring_rubric" in cols
+        if not self._has_scoring_rubric:
+            logger.warning(
+                "IdeaForge schema at %s lacks 'scoring_rubric' column; "
+                "falling back to legacy query (no rubric filter, no rubric "
+                "field in returned dicts). Upgrade IdeaForge or skip the "
+                "rubric path until the column is added.",
+                self.db_path,
+            )
+        return self._has_scoring_rubric
 
     def close(self):
         """Close database connection."""
@@ -54,43 +94,131 @@ class IdeaForgeReader:
         Classification is no longer required — score threshold handles
         dismissal directly. Results sorted by weighted_score DESC.
 
+        Rubric filter (R-A item 3, 2026-05-12): admits only rows with
+        ``scoring_rubric = 'life_domain'``. The 'tech' rubric is the legacy
+        dead path (11 tech rows moved to status='archived' on 2026-05-11
+        per pivot decision D1); NULL-rubric rows are pre-rubric legacy
+        and intentionally excluded for the same reason. New rubrics
+        require an explicit code change here — allow-list, not
+        exclude-list, is the correct safety posture for "what enters the
+        build queue".
+
         Returns:
             List of idea dictionaries with fields:
             - id, title, description, problem_statement, target_audience
             - weighted_score, opportunity_score, problem_score, feasibility_score,
               why_now_score, competition_score
-            - artifact_type, signal_count, status
+            - artifact_type, signal_count, status, strategic_theme,
+              scoring_rubric
         """
         self._connect()
         cursor = self.conn.cursor()
 
-        cursor.execute("""
-            SELECT
-                id,
-                title,
-                description,
-                problem_statement,
-                target_audience,
-                weighted_score,
-                opportunity_score,
-                problem_score,
-                feasibility_score,
-                why_now_score,
-                competition_score,
-                artifact_type,
-                signal_count,
-                status,
-                strategic_theme
-            FROM ideas
-            WHERE status = 'classified'
-                AND weighted_score IS NOT NULL
-                AND artifact_type IS NOT NULL
-                AND (claimed_by IS NULL OR claimed_by = '' OR claimed_by = 'metroplex')
-            ORDER BY weighted_score DESC
-        """)
+        # Resilient query construction: when the upstream DB lacks the
+        # scoring_rubric column (older IdeaForge snapshots), fall back to
+        # the legacy query shape rather than raising OperationalError.
+        # NOTE: scoring_rubric is bound as a parameter (not a literal) so that
+        # any future "switch on env var / config" change inherits the
+        # parameterized call shape. Today the value is a hard-coded constant.
+        has_rubric = self._detect_scoring_rubric_column()
+        # R-A 1.6 (2026-05-12): probe for agentic_relief + weight_hint and
+        # struggling_user columns. Fall back to NULL-selects when missing
+        # so older ideaforge.db snapshots survive without OperationalError.
+        cols = {row[1] for row in cursor.execute("PRAGMA table_info(ideas)")}
+        has_relief = "agentic_relief" in cols and "weight_hint" in cols
+        has_struggling_user = "struggling_user" in cols
+        relief_select = (
+            "agentic_relief,\n                    weight_hint"
+            if has_relief
+            else "NULL AS agentic_relief,\n                    NULL AS weight_hint"
+        )
+        struggling_user_select = (
+            "struggling_user"
+            if has_struggling_user
+            else "NULL AS struggling_user"
+        )
+        if has_rubric:
+            cursor.execute(f"""
+                SELECT
+                    id,
+                    title,
+                    description,
+                    problem_statement,
+                    target_audience,
+                    {struggling_user_select},
+                    weighted_score,
+                    opportunity_score,
+                    problem_score,
+                    feasibility_score,
+                    why_now_score,
+                    competition_score,
+                    artifact_type,
+                    signal_count,
+                    status,
+                    strategic_theme,
+                    scoring_rubric,
+                    {relief_select}
+                FROM ideas
+                WHERE status = 'classified'
+                    AND weighted_score IS NOT NULL
+                    AND artifact_type IS NOT NULL
+                    AND scoring_rubric = ?
+                    AND (claimed_by IS NULL OR claimed_by = '' OR claimed_by = 'metroplex')
+                ORDER BY weighted_score DESC
+            """, ('life_domain',))
+        else:
+            # Legacy fallback: pre-rubric schemas. No rubric filter, no
+            # rubric field in returned dicts. Triage/build paths that
+            # depend on the rubric will treat the result as 'tech'-style
+            # work (which they already handle).
+            cursor.execute(f"""
+                SELECT
+                    id,
+                    title,
+                    description,
+                    problem_statement,
+                    target_audience,
+                    {struggling_user_select},
+                    weighted_score,
+                    opportunity_score,
+                    problem_score,
+                    feasibility_score,
+                    why_now_score,
+                    competition_score,
+                    artifact_type,
+                    signal_count,
+                    status,
+                    strategic_theme,
+                    {relief_select}
+                FROM ideas
+                WHERE status = 'classified'
+                    AND weighted_score IS NOT NULL
+                    AND artifact_type IS NOT NULL
+                    AND (claimed_by IS NULL OR claimed_by = '' OR claimed_by = 'metroplex')
+                ORDER BY weighted_score DESC
+            """)
 
         rows = cursor.fetchall()
-        return [dict(row) for row in rows]
+        results = [dict(row) for row in rows]
+
+        # R-A item 3 / Codex Round 3 ops finding: when the upstream IdeaForge
+        # schema is legacy (pre-rubric), every returned dict is missing the
+        # 'scoring_rubric' field. Combined with the fail-closed dequeue guard
+        # in gates/build.py, this means ALL ideaforge items will be rejected
+        # at dequeue. That is the correct safety posture (don't dispatch
+        # unknown-rubric ideas), but it is operationally surprising. Log a
+        # loud WARNING on every non-empty return so operators see why no
+        # builds are progressing.
+        if results and not has_rubric:
+            logger.warning(
+                "IdeaForge legacy-schema fallback active: returning %d "
+                "rows without scoring_rubric. The build gate's fail-closed "
+                "dequeue guard will reject every one. Upgrade the upstream "
+                "IdeaForge schema (add 'scoring_rubric' column) to restore "
+                "normal flow.",
+                len(results),
+            )
+        return results
 
     def claim_idea(self, idea_id: int, claimed_by: str = "metroplex") -> bool:
         """
@@ -165,26 +293,63 @@ class IdeaForgeReader:
         self._connect()
         cursor = self.conn.cursor()
 
-        cursor.execute("""
-            SELECT
-                id,
-                title,
-                description,
-                problem_statement,
-                target_audience,
-                struggling_user,
-                weighted_score,
-                opportunity_score,
-                problem_score,
-                feasibility_score,
-                why_now_score,
-                competition_score,
-                artifact_type,
-                signal_count,
-                status
-            FROM ideas
-            WHERE id = ?
-        """, (idea_id,))
+        has_rubric = self._detect_scoring_rubric_column()
+        # R-A 1.6 (2026-05-12): probe for agentic_relief + weight_hint
+        # columns. They were added by the ideaforge migration of the
+        # same pass. Fall back to NULL-selects when missing so older
+        # ideaforge.db snapshots survive without an OperationalError.
+        cols = {row[1] for row in cursor.execute("PRAGMA table_info(ideas)")}
+        has_relief = "agentic_relief" in cols and "weight_hint" in cols
+        relief_select = (
+            "agentic_relief,\n                    weight_hint"
+            if has_relief
+            else "NULL AS agentic_relief,\n                    NULL AS weight_hint"
+        )
+        if has_rubric:
+            cursor.execute(f"""
+                SELECT
+                    id,
+                    title,
+                    description,
+                    problem_statement,
+                    target_audience,
+                    struggling_user,
+                    weighted_score,
+                    opportunity_score,
+                    problem_score,
+                    feasibility_score,
+                    why_now_score,
+                    competition_score,
+                    artifact_type,
+                    signal_count,
+                    status,
+                    scoring_rubric,
+                    {relief_select}
+                FROM ideas
+                WHERE id = ?
+            """, (idea_id,))
+        else:
+            cursor.execute(f"""
+                SELECT
+                    id,
+                    title,
+                    description,
+                    problem_statement,
+                    target_audience,
+                    struggling_user,
+                    weighted_score,
+                    opportunity_score,
+                    problem_score,
+                    feasibility_score,
+                    why_now_score,
+                    competition_score,
+                    artifact_type,
+                    signal_count,
+                    status,
+                    {relief_select}
+                FROM ideas
+                WHERE id = ?
+            """, (idea_id,))
 
         row = cursor.fetchone()
         return dict(row) if row else None

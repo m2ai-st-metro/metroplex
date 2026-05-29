@@ -27,13 +27,12 @@ WORKER_ROUTES = {
     ("skylynx", "infrastructure"): "ravage",
     ("skylynx", "case_study_addition"): "soundwave",
     ("skylynx", ""): "ravage",  # default for unknown skylynx types
-    # Linear issues default to ravage (coding tasks)
-    ("linear", ""): "ravage",
     # IdeaForge items default to ravage
     ("ideaforge", ""): "ravage",
 }
 
-VALID_WORKER_TYPES = {"starscream", "ravage", "soundwave", "astrotrain", "default", "oz-cloud"}
+# Retired workers (starscream, astrotrain) removed 2026-05-12 clean-slate sweep.
+VALID_WORKER_TYPES = {"ravage", "soundwave", "default", "oz-cloud"}
 
 
 @runtime_checkable
@@ -355,10 +354,6 @@ def build_dispatch_prompt(item: dict) -> str:
     scope = idea_data.get("_scope", "")
     if scope:
         lines.append(f"Scope: {scope}")
-
-    linear_id = idea_data.get("_linear_identifier", "")
-    if linear_id:
-        lines.append(f"Linear: {linear_id}")
 
     lines.append("")
     lines.append(f"Source: {source} | Priority score: {item.get('priority_score', 0):.1f}")

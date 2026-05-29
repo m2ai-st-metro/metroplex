@@ -16,10 +16,9 @@ from audit import AuditLogger
 from safety import CircuitBreaker, CycleCaps, ShutdownHandler
 from gates.triage import TriageGate
 from gates.build import SpecGenerator, BuildOrchestrator
-from gates.patcher import PatchGate
 from orchestrator import CycleOrchestrator
 from notifier import LogNotifier
-from models import TriageDecision, BuildJob, PatchApplication, PriorityItem
+from models import TriageDecision, BuildJob, PriorityItem
 
 
 def make_pq_item(**kwargs) -> PriorityItem:
@@ -129,29 +128,10 @@ def mock_build_orchestrator():
 
 
 @pytest.fixture
-def mock_patch_gate():
-    """Create mock patch gate."""
-    gate = Mock(spec=PatchGate)
-    gate.run.return_value = [
-        PatchApplication(
-            patch_id="patch-1",
-            persona_id="persona-1",
-            from_version="1.0",
-            to_version="1.1",
-            status="applied",
-            reason="patch applied successfully",
-            applied_at=datetime.now()
-        )
-    ]
-    return gate
-
-
-@pytest.fixture
 def orchestrator(
     config,
     mock_triage_gate,
     mock_build_orchestrator,
-    mock_patch_gate,
     circuit_breaker,
     cycle_caps,
     shutdown_handler,
@@ -163,7 +143,6 @@ def orchestrator(
         config=config,
         triage_gate=mock_triage_gate,
         build_orchestrator=mock_build_orchestrator,
-        patch_gate=mock_patch_gate,
         circuit_breaker=circuit_breaker,
         cycle_caps=cycle_caps,
         shutdown_handler=shutdown_handler,
@@ -176,20 +155,18 @@ def orchestrator(
 class TestCycleOrchestrator:
     """Test CycleOrchestrator class."""
 
-    def test_run_cycle_success(self, orchestrator, mock_triage_gate, mock_build_orchestrator, mock_patch_gate):
+    def test_run_cycle_success(self, orchestrator, mock_triage_gate, mock_build_orchestrator):
         """Test successful cycle execution."""
         result = orchestrator.run_cycle(dry_run=True)
 
         # Verify all gates were called
         mock_triage_gate.run.assert_called_once_with(dry_run=True)
         mock_build_orchestrator.run_from_queue.assert_called_once()
-        mock_patch_gate.run.assert_called_once_with(dry_run=True)
 
         # Verify result
         assert result.cycle_id.startswith("cycle-")
         assert result.triage_count == 1
         assert result.build_count == 1
-        assert result.patch_count == 1
         assert len(result.errors) == 0
         assert result.completed_at is not None
 
@@ -265,12 +242,11 @@ class TestCycleOrchestrator:
         assert "pending_builds" in status
 
         # Verify gate statuses
-        assert len(status["gate_statuses"]) == 4
+        assert len(status["gate_statuses"]) == 3
         gate_names = [gs["gate"] for gs in status["gate_statuses"]]
         assert "triage" in gate_names
         assert "build" in gate_names
         assert "publish" in gate_names
-        assert "patch" in gate_names
 
         # Verify recent cycles
         assert len(status["recent_cycles"]) >= 1
@@ -322,7 +298,7 @@ class TestCLI:
 
         # Should succeed (or fail gracefully if no DBs)
         assert result.returncode in [0, 1]
-        assert "Gate 1" in result.stdout or "Gate 2" in result.stdout or "Gate 3" in result.stdout or "Warning" in result.stdout
+        assert "Gate 1" in result.stdout or "Gate 2" in result.stdout or "Gate 4" in result.stdout or "Warning" in result.stdout
 
     def test_cli_reset_gate(self):
         """Test 'metroplex.py reset --gate triage' command."""
@@ -352,7 +328,7 @@ class TestCLI:
         assert result.returncode == 0
         assert "triage" in result.stdout
         assert "build" in result.stdout
-        assert "patch" in result.stdout
+        assert "publish" in result.stdout
 
     def test_cli_help(self):
         """Test 'metroplex.py --help' command."""
@@ -368,7 +344,7 @@ class TestCLI:
         assert "Metroplex" in result.stdout
         assert "triage" in result.stdout
         assert "build" in result.stdout
-        assert "patch" in result.stdout
+        assert "publish" in result.stdout
         assert "run-all" in result.stdout
         assert "status" in result.stdout
         assert "reset" in result.stdout
@@ -448,8 +424,6 @@ class TestScheduleWindows:
         mock_build = Mock(spec=BuildOrchestrator)
         mock_build.run_from_queue.return_value = []
         mock_build.is_runner_active.return_value = False
-        mock_patch = Mock(spec=PatchGate)
-        mock_patch.run.return_value = []
         cb = CircuitBreaker(threshold=3, state_db=state_db)
         cc = CycleCaps(config)
         sh = ShutdownHandler()
@@ -458,7 +432,6 @@ class TestScheduleWindows:
             config=config,
             triage_gate=mock_triage,
             build_orchestrator=mock_build,
-            patch_gate=mock_patch,
             circuit_breaker=cb,
             cycle_caps=cc,
             shutdown_handler=sh,
@@ -573,7 +546,7 @@ class TestOrchestratorNotifications:
 
     def test_cycle_notifies_on_triage_approval(
         self, config, mock_triage_gate, mock_build_orchestrator,
-        mock_patch_gate, circuit_breaker, cycle_caps,
+        circuit_breaker, cycle_caps,
         shutdown_handler, state_db, audit_logger
     ):
         """Test that approved ideas trigger a notification."""
@@ -584,7 +557,6 @@ class TestOrchestratorNotifications:
             config=config,
             triage_gate=mock_triage_gate,
             build_orchestrator=mock_build_orchestrator,
-            patch_gate=mock_patch_gate,
             circuit_breaker=circuit_breaker,
             cycle_caps=cycle_caps,
             shutdown_handler=shutdown_handler,
@@ -602,7 +574,7 @@ class TestOrchestratorNotifications:
 
     def test_cycle_notifies_on_build_queued(
         self, config, mock_triage_gate, mock_build_orchestrator,
-        mock_patch_gate, circuit_breaker, cycle_caps,
+        circuit_breaker, cycle_caps,
         shutdown_handler, state_db, audit_logger
     ):
         """Test that queued builds trigger a notification."""
@@ -613,7 +585,6 @@ class TestOrchestratorNotifications:
             config=config,
             triage_gate=mock_triage_gate,
             build_orchestrator=mock_build_orchestrator,
-            patch_gate=mock_patch_gate,
             circuit_breaker=circuit_breaker,
             cycle_caps=cycle_caps,
             shutdown_handler=shutdown_handler,
@@ -631,7 +602,7 @@ class TestOrchestratorNotifications:
 
     def test_cycle_notifies_on_error(
         self, config, mock_triage_gate, mock_build_orchestrator,
-        mock_patch_gate, circuit_breaker, cycle_caps,
+        circuit_breaker, cycle_caps,
         shutdown_handler, state_db, audit_logger
     ):
         """Test that gate failures trigger an error notification."""
@@ -644,7 +615,6 @@ class TestOrchestratorNotifications:
             config=config,
             triage_gate=mock_triage_gate,
             build_orchestrator=mock_build_orchestrator,
-            patch_gate=mock_patch_gate,
             circuit_breaker=circuit_breaker,
             cycle_caps=cycle_caps,
             shutdown_handler=shutdown_handler,
@@ -669,8 +639,6 @@ class TestOrchestratorNotifications:
         mock_build = Mock(spec=BuildOrchestrator)
         mock_build.run_from_queue.return_value = []
         mock_build.is_runner_active.return_value = False
-        mock_patch = Mock(spec=PatchGate)
-        mock_patch.run.return_value = []
 
         mock_notifier = Mock()
         mock_notifier.notify.return_value = True
@@ -683,7 +651,6 @@ class TestOrchestratorNotifications:
             config=config,
             triage_gate=mock_triage,
             build_orchestrator=mock_build,
-            patch_gate=mock_patch,
             circuit_breaker=cb,
             cycle_caps=cc,
             shutdown_handler=sh,
@@ -745,7 +712,7 @@ class TestStandaloneStatusPolling:
         assert mock_build_orchestrator.poll_and_sync_status.called
 
     def test_run_cycle_notifies_completed_builds(
-        self, config, mock_triage_gate, mock_build_orchestrator, mock_patch_gate,
+        self, config, mock_triage_gate, mock_build_orchestrator,
         circuit_breaker, cycle_caps, shutdown_handler, state_db, audit_logger
     ):
         """Completed builds from polling generate notifications."""
@@ -760,7 +727,7 @@ class TestStandaloneStatusPolling:
 
         orch = CycleOrchestrator(
             config=config, triage_gate=mock_triage_gate,
-            build_orchestrator=mock_build_orchestrator, patch_gate=mock_patch_gate,
+            build_orchestrator=mock_build_orchestrator,
             circuit_breaker=circuit_breaker, cycle_caps=cycle_caps,
             shutdown_handler=shutdown_handler, state_db=state_db,
             audit_logger=audit_logger, cycle_sleep_seconds=1,
@@ -773,15 +740,13 @@ class TestStandaloneStatusPolling:
         assert any("completed" in c.lower() or "Build completed" in c for c in notify_calls)
 
     def test_run_cycle_poll_failure_nonfatal(
-        self, orchestrator, mock_build_orchestrator, mock_patch_gate, audit_logger
+        self, orchestrator, mock_build_orchestrator, audit_logger
     ):
         """A polling failure doesn't prevent the rest of the cycle from running."""
         mock_build_orchestrator.poll_and_sync_status.side_effect = Exception("poll error")
 
         result = orchestrator.run_cycle(dry_run=True)
 
-        # Patch gate should still have been called
-        assert mock_patch_gate.run.called
         # Cycle should complete without raising
         assert result.completed_at is not None
 
@@ -790,7 +755,7 @@ class TestSkyLynxIntake:
     """Tests for Sky-Lynx recommendation intake in CycleOrchestrator."""
 
     def test_ingest_skylynx_enqueues_recommendations(
-        self, config, mock_triage_gate, mock_build_orchestrator, mock_patch_gate,
+        self, config, mock_triage_gate, mock_build_orchestrator,
         circuit_breaker, cycle_caps, shutdown_handler, state_db, audit_logger
     ):
         """ingest_skylynx reads pending recs and enqueues them as PriorityItems."""
@@ -823,7 +788,7 @@ class TestSkyLynxIntake:
 
         orch = CycleOrchestrator(
             config=config, triage_gate=mock_triage_gate,
-            build_orchestrator=mock_build_orchestrator, patch_gate=mock_patch_gate,
+            build_orchestrator=mock_build_orchestrator,
             circuit_breaker=circuit_breaker, cycle_caps=cycle_caps,
             shutdown_handler=shutdown_handler, state_db=state_db,
             audit_logger=audit_logger, cycle_sleep_seconds=1,
@@ -841,7 +806,7 @@ class TestSkyLynxIntake:
         assert summary.get("total", 0) == 1
 
     def test_ingest_skylynx_applies_weight(
-        self, config, mock_triage_gate, mock_build_orchestrator, mock_patch_gate,
+        self, config, mock_triage_gate, mock_build_orchestrator,
         circuit_breaker, cycle_caps, shutdown_handler, state_db, audit_logger
     ):
         """Priority score is base_score * skylynx_weight."""
@@ -864,7 +829,7 @@ class TestSkyLynxIntake:
 
         orch = CycleOrchestrator(
             config=config, triage_gate=mock_triage_gate,
-            build_orchestrator=mock_build_orchestrator, patch_gate=mock_patch_gate,
+            build_orchestrator=mock_build_orchestrator,
             circuit_breaker=circuit_breaker, cycle_caps=cycle_caps,
             shutdown_handler=shutdown_handler, state_db=state_db,
             audit_logger=audit_logger, skylynx_reader=mock_reader,
@@ -877,7 +842,7 @@ class TestSkyLynxIntake:
         assert item.priority_score == 85.0 * 1.5
 
     def test_ingest_skylynx_dry_run_no_writes(
-        self, config, mock_triage_gate, mock_build_orchestrator, mock_patch_gate,
+        self, config, mock_triage_gate, mock_build_orchestrator,
         circuit_breaker, cycle_caps, shutdown_handler, state_db, audit_logger
     ):
         """Dry run counts items but does not enqueue or mark dispatched."""
@@ -897,7 +862,7 @@ class TestSkyLynxIntake:
 
         orch = CycleOrchestrator(
             config=config, triage_gate=mock_triage_gate,
-            build_orchestrator=mock_build_orchestrator, patch_gate=mock_patch_gate,
+            build_orchestrator=mock_build_orchestrator,
             circuit_breaker=circuit_breaker, cycle_caps=cycle_caps,
             shutdown_handler=shutdown_handler, state_db=state_db,
             audit_logger=audit_logger, skylynx_reader=mock_reader,
@@ -917,7 +882,7 @@ class TestSkyLynxIntake:
         assert count == 0
 
     def test_run_cycle_calls_ingest_skylynx(
-        self, config, mock_triage_gate, mock_build_orchestrator, mock_patch_gate,
+        self, config, mock_triage_gate, mock_build_orchestrator,
         circuit_breaker, cycle_caps, shutdown_handler, state_db, audit_logger
     ):
         """run_cycle invokes Sky-Lynx intake before triage."""
@@ -926,7 +891,7 @@ class TestSkyLynxIntake:
 
         orch = CycleOrchestrator(
             config=config, triage_gate=mock_triage_gate,
-            build_orchestrator=mock_build_orchestrator, patch_gate=mock_patch_gate,
+            build_orchestrator=mock_build_orchestrator,
             circuit_breaker=circuit_breaker, cycle_caps=cycle_caps,
             shutdown_handler=shutdown_handler, state_db=state_db,
             audit_logger=audit_logger, skylynx_reader=mock_reader,
@@ -953,8 +918,6 @@ class TestDispatchIntegration:
             "running": [], "running_count": 0,
             "completed": [], "failed": [], "newly_synced": [],
         }
-        mock_patch = Mock(spec=PatchGate)
-        mock_patch.run.return_value = []
         cb = CircuitBreaker(threshold=3, state_db=state_db)
         cc = CycleCaps(config)
         sh = ShutdownHandler()
@@ -964,7 +927,6 @@ class TestDispatchIntegration:
             config=config,
             triage_gate=mock_triage,
             build_orchestrator=mock_build,
-            patch_gate=mock_patch,
             circuit_breaker=cb,
             cycle_caps=cc,
             shutdown_handler=sh,
@@ -999,11 +961,11 @@ class TestDispatchIntegration:
         assert dispatcher.dispatched[0]["worker_type"] == "ravage"
 
     def test_dispatch_skips_buildable_sources(self, config, state_db, audit_logger):
-        """IdeaForge/linear/academy items are NOT dispatched (handled by Gate 2)."""
+        """IdeaForge/academy items are NOT dispatched (handled by Gate 2)."""
         from models import PriorityItem
         from dispatcher import LogDispatcher
 
-        for source in ("ideaforge", "linear", "academy"):
+        for source in ("ideaforge", "academy"):
             item = make_pq_item(
                 source=source,
                 source_id=f"{source}-001",
@@ -1058,7 +1020,7 @@ class TestDispatchIntegration:
             mock_dispatch.assert_called_once_with(dry_run=True)
 
     def test_dispatch_error_does_not_halt_cycle(self, config, state_db, audit_logger):
-        """Dispatch errors are non-fatal — cycle continues to Gate 4 and Gate 3."""
+        """Dispatch errors are non-fatal — cycle continues to Gate 4."""
         mock_dispatcher = Mock()
         mock_dispatcher.dispatch.side_effect = Exception("DB locked")
 
@@ -1105,14 +1067,10 @@ class TestDispatchIntegration:
             "running": [], "running_count": 0,
             "completed": [], "failed": [], "newly_synced": [],
         }
-        mock_patch = Mock(spec=PatchGate)
-        mock_patch.run.return_value = []
-
         orch = CycleOrchestrator(
             config=config,
             triage_gate=mock_triage,
             build_orchestrator=mock_build,
-            patch_gate=mock_patch,
             circuit_breaker=CircuitBreaker(threshold=3, state_db=state_db),
             cycle_caps=CycleCaps(config),
             shutdown_handler=ShutdownHandler(),
@@ -1171,3 +1129,396 @@ class TestCLIQueue:
         assert result.returncode == 0
         assert "PRIORITY QUEUE" in result.stdout
         assert "Total items:" in result.stdout
+
+
+class TestQualityScoringForwardsRubric:
+    """R-A item 3 (2026-05-12): the quality-scoring step reads
+    build_jobs.scoring_rubric and forwards it to score_project."""
+
+    @staticmethod
+    def _seed_build(state_db, queue_job_id, project_dir, scoring_rubric=None):
+        """Insert a build_jobs row with the given rubric and project_dir."""
+        job = BuildJob(
+            idea_id=str(queue_job_id),
+            title=f"T-{queue_job_id}",
+            spec_path="/tmp/spec.txt",
+            queue_job_id=queue_job_id,
+            status="queued",
+            queued_at=datetime.now(),
+            scoring_rubric=scoring_rubric,
+        )
+        state_db.record_build_job(job)
+        # Now mark it completed + reviewed + attach project_dir
+        state_db.update_build_job_status(queue_job_id, "completed")
+        state_db.update_build_job_project_dir(queue_job_id, str(project_dir))
+        state_db.update_build_review_status(queue_job_id, "reviewed")
+
+    @staticmethod
+    def _review_pass_result(queue_job_id, title):
+        """Stub mimicking ReviewResult — duck-typed."""
+        r = MagicMock()
+        r.verdict = "pass"
+        r.queue_job_id = queue_job_id
+        r.title = title
+        return r
+
+    def test_orchestrator_forwards_life_domain_rubric(
+        self, orchestrator, state_db, tmp_path,
+    ):
+        """C3a: when build_jobs.scoring_rubric='life_domain', score_project
+        receives scoring_rubric='life_domain'."""
+        # Project dir: no agent shape -> life_domain gate would fire if real.
+        # We patch score_project so we only assert the kwarg.
+        project_dir = tmp_path / "proj_life"
+        project_dir.mkdir()
+        (project_dir / "README.md").write_text("hello")
+
+        self._seed_build(state_db, "build-life-1", project_dir,
+                         scoring_rubric="life_domain")
+
+        review_results = [self._review_pass_result("build-life-1", "T-life")]
+
+        with patch("orchestrator.score_project") as mock_score:
+            mock_breakdown = MagicMock()
+            mock_breakdown.total_score = 0.0
+            mock_breakdown.static_score = 0.0
+            mock_breakdown.source_file_count = 0
+            mock_breakdown.test_file_count = 0
+            mock_breakdown.category_failed = True
+            mock_breakdown.category_failure_reason = "missing_agent_yaml"
+            mock_score.return_value = mock_breakdown
+
+            scored = orchestrator._score_review_pass_builds(
+                review_results, dry_run=False,
+            )
+
+        assert scored == 1
+        assert mock_score.call_count == 1
+        # Assert via kwargs so positional/keyword equivalence is irrelevant.
+        _, kwargs = mock_score.call_args
+        assert kwargs.get("scoring_rubric") == "life_domain"
+
+    def test_orchestrator_forwards_none_rubric_when_null(
+        self, orchestrator, state_db, tmp_path,
+    ):
+        """C3b: NULL scoring_rubric -> score_project called with rubric=None
+        (backward-compat: pre-rubric rows must not be gated)."""
+        project_dir = tmp_path / "proj_null"
+        project_dir.mkdir()
+        (project_dir / "README.md").write_text("hi")
+        (project_dir / "main.py").write_text("print('hi')\n")
+
+        self._seed_build(state_db, "build-null-1", project_dir,
+                         scoring_rubric=None)
+
+        review_results = [self._review_pass_result("build-null-1", "T-null")]
+
+        with patch("orchestrator.score_project") as mock_score:
+            mock_breakdown = MagicMock()
+            mock_breakdown.total_score = 24.0
+            mock_breakdown.static_score = 24.0
+            mock_breakdown.source_file_count = 1
+            mock_breakdown.test_file_count = 0
+            mock_breakdown.category_failed = False
+            mock_breakdown.category_failure_reason = None
+            mock_score.return_value = mock_breakdown
+
+            scored = orchestrator._score_review_pass_builds(
+                review_results, dry_run=False,
+            )
+
+        assert scored == 1
+        assert mock_score.call_count == 1
+        _, kwargs = mock_score.call_args
+        assert kwargs.get("scoring_rubric") is None
+
+    def test_orchestrator_skips_when_project_dir_missing(
+        self, orchestrator, state_db, tmp_path,
+    ):
+        """C3d: rows where project_dir is missing or non-dir are skipped
+        with no score_project call and no DB update."""
+        # Seed a row whose project_dir points at a non-existent path.
+        bogus = tmp_path / "does_not_exist"
+        # We seed without calling update_build_job_project_dir to leave NULL.
+        job = BuildJob(
+            idea_id="404",
+            title="Phantom",
+            spec_path="/tmp/spec.txt",
+            queue_job_id="build-phantom",
+            status="queued",
+            queued_at=datetime.now(),
+            scoring_rubric="life_domain",
+        )
+        state_db.record_build_job(job)
+        state_db.update_build_job_status("build-phantom", "completed")
+
+        review_results = [self._review_pass_result("build-phantom", "T-phantom")]
+
+        with patch("orchestrator.score_project") as mock_score:
+            scored = orchestrator._score_review_pass_builds(
+                review_results, dry_run=False,
+            )
+
+        assert scored == 0
+        assert mock_score.call_count == 0
+
+    def test_orchestrator_dry_run_skips_db_write_but_still_calls_score(
+        self, orchestrator, state_db, tmp_path,
+    ):
+        """dry_run=True: score_project still invoked (so we can observe the
+        gate via audit log), but update_build_quality_score is NOT called."""
+        project_dir = tmp_path / "proj_dry"
+        project_dir.mkdir()
+        (project_dir / "README.md").write_text("x")
+
+        self._seed_build(state_db, "build-dry-1", project_dir,
+                         scoring_rubric="life_domain")
+
+        review_results = [self._review_pass_result("build-dry-1", "T-dry")]
+
+        with patch("orchestrator.score_project") as mock_score, \
+             patch.object(state_db, "update_build_quality_score") as mock_update:
+            mock_breakdown = MagicMock()
+            mock_breakdown.total_score = 0.0
+            mock_breakdown.static_score = 0.0
+            mock_breakdown.source_file_count = 0
+            mock_breakdown.test_file_count = 0
+            mock_breakdown.category_failed = True
+            mock_breakdown.category_failure_reason = "missing_agent_yaml"
+            mock_score.return_value = mock_breakdown
+            # Re-bind the state_db on orchestrator to the patched one
+            orchestrator.state_db = state_db
+
+            scored = orchestrator._score_review_pass_builds(
+                review_results, dry_run=True,
+            )
+
+        assert scored == 1
+        assert mock_score.call_count == 1
+        mock_update.assert_not_called()
+
+
+class TestAutoRetryRedispatch:
+    """Regression tests for the idea-436 premature-abandon bug.
+
+    A non-exhausted build whose backoff window has elapsed must be RE-DISPATCHED
+    (priority_queue re-pended), never abandoned. Previously _process_auto_retries
+    abandoned any build for which mark_build_for_retry returned False -- which is
+    True for every row already carrying next_retry_at, i.e. exactly the rows
+    get_retryable_builds re-surfaces once their backoff elapses. That stranded
+    idea-436 with 2 failures against MAX_RETRIES=5 and left priority_queue at
+    'dispatched'.
+    """
+
+    def _setup_elapsed_backoff_build(self, state_db, queue_job_id="metroplex-ideaforge-1"):
+        """Two failed rows; latest stamped with an elapsed next_retry_at, plus a
+        priority_queue row stranded at 'dispatched' (mirrors idea-436 row 359)."""
+        from datetime import timedelta
+        for _ in range(2):
+            state_db.record_build_job(BuildJob(
+                idea_id=1, title="Elder Care", spec_path="/tmp/spec.txt",
+                queue_job_id=queue_job_id, status="failed", queued_at=datetime.now(),
+            ))
+        past = (datetime.now() - timedelta(hours=1)).isoformat()
+        state_db.conn.execute(
+            "UPDATE build_jobs SET next_retry_at = ? WHERE id = (SELECT MAX(id) FROM build_jobs)",
+            (past,),
+        )
+        state_db.conn.execute(
+            "INSERT INTO priority_queue (source, source_id, title, description, "
+            "priority_score, status, idea_data, created_at) "
+            "VALUES ('ideaforge', '1', 'Elder Care', 'd', 1.0, 'dispatched', '{}', ?)",
+            (datetime.now().isoformat(),),
+        )
+        state_db.conn.commit()
+
+    def test_non_exhausted_elapsed_backoff_is_redispatched_not_abandoned(
+        self, orchestrator, state_db,
+    ):
+        self._setup_elapsed_backoff_build(state_db)
+
+        # Sanity: the scenario reproduces the False-returning guard with slots open.
+        assert state_db.get_retryable_builds(), "scenario must surface a retryable build"
+        assert state_db.mark_build_for_retry("metroplex-ideaforge-1") is False
+        assert state_db.has_exhausted_retries("metroplex-ideaforge-1") is False
+
+        orchestrator._process_auto_retries()
+
+        # No row was abandoned.
+        rows = state_db.conn.execute(
+            "SELECT next_retry_at FROM build_jobs WHERE base_job_id = 'metroplex-ideaforge-1'"
+        ).fetchall()
+        assert all(r["next_retry_at"] != "abandoned" for r in rows), \
+            "non-exhausted build must not be abandoned"
+
+        # The stranded priority_queue row was re-pended for Gate 2.
+        pq_status = state_db.conn.execute(
+            "SELECT status FROM priority_queue WHERE source='ideaforge' AND source_id='1'"
+        ).fetchone()["status"]
+        assert pq_status == "pending", f"expected re-dispatch to 'pending', got {pq_status!r}"
+
+    def test_exhausted_build_is_abandoned_by_exhausted_path(self, orchestrator, state_db):
+        """The abandon path still fires for genuinely exhausted builds."""
+        for _ in range(StateDB.MAX_RETRIES):
+            state_db.record_build_job(BuildJob(
+                idea_id=2, title="Exhausted", spec_path="/tmp/spec.txt",
+                queue_job_id="metroplex-ideaforge-2", status="failed",
+                queued_at=datetime.now(),
+            ))
+        state_db.conn.commit()
+
+        assert state_db.has_exhausted_retries("metroplex-ideaforge-2") is True
+
+        orchestrator._process_auto_retries()
+
+        rows = state_db.conn.execute(
+            "SELECT next_retry_at FROM build_jobs WHERE base_job_id = 'metroplex-ideaforge-2'"
+        ).fetchall()
+        assert any(r["next_retry_at"] == "abandoned" for r in rows), \
+            "exhausted build must still be abandoned"
+
+
+class TestStuckBuildReaper:
+    """Tests for the S5 stuck-build reaper.
+
+    health._check_stuck_builds only emits a CRIT alert; nothing transitioned a
+    wedged 'started' row out of that state, so a build whose runner died
+    mid-flight rotted indefinitely (idea-441 sat 'started' for 333h). The
+    reaper marks such rows 'failed' and routes them through the NORMAL retry
+    path — never abandoned (unless MAX_RETRIES is genuinely exhausted) —
+    respecting the build circuit breaker and the per-cycle cap.
+    """
+
+    def _add_started_build(
+        self, state_db, queue_job_id, idea_id, age_seconds, title="Stuck Build",
+    ):
+        """Insert a 'started' build_jobs row aged ``age_seconds`` plus a
+        matching priority_queue row stranded at 'dispatched'."""
+        from datetime import timedelta
+        state_db.record_build_job(BuildJob(
+            idea_id=idea_id, title=title, spec_path="/tmp/spec.txt",
+            queue_job_id=queue_job_id, status="started",
+            queued_at=datetime.now() - timedelta(seconds=age_seconds),
+        ))
+        state_db.conn.execute(
+            "INSERT INTO priority_queue (source, source_id, title, description, "
+            "priority_score, status, idea_data, created_at) "
+            "VALUES ('ideaforge', ?, ?, 'd', 1.0, 'dispatched', '{}', ?)",
+            (str(idea_id), title, datetime.now().isoformat()),
+        )
+        state_db.conn.commit()
+
+    def test_get_stuck_started_builds_respects_timeout(self, state_db):
+        """Only 'started' rows older than the timeout are returned."""
+        self._add_started_build(state_db, "metroplex-ideaforge-1", 1, age_seconds=7200)
+        self._add_started_build(state_db, "metroplex-ideaforge-2", 2, age_seconds=60)
+
+        stuck = state_db.get_stuck_started_builds(5400)  # 90 min
+
+        ids = {b["queue_job_id"] for b in stuck}
+        assert ids == {"metroplex-ideaforge-1"}, \
+            "only the >90-min build should be stuck"
+
+    def test_reaper_marks_failed_and_routes_to_retry_not_abandon(
+        self, orchestrator, state_db, config,
+    ):
+        """A reaped build becomes 'failed' and retryable — never abandoned."""
+        self._add_started_build(
+            state_db, "metroplex-ideaforge-1", 1,
+            age_seconds=config.build_timeout_seconds + 600,
+        )
+
+        reaped = orchestrator._reap_stuck_builds()
+        assert reaped == 1
+
+        row = state_db.conn.execute(
+            "SELECT status, next_retry_at FROM build_jobs "
+            "WHERE queue_job_id = 'metroplex-ideaforge-1'"
+        ).fetchone()
+        assert row["status"] == "failed", "stuck build must be transitioned to failed"
+        assert row["next_retry_at"] != "abandoned", \
+            "reaped build must NOT be abandoned — it routes through retry"
+
+        # The normal retry machinery now surfaces it, and the exhausted/abandon
+        # path does not.
+        retryable_ids = {b["queue_job_id"] for b in state_db.get_retryable_builds()}
+        assert "metroplex-ideaforge-1" in retryable_ids
+        exhausted_ids = {b["queue_job_id"] for b in state_db.get_exhausted_builds()}
+        assert "metroplex-ideaforge-1" not in exhausted_ids
+
+    def test_run_cycle_reaps_then_redispatches(
+        self, orchestrator, state_db, config,
+    ):
+        """End-to-end: a stuck build is reaped and re-dispatched within one
+        cycle (priority_queue back to 'pending'), proving reap feeds the
+        inline auto-retry block."""
+        # Use an idea_id distinct from the mock triage gate's idea (1) so the
+        # cycle's triage intake doesn't touch this priority_queue row.
+        self._add_started_build(
+            state_db, "metroplex-ideaforge-77", 77,
+            age_seconds=config.build_timeout_seconds + 600,
+        )
+
+        orchestrator.run_cycle(dry_run=False)
+
+        pq_status = state_db.conn.execute(
+            "SELECT status FROM priority_queue WHERE source='ideaforge' AND source_id='77'"
+        ).fetchone()["status"]
+        assert pq_status == "pending", \
+            f"reaped build should be re-dispatched to 'pending', got {pq_status!r}"
+
+        # The failed row carries a backoff timer (retry scheduled), not the
+        # abandoned sentinel.
+        row = state_db.conn.execute(
+            "SELECT next_retry_at FROM build_jobs WHERE queue_job_id='metroplex-ideaforge-77'"
+        ).fetchone()
+        assert row["next_retry_at"] not in (None, "abandoned"), \
+            "retry block should have stamped a backoff timer on the reaped row"
+
+    def test_reaper_skips_when_build_gate_halted(
+        self, orchestrator, state_db, circuit_breaker, config,
+    ):
+        """A halted build circuit breaker suppresses reaping (no retry churn)."""
+        self._add_started_build(
+            state_db, "metroplex-ideaforge-1", 1,
+            age_seconds=config.build_timeout_seconds + 600,
+        )
+        for _ in range(3):
+            circuit_breaker.record_failure("build", "boom")
+        assert circuit_breaker.is_halted("build")
+
+        assert orchestrator._reap_stuck_builds() == 0
+
+        status = state_db.conn.execute(
+            "SELECT status FROM build_jobs WHERE queue_job_id='metroplex-ideaforge-1'"
+        ).fetchone()["status"]
+        assert status == "started", "build must remain untouched while gate is halted"
+
+    def test_reaper_respects_per_cycle_cap(self, orchestrator, state_db, config):
+        """No more than max_approve_per_cycle builds are reaped per cycle."""
+        cap = config.max_approve_per_cycle
+        total = cap + 2
+        for i in range(total):
+            self._add_started_build(
+                state_db, f"metroplex-ideaforge-{10 + i}", 10 + i,
+                age_seconds=config.build_timeout_seconds + 600,
+            )
+
+        reaped = orchestrator._reap_stuck_builds()
+        assert reaped == cap, f"expected cap={cap} reaps, got {reaped}"
+
+        still_started = state_db.conn.execute(
+            "SELECT COUNT(*) FROM build_jobs WHERE status='started'"
+        ).fetchone()[0]
+        assert still_started == total - cap, \
+            "builds beyond the cap must remain 'started' for the next cycle"
+
+    def test_reaper_noop_when_nothing_stuck(self, orchestrator, state_db, config):
+        """A fresh 'started' build inside the timeout is not reaped."""
+        self._add_started_build(state_db, "metroplex-ideaforge-1", 1, age_seconds=60)
+
+        assert orchestrator._reap_stuck_builds() == 0
+        status = state_db.conn.execute(
+            "SELECT status FROM build_jobs WHERE queue_job_id='metroplex-ideaforge-1'"
+        ).fetchone()["status"]
+        assert status == "started"

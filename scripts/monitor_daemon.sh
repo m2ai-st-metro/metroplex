@@ -6,7 +6,7 @@ set -u
 
 QUEUE_DIR=/home/apexaipc/projects/metroplex/data/self_healing_queue
 STATE_FILE=/tmp/metroplex-daemon-monitor.state
-HEARTBEAT_MAX_AGE=120      # seconds
+HEARTBEAT_MAX_AGE=600      # seconds; must exceed daemon keep-alive cadence (60s) with margin. in_flight watchdog at 1800s independently catches stuck tasks.
 IN_FLIGHT_MAX_AGE=1800     # seconds (30 min)
 
 set +u; source /home/apexaipc/.env.shared; set -u

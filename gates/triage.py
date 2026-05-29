@@ -14,6 +14,9 @@ logger = logging.getLogger(__name__)
 
 # Internal ST Metro infrastructure names — ideas referencing these are self-referential
 # and should not enter the pipeline for external distribution.
+# This is a content filter, NOT a dispatch list. Agent identity terms (galvatron, starscream,
+# soundwave) stay here permanently: even after retirement and revival in CCOS, their work must
+# not re-enter ingestion and loop back through the pipeline.
 INTERNAL_KEYWORDS = {
     "ultra magnus", "metroplex", "st metro", "ideaforge", "idea forge",
     "sky-lynx", "skylynx", "galvatron", "starscream", "soundwave",

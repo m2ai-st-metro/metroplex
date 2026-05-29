@@ -5,6 +5,9 @@ venv/
 data/
 *.egg-info/
 .env
+.env.*
+!.env.example
+*.bak-rotate
 screenshots/
 .pytest_cache/
 .coverage
@@ -14,3 +17,9 @@ build/
 *.egg
 .DS_Store
 :memory:
+.self-healing-claudex/
+.self-healing-pipeline/
+/metroplex.db
+.ruff_cache/
+.firecrawl/
+.cmd-agent-active/

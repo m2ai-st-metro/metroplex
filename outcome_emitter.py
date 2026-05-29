@@ -49,6 +49,8 @@ class OutcomeEmitter:
         pipeline_trace: list[dict] | None = None,
         tags: list[str] | None = None,
         idea_type: str | None = None,
+        scene_fidelity_score: float | None = None,
+        scene_fidelity_breakdown: dict | None = None,
     ) -> bool:
         """
         Emit an OutcomeRecord for a terminal-state idea.
@@ -65,6 +67,8 @@ class OutcomeEmitter:
             pipeline_trace: List of stage trace dicts
             tags: Tags for categorization
             idea_type: Type of idea (tool, agent, etc.)
+            scene_fidelity_score: Optional scene-fidelity grade (Sky-Lynx review)
+            scene_fidelity_breakdown: Optional dict of per-axis fidelity scores + notes
 
         Returns:
             True if emitted successfully, False on error.
@@ -105,6 +109,8 @@ class OutcomeEmitter:
                 pipeline_trace=trace_objects,
                 tags=tags or [],
                 idea_type=idea_type,
+                scene_fidelity_score=scene_fidelity_score,
+                scene_fidelity_breakdown=scene_fidelity_breakdown,
                 emitted_at=datetime.now(),
             )
 

@@ -35,12 +35,6 @@ class Config:
     um_db: str = field(default="")  # Deprecated: UM removed from pipeline (2026-03-15)
     st_records_db: str = field(default="/home/apexaipc/projects/st-records/data/persona_metrics.db")
 
-    # Directory paths
-    yce_dir: str = field(default="/home/apexaipc/projects/yce-harness")
-
-    # GitHub repo
-    academy_repo: str = field(default="m2ai-st-metro/st-agent-registry")
-
     # Model settings
     build_model: str = field(default="opus")
 
@@ -49,6 +43,10 @@ class Config:
     build_max_workers: int = field(default=2)
     max_concurrent_builds: int = field(default=1)
 
+    # Build timeout watchdog: a build sitting in 'started' longer than this is
+    # considered stuck and gets reaped (marked failed + routed to retry). 90 min.
+    build_timeout_seconds: int = field(default=5400)
+
     # Scoring thresholds
     approve_threshold: int = field(default=55)
     reject_threshold: int = field(default=40)
@@ -56,7 +54,6 @@ class Config:
 
     # Cycle limits
     max_approve_per_cycle: int = field(default=3)
-    max_patches_per_cycle: int = field(default=5)
 
     # Circuit breaker
     circuit_breaker_threshold: int = field(default=3)
@@ -67,26 +64,15 @@ class Config:
     # Priority queue source weights
     ideaforge_weight: float = field(default=1.0)
     skylynx_weight: float = field(default=1.5)
-    linear_weight: float = field(default=2.0)
-    academy_weight: float = field(default=2.0)
-
-    # Academy integration (persona -> agent promotions)
-    academy_dir: str = field(default="/home/apexaipc/projects/st-agent-registry")
-    academy_promotions_path: str = field(default="/home/apexaipc/projects/st-agent-registry/data/promotions.jsonl")
 
     # Telegram notifications (optional)
     telegram_bot_token: str = field(default="")
     telegram_chat_id: str = field(default="")
     notify_mode: str = field(default="all")
 
-    # Linear integration (via Arcade SDK)
-    linear_team: str = field(default="")
-    linear_label_filter: str = field(default="metroplex")
-    linear_poll_states: str = field(default="Backlog,Todo")
-
     # Spec generation (LLM expansion)
     spec_use_llm: bool = field(default=True)
-    spec_llm_model: str = field(default="Qwen/Qwen2.5-72B-Instruct")
+    spec_llm_model: str = field(default="mistralai/Mistral-Small-3.2-24B-Instruct-2506")
     spec_llm_max_tokens: int = field(default=8192)
 
     # Dispatch (EA-Claude worker queue)
@@ -154,8 +140,6 @@ class Config:
         self.ideaforge_db = os.environ.get("METROPLEX_IDEAFORGE_DB", self.ideaforge_db)
         self.um_db = os.environ.get("METROPLEX_UM_DB", self.um_db)
         self.st_records_db = os.environ.get("METROPLEX_ST_RECORDS_DB", self.st_records_db)
-        self.yce_dir = os.environ.get("METROPLEX_YCE_DIR", self.yce_dir)
-        self.academy_repo = os.environ.get("METROPLEX_ACADEMY_REPO", self.academy_repo)
         self.build_model = os.environ.get("METROPLEX_BUILD_MODEL", self.build_model)
 
         # Parallel build settings
@@ -166,6 +150,10 @@ class Config:
             pass
         try:
             self.max_concurrent_builds = int(os.environ.get("METROPLEX_MAX_CONCURRENT_BUILDS", self.max_concurrent_builds))
+        except ValueError:
+            pass
+        try:
+            self.build_timeout_seconds = int(os.environ.get("METROPLEX_BUILD_TIMEOUT_SECONDS", self.build_timeout_seconds))
         except ValueError:
             pass
 
@@ -191,11 +179,6 @@ class Config:
             pass
 
         try:
-            self.max_patches_per_cycle = int(os.environ.get("METROPLEX_MAX_PATCHES_PER_CYCLE", self.max_patches_per_cycle))
-        except ValueError:
-            pass
-
-        try:
             self.circuit_breaker_threshold = int(os.environ.get("METROPLEX_CIRCUIT_BREAKER_THRESHOLD", self.circuit_breaker_threshold))
         except ValueError:
             pass
@@ -214,23 +197,6 @@ class Config:
             self.skylynx_weight = float(os.environ.get("METROPLEX_SKYLYNX_WEIGHT", self.skylynx_weight))
         except ValueError:
             pass
-        try:
-            self.linear_weight = float(os.environ.get("METROPLEX_LINEAR_WEIGHT", self.linear_weight))
-        except ValueError:
-            pass
-        try:
-            self.academy_weight = float(os.environ.get("METROPLEX_ACADEMY_WEIGHT", self.academy_weight))
-        except ValueError:
-            pass
-
-        # Academy
-        self.academy_dir = os.environ.get("METROPLEX_ACADEMY_DIR", self.academy_dir)
-        self.academy_promotions_path = os.environ.get("METROPLEX_ACADEMY_PROMOTIONS_PATH", self.academy_promotions_path)
-
-        # Linear
-        self.linear_team = os.environ.get("METROPLEX_LINEAR_TEAM", self.linear_team)
-        self.linear_label_filter = os.environ.get("METROPLEX_LINEAR_LABEL_FILTER", self.linear_label_filter)
-        self.linear_poll_states = os.environ.get("METROPLEX_LINEAR_POLL_STATES", self.linear_poll_states)
 
         # Spec generation (LLM expansion)
         self.spec_use_llm = os.environ.get("METROPLEX_SPEC_USE_LLM", "").lower() not in ("0", "false", "no")
@@ -345,10 +311,10 @@ class Config:
         except ValueError:
             pass
 
-        # Oz Cloud Agent settings
+        # Build target settings (post-CLEANUP-B: cloud or self_healing only)
         self.build_target = os.environ.get("METROPLEX_BUILD_TARGET", self.build_target)
-        if self.build_target not in ("local", "cloud", "a2a", "auto", "self_healing"):
-            self.build_target = "local"
+        if self.build_target not in ("cloud", "self_healing"):
+            self.build_target = "self_healing"
         self.self_healing_workspace_root = os.environ.get(
             "METROPLEX_SELF_HEALING_WORKSPACE_ROOT",
             getattr(self, "self_healing_workspace_root", ""),
@@ -359,7 +325,6 @@ class Config:
         )
         self.oz_environment_id = os.environ.get("METROPLEX_OZ_ENVIRONMENT_ID", self.oz_environment_id)
         self.oz_build_model = os.environ.get("METROPLEX_OZ_BUILD_MODEL", self.oz_build_model)
-        self.a2a_server_url = os.environ.get("METROPLEX_A2A_SERVER_URL", self.a2a_server_url)
 
 
     def validate(self) -> list[str]:
@@ -378,10 +343,6 @@ class Config:
         for name, path in db_paths:
             if not Path(path).exists():
                 warnings.append(f"{name} not found at {path}")
-
-        # Check yce_dir
-        if not Path(self.yce_dir).exists():
-            warnings.append(f"YCE directory not found at {self.yce_dir}")
 
         # Validate thresholds
         if self.approve_threshold <= self.reject_threshold:
@@ -405,11 +366,8 @@ class Config:
     ratchet_stale_cycles: int = field(default=100)  # Unchanged cycles before decay triggers
     ratchet_decay_amount: float = field(default=0.5)  # How much to loosen per decay step
 
-    # Oz Cloud Agent settings
-    build_target: str = field(default="local")  # local|cloud|a2a|auto
+    # Build target settings (post-CLEANUP-B 2026-05-12: cloud or self_healing only)
+    build_target: str = field(default="self_healing")  # cloud|self_healing
     oz_environment_id: str = field(default="")
     oz_build_model: str = field(default="claude-sonnet-4-6")
-
-    # A2A server settings
-    a2a_server_url: str = field(default="http://127.0.0.1:18900")
 

@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 """
 Metroplex CLI - Autonomous Build Layer Entry Point
-Orchestrates triage, build, and patch gates with safety systems.
+Orchestrates triage and build gates with safety systems.
 """
 import sys
 import os
@@ -17,7 +17,6 @@ from audit import AuditLogger
 from safety import CircuitBreaker, CycleCaps, ShutdownHandler
 from gates.triage import TriageGate
 from gates.build import SpecGenerator, BuildOrchestrator
-from gates.patcher import PatchGate
 from gates.publish import PublishGate
 from gates.readme import ReadmeGate
 from gates.readiness import ReadinessGate
@@ -25,10 +24,7 @@ from gates.review import ReviewGate
 from orchestrator import CycleOrchestrator
 from notifier import create_notifier, FilteredNotifier
 from readers.ideaforge_reader import IdeaForgeReader
-from readers.linear_reader import LinearReader
-from readers.academy_reader import AcademyReader
 from readers.skylynx_reader import SkyLynxReader
-from readers.st_records_reader import STRecordsReader
 from dispatcher import create_dispatcher, route_to_worker, build_dispatch_prompt
 from outcome_emitter import create_outcome_emitter
 from dashboard import compute_funnel_metrics, format_funnel_output
@@ -88,44 +84,10 @@ def initialize_components(config: Config):
         ideaforge_reader = None
 
     try:
-        st_records_reader = STRecordsReader(config.st_records_db)
-    except FileNotFoundError:
-        print(f"Warning: ST Records DB not found at {config.st_records_db}")
-        st_records_reader = None
-
-    try:
         skylynx_reader = SkyLynxReader(config.st_records_db)
     except FileNotFoundError:
         print(f"Warning: ST Records DB not found at {config.st_records_db} (Sky-Lynx reader)")
         skylynx_reader = None
-
-    # Initialize Linear reader (requires ARCADE_API_KEY)
-    import os
-    arcade_key = os.environ.get("ARCADE_API_KEY", "")
-    if arcade_key and config.linear_team:
-        try:
-            linear_reader = LinearReader(
-                arcade_api_key=arcade_key,
-                arcade_user_id=os.environ.get("ARCADE_USER_ID", "agent@local"),
-                team=config.linear_team,
-                label_filter=config.linear_label_filter,
-                poll_states=config.linear_poll_states,
-            )
-        except (ValueError, Exception) as e:
-            print(f"Warning: Linear reader init failed: {e}")
-            linear_reader = None
-    else:
-        linear_reader = None
-        if not arcade_key:
-            pass  # Silent -- Arcade key not configured
-        elif not config.linear_team:
-            pass  # Silent -- no team configured
-
-    # Initialize Academy reader (reads from promotions JSONL file)
-    academy_reader = AcademyReader(
-        promotions_path=config.academy_promotions_path,
-        academy_dir=config.academy_dir,
-    )
 
     # Initialize gates
     triage_gate = TriageGate(
@@ -156,13 +118,6 @@ def initialize_components(config: Config):
         audit_logger=audit_logger,
         ideaforge_reader=ideaforge_reader,
         adapter=build_adapter,
-    )
-
-    patch_gate = PatchGate(
-        config=config,
-        state_db=state_db,
-        st_records_reader=st_records_reader,
-        audit_logger=audit_logger
     )
 
     publish_gate = PublishGate(
@@ -203,21 +158,11 @@ def initialize_components(config: Config):
     # Initialize dispatcher for non-buildable queue items (Sky-Lynx -> ClaudeClaw)
     dispatcher = create_dispatcher(config.dispatch_db, config.dispatch_chat_id)
 
-    # Initialize A2A server manager (if using A2A or auto dispatch)
-    a2a_manager = None
-    if config.build_target in ("a2a", "auto"):
-        from a2a_lifecycle import A2AServerManager
-        a2a_manager = A2AServerManager(
-            yce_dir=config.yce_dir,
-            server_url=config.a2a_server_url,
-        )
-
     # Initialize orchestrator
     orchestrator = CycleOrchestrator(
         config=config,
         triage_gate=triage_gate,
         build_orchestrator=build_orchestrator,
-        patch_gate=patch_gate,
         circuit_breaker=circuit_breaker,
         cycle_caps=cycle_caps,
         shutdown_handler=shutdown_handler,
@@ -226,8 +171,6 @@ def initialize_components(config: Config):
         cycle_sleep_seconds=config.cycle_sleep_seconds,
         notifier=notifier,
         skylynx_reader=skylynx_reader,
-        linear_reader=linear_reader,
-        academy_reader=academy_reader,
         publish_gate=publish_gate,
         review_gate=review_gate,
         dispatcher=dispatcher,
@@ -235,7 +178,6 @@ def initialize_components(config: Config):
         event_emitter=event_emitter,
         readme_gate=readme_gate,
         readiness_gate=readiness_gate,
-        a2a_manager=a2a_manager,
     )
 
     return orchestrator, state_db, circuit_breaker
@@ -364,42 +306,6 @@ def cmd_build(args, config: Config):
         state_db.close()
 
 
-def cmd_patch(args, config: Config):
-    """
-    Run Gate 3 (patch) only.
-
-    Args:
-        args: Parsed command-line arguments
-        config: Metroplex configuration
-
-    Returns:
-        Exit code (0=success, 1=error, 2=halted)
-    """
-    orchestrator, state_db, circuit_breaker = initialize_components(config)
-
-    # Check if gate is halted
-    if circuit_breaker.is_halted("patch"):
-        print("ERROR: Patch gate is halted by circuit breaker")
-        print("Run 'metroplex.py reset --gate patch' to reset")
-        return 2
-
-    try:
-        print("Running Gate 3 (Patch)...")
-        patches = orchestrator.patch_gate.run(dry_run=args.dry_run)
-
-        print(f"\nCompleted: {len(patches)} patches")
-        print(f"  Applied: {sum(1 for p in patches if p.status == 'applied')}")
-        print(f"  Failed: {sum(1 for p in patches if p.status == 'failed')}")
-        print(f"  Skipped: {sum(1 for p in patches if p.status == 'skipped')}")
-
-        return 0
-    except Exception as e:
-        print(f"ERROR: {e}")
-        return 1
-    finally:
-        state_db.close()
-
-
 def cmd_publish(args, config: Config):
     """
     Run Gate 4 (publish) only -- push completed builds to GitHub.
@@ -457,7 +363,7 @@ def cmd_publish(args, config: Config):
 
 def cmd_run_all(args, config: Config):
     """
-    Run full cycle (triage → build → publish → patch).
+    Run full cycle (triage → build → publish).
 
     Args:
         args: Parsed command-line arguments
@@ -485,7 +391,6 @@ def cmd_run_all(args, config: Config):
         print(f"Total triage decisions: {sum(r.triage_count for r in results)}")
         print(f"Total build jobs: {sum(r.build_count for r in results)}")
         print(f"Total published: {sum(r.publish_count for r in results)}")
-        print(f"Total patches: {sum(r.patch_count for r in results)}")
         print(f"Total errors: {sum(len(r.errors) for r in results)}")
 
         return 0
@@ -581,9 +486,9 @@ def cmd_status(args, config: Config):
                 if queue.get(s, 0) > 0:
                     print(f"  {s.capitalize()}: {queue[s]}")
 
-        # Runner status
+        # Build adapter runner status
         runner = status.get("runner_active", False)
-        print(f"\nYCE Runner: {'ACTIVE' if runner else 'idle'}")
+        print(f"\nBuild Runner: {'ACTIVE' if runner else 'idle'}")
 
         # Schedule
         sched = status.get("schedule", {})
@@ -601,7 +506,7 @@ def cmd_status(args, config: Config):
             print(f"  {cycle['cycle_id']}")
             print(f"    Started: {started}")
             print(f"    Completed: {completed}")
-            print(f"    Triage: {cycle['triage_count']}, Build: {cycle['build_count']}, Patch: {cycle['patch_count']}")
+            print(f"    Triage: {cycle['triage_count']}, Build: {cycle['build_count']}")
             if errors:
                 print(f"    Errors: {len(errors)}")
 
@@ -701,6 +606,95 @@ def cmd_retry(args, config: Config):
         state_db.close()
 
 
+def cmd_recover(args, config: Config):
+    """Re-enable a fully-retry-exhausted build (count_failed_builds >= MAX_RETRIES).
+
+    The `retry` command only flips the latest failed row to queued, which is
+    insufficient at the exhaustion ceiling because get_retryable_builds() counts
+    failed rows directly. This command deletes the most-recent failed rows so
+    the count drops below MAX_RETRIES (one retry slot opens), and re-pends the
+    matching priority_queue row. Optionally also cleans workspace + failed/
+    queue files for a fresh dispatch.
+    """
+    import re as _re
+    import shutil
+    from pathlib import Path
+
+    base_job_id = args.base_job_id
+    if _re.search(r"-r\d+$", base_job_id):
+        print(f"ERROR: --base-job-id must not have a -rN suffix; got {base_job_id!r}")
+        return 1
+
+    state_db = StateDB()
+    state_db.connect()
+
+    try:
+        cursor = state_db.conn.cursor()
+        cursor.execute(
+            "SELECT queue_job_id, status, retry_count, next_retry_at "
+            "FROM build_jobs WHERE base_job_id = ? ORDER BY id",
+            (base_job_id,),
+        )
+        rows = cursor.fetchall()
+        if not rows:
+            print(f"No build_jobs rows found for base_job_id: {base_job_id}")
+            return 1
+        failed_count = sum(1 for r in rows if r["status"] == "failed")
+
+        print(f"Base job: {base_job_id}")
+        print(f"  Total rows: {len(rows)}  (failed: {failed_count})")
+        for r in rows:
+            tag = "  [will delete]" if r["status"] == "failed" else ""
+            print(f"    {r['queue_job_id']:<40} status={r['status']:<10} retry_count={r['retry_count']} next_retry_at={r['next_retry_at'] or '-':<12}{tag}")
+        print(f"  Plan: keep at most {args.keep_failed} failed row(s); delete {max(0, failed_count - args.keep_failed)}")
+        if args.clean_workspace:
+            print("  + Will rm -rf workspace dirs for deleted attempts")
+        if args.clean_failed_queue:
+            print("  + Will rm matching queue files from data/self_healing_queue/failed/")
+
+        if not args.yes:
+            try:
+                resp = input("\nProceed? [y/N] ").strip().lower()
+            except EOFError:
+                resp = ""
+            if resp not in ("y", "yes"):
+                print("Aborted.")
+                return 1
+
+        result = state_db.soft_reset_attempts(base_job_id, keep_max_failed=args.keep_failed)
+
+        print()
+        print(f"Deleted {result['deleted_count']} failed build_jobs row(s):")
+        for qj in result["deleted_queue_job_ids"]:
+            print(f"  - {qj}")
+        print(f"Retained {result['retained_failed_count']} failed row(s)")
+        if result["priority_queue_id"]:
+            print(f"Re-pended priority_queue id={result['priority_queue_id']} (source={result['source']}, source_id={result['source_id']})")
+        else:
+            print("WARNING: no matching priority_queue row found — build_jobs were trimmed but the queue won't re-dispatch automatically.")
+
+        # Optional filesystem cleanup. Best-effort; we already mutated the DB.
+        if args.clean_workspace or args.clean_failed_queue:
+            workspaces_root = Path("data/self_healing_workspaces")
+            failed_root = Path("data/self_healing_queue/failed")
+            for qj in result["deleted_queue_job_ids"]:
+                if args.clean_workspace:
+                    ws = workspaces_root / qj
+                    if ws.exists():
+                        shutil.rmtree(ws)
+                        print(f"Removed workspace: {ws}")
+                if args.clean_failed_queue:
+                    # Match both metroplex-...-rN.json AND metroplex-...-rN_attemptN_TIMESTAMP.json
+                    for f in failed_root.glob(f"{qj}*.json"):
+                        f.unlink()
+                        print(f"Removed failed queue file: {f}")
+
+        print("\nBuild will be re-dispatched on the next orchestrator cycle.")
+        return 0
+    finally:
+        state_db.close()
+
+
 def cmd_cost(args, config: Config):
     """Show cost tracking summary."""
     state_db = StateDB()
@@ -794,7 +788,7 @@ def cmd_reset(args, config: Config):
 
     try:
         if args.gate == "all":
-            gates = ["triage", "build", "publish", "patch"]
+            gates = ["triage", "build", "publish"]
         else:
             gates = [args.gate]
 
@@ -1070,8 +1064,10 @@ def cmd_score_builds(args, config: Config):
         state_db.connect()
         cursor = state_db.conn.cursor()
 
+        # R-A item 3: select scoring_rubric so we can forward it to score_project.
+        # NULL rows -> rubric=None -> backward-compat (no category gate applied).
         cursor.execute("""
-            SELECT DISTINCT b.queue_job_id, b.title, b.project_dir, b.quality_score
+            SELECT DISTINCT b.queue_job_id, b.title, b.project_dir, b.quality_score, b.scoring_rubric
             FROM build_jobs b
             WHERE b.status = 'completed'
             AND b.id IN (SELECT MAX(id) FROM build_jobs GROUP BY queue_job_id)
@@ -1094,17 +1090,24 @@ def cmd_score_builds(args, config: Config):
                     print(f"  Skip (no dir): {row['title']}")
                 continue
 
-            breakdown = score_project(Path(project_dir))
+            rubric = row["scoring_rubric"]
+            breakdown = score_project(Path(project_dir), scoring_rubric=rubric)
+
+            # When the life_domain category gate fired, surface the reason
+            # in the operator-visible output so the 0/100 is not opaque.
+            gate_hint = ""
+            if breakdown.category_failed:
+                gate_hint = f", CATEGORY_FAILED={breakdown.category_failure_reason}"
 
             if args.dry_run:
                 print(f"  [DRY RUN] {row['title']}: {breakdown.total_score}/100 "
                       f"(static={breakdown.static_score}, src={breakdown.source_file_count}, "
-                      f"tests={breakdown.test_file_count})")
+                      f"tests={breakdown.test_file_count}{gate_hint})")
             else:
                 state_db.update_build_quality_score(row["queue_job_id"], breakdown.total_score)
                 print(f"  {row['title']}: {breakdown.total_score}/100 "
                       f"(static={breakdown.static_score}, src={breakdown.source_file_count}, "
-                      f"tests={breakdown.test_file_count})")
+                      f"tests={breakdown.test_file_count}{gate_hint})")
             scored += 1
 
         action = "Would score" if args.dry_run else "Scored"
@@ -1466,12 +1469,8 @@ def main():
     publish_parser = subparsers.add_parser("publish", help="Run Gate 4 (publish) -- push builds to GitHub")
     publish_parser.add_argument("--dry-run", action="store_true", help="Show what would be published without creating repos")
 
-    # patch command
-    patch_parser = subparsers.add_parser("patch", help="Run Gate 3 (patch) only")
-    patch_parser.add_argument("--dry-run", action="store_true", help="Print patches without applying")
-
     # run-all command
-    run_all_parser = subparsers.add_parser("run-all", help="Run full cycle (triage → build → publish → patch)")
+    run_all_parser = subparsers.add_parser("run-all", help="Run full cycle (triage → build → publish)")
     run_all_parser.add_argument("--dry-run", action="store_true", help="Run in dry-run mode")
     run_all_parser.add_argument("--cycles", type=int, default=1, help="Number of cycles (0=infinite)")
 
@@ -1486,7 +1485,7 @@ def main():
     dispatch_parser.add_argument("--dry-run", action="store_true", help="Show what would be dispatched")
     dispatch_parser.add_argument("--item-id", type=int, help="Dispatch specific queue item by ID")
     dispatch_parser.add_argument("--count", type=int, default=1, help="Number of items to dispatch (default: 1)")
-    dispatch_parser.add_argument("--worker", choices=["starscream", "ravage", "soundwave", "astrotrain", "default"],
+    dispatch_parser.add_argument("--worker", choices=["ravage", "soundwave", "default"],
                                 help="Override auto-routed worker type")
 
     # builds command
@@ -1495,6 +1494,36 @@ def main():
     # retry command
     retry_parser = subparsers.add_parser("retry", help="Re-dispatch a failed build")
     retry_parser.add_argument("build_id", help="Queue job ID to retry (e.g. metroplex-ideaforge-79)")
+
+    # recover command — re-enable a fully-exhausted build (count_failed >= MAX_RETRIES)
+    recover_parser = subparsers.add_parser(
+        "recover",
+        help="Re-enable a fully-retry-exhausted build by trimming failed rows + re-pending priority_queue",
+    )
+    recover_parser.add_argument(
+        "--base-job-id",
+        required=True,
+        help="Base job ID without -rN suffix (e.g. metroplex-ideaforge-427)",
+    )
+    recover_parser.add_argument(
+        "--keep-failed",
+        type=int,
+        default=2,
+        help="How many failed build_jobs rows to retain (default: 2; leaves 3 retry slots vs MAX_RETRIES=5). Use 0 to also clear the 'abandoned' sentinel.",
+    )
+    recover_parser.add_argument(
+        "--clean-workspace",
+        action="store_true",
+        help="Also rm -rf data/self_healing_workspaces/<base>-rN/ for the deleted attempts",
+    )
+    recover_parser.add_argument(
+        "--clean-failed-queue",
+        action="store_true",
+        help="Also remove matching files from data/self_healing_queue/failed/ (incl. _attemptN_TIMESTAMP.json variants)",
+    )
+    recover_parser.add_argument(
+        "--yes", "-y", action="store_true", help="Skip confirmation prompt",
+    )
 
     # cost command
     cost_parser = subparsers.add_parser("cost", help="Show cost tracking summary")
@@ -1521,7 +1550,7 @@ def main():
 
     # reset command
     reset_parser = subparsers.add_parser("reset", help="Reset circuit breaker")
-    reset_parser.add_argument("--gate", required=True, choices=["triage", "build", "publish", "patch", "all"], help="Gate to reset")
+    reset_parser.add_argument("--gate", required=True, choices=["triage", "build", "publish", "all"], help="Gate to reset")
 
     # recalibrate command
     recalibrate_parser = subparsers.add_parser("recalibrate", help="Force-reset quality ratchet threshold to current proposed value")
@@ -1567,8 +1596,6 @@ def main():
         sys.exit(cmd_build(args, config))
     elif args.command == "publish":
         sys.exit(cmd_publish(args, config))
-    elif args.command == "patch":
-        sys.exit(cmd_patch(args, config))
     elif args.command == "run-all":
         # Single-instance lock: prevent dual metroplex daemons writing to
         # the same SQLite DB (Bug 2 — April 3 orphan process).
@@ -1587,6 +1614,8 @@ def main():
         sys.exit(cmd_builds(args, config))
     elif args.command == "retry":
         sys.exit(cmd_retry(args, config))
+    elif args.command == "recover":
+        sys.exit(cmd_recover(args, config))
     elif args.command == "cost":
         sys.exit(cmd_cost(args, config))
     elif args.command == "postmortems":

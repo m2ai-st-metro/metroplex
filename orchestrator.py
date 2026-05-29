@@ -1,6 +1,6 @@
 """
 Metroplex Cycle Orchestrator
-Sequences all four gates into cycles with safety systems integration.
+Sequences triage / build / publish gates into cycles with safety systems integration.
 Includes notifications, schedule windows, and priority queue dispatch.
 """
 import json
@@ -19,17 +19,14 @@ from audit import AuditLogger
 from safety import BudgetEnforcer, CircuitBreaker, CycleCaps, ShutdownHandler
 from gates.triage import TriageGate
 from gates.build import BuildOrchestrator
-from gates.patcher import PatchGate
 from gates.publish import PublishGate
 from gates.readme import ReadmeGate
 from gates.readiness import ReadinessGate
 from gates.review import ReviewGate
 from notifier import Notifier, LogNotifier
 from dispatcher import Dispatcher, LogDispatcher, route_to_worker, build_dispatch_prompt
-from readers.academy_reader import AcademyReader
 from oz_bridge import poll_oz_run
 from readers.skylynx_reader import SkyLynxReader
-from readers.linear_reader import LinearReader
 from outcome_emitter import OutcomeEmitter
 from event_emitter import EventEmitter
 from gates.quality_scorer import score_project
@@ -44,14 +41,13 @@ logger = logging.getLogger(__name__)
 
 
 class CycleOrchestrator:
-    """Orchestrates full Metroplex cycles (triage -> build -> publish -> patch)."""
+    """Orchestrates full Metroplex cycles (triage -> build -> publish)."""
 
     def __init__(
         self,
         config: Config,
         triage_gate: TriageGate,
         build_orchestrator: BuildOrchestrator,
-        patch_gate: PatchGate,
         circuit_breaker: CircuitBreaker,
         cycle_caps: CycleCaps,
         shutdown_handler: ShutdownHandler,
@@ -60,8 +56,6 @@ class CycleOrchestrator:
         cycle_sleep_seconds: int = 60,
         notifier: Notifier | None = None,
         skylynx_reader: SkyLynxReader | None = None,
-        linear_reader: LinearReader | None = None,
-        academy_reader: AcademyReader | None = None,
         publish_gate: PublishGate | None = None,
         review_gate: ReviewGate | None = None,
         dispatcher: Dispatcher | None = None,
@@ -69,7 +63,6 @@ class CycleOrchestrator:
         event_emitter: EventEmitter | None = None,
         readme_gate: ReadmeGate | None = None,
         readiness_gate: ReadinessGate | None = None,
-        a2a_manager=None,
     ):
         """
         Initialize Cycle Orchestrator.
@@ -78,7 +71,6 @@ class CycleOrchestrator:
             config: Metroplex configuration
             triage_gate: TriageGate instance
             build_orchestrator: BuildOrchestrator instance
-            patch_gate: PatchGate instance
             circuit_breaker: CircuitBreaker instance
             cycle_caps: CycleCaps instance
             shutdown_handler: ShutdownHandler instance
@@ -87,8 +79,6 @@ class CycleOrchestrator:
             cycle_sleep_seconds: Sleep duration between cycles (default 60)
             notifier: Notification backend (defaults to LogNotifier)
             skylynx_reader: SkyLynxReader instance (optional, enables Sky-Lynx intake)
-            linear_reader: LinearReader instance (optional, enables Linear intake)
-            academy_reader: AcademyReader instance (optional, enables Academy promotion intake)
             publish_gate: PublishGate instance (optional, enables Gate 4)
             review_gate: ReviewGate instance (optional, enables Gate 4.5 code review)
             dispatcher: Dispatcher for routing non-buildable items to ClaudeClaw workers
@@ -100,7 +90,6 @@ class CycleOrchestrator:
         self.config = config
         self.triage_gate = triage_gate
         self.build_orchestrator = build_orchestrator
-        self.patch_gate = patch_gate
         self.publish_gate = publish_gate
         self.review_gate = review_gate
         self.circuit_breaker = circuit_breaker
@@ -111,14 +100,11 @@ class CycleOrchestrator:
         self.cycle_sleep_seconds = cycle_sleep_seconds
         self.notifier = notifier or LogNotifier()
         self.skylynx_reader = skylynx_reader
-        self.linear_reader = linear_reader
-        self.academy_reader = academy_reader
         self.dispatcher = dispatcher or LogDispatcher()
         self.outcome_emitter = outcome_emitter
         self.event_emitter = event_emitter
         self.readme_gate = readme_gate
         self.readiness_gate = readiness_gate
-        self.a2a_manager = a2a_manager
         # IdeaForge writer for build outcome feedback (L5 B3)
         try:
             self.ideaforge_writer = IdeaForgeWriter(config.ideaforge_db)
@@ -353,114 +339,6 @@ class CycleOrchestrator:
 
         return count
 
-    def ingest_linear(self, dry_run: bool = False) -> int:
-        """
-        Ingest issues from Linear into the priority queue.
-
-        Linear issues bypass triage (they are already triaged in Linear)
-        and enqueue directly with linear_weight applied.
-
-        Args:
-            dry_run: If True, count items but don't write to DB
-
-        Returns:
-            Number of issues enqueued
-        """
-        if self.linear_reader is None:
-            return 0
-
-        try:
-            issues = self.linear_reader.get_issues()
-        except Exception as e:
-            self.audit_logger.log_error("linear_intake", f"Failed to read issues: {e}")
-            return 0
-
-        if not issues:
-            return 0
-
-        count = 0
-        for issue in issues:
-            base_score = self.linear_reader.priority_to_score(issue.get("priority", 0))
-            priority_score = base_score * self.config.linear_weight
-            idea = self.linear_reader.issue_to_idea(issue)
-
-            item = PriorityItem(
-                source="linear",
-                source_id=issue["identifier"],
-                title=issue["title"],
-                description=issue.get("description", issue["title"]) or issue["title"],
-                priority_score=priority_score,
-                idea_data=json.dumps(idea, default=str),
-            )
-
-            if dry_run:
-                print(f"  [DRY RUN] Would enqueue Linear: {issue['identifier']} {issue['title']} (score={priority_score:.1f})")
-                count += 1
-            else:
-                row_id = self.state_db.enqueue_item(item)
-                if row_id > 0:
-                    count += 1  # Linear has no write-back (no "mark dispatched")
-
-        return count
-
-    def ingest_academy(self, dry_run: bool = False) -> int:
-        """
-        Ingest pending Academy persona promotions into the priority queue.
-
-        Academy promotions bypass triage (they are pre-validated by graduation
-        gates) and enqueue directly with academy_weight applied.
-
-        Args:
-            dry_run: If True, count items but don't write to DB
-
-        Returns:
-            Number of promotions enqueued
-        """
-        if self.academy_reader is None:
-            return 0
-
-        try:
-            promotions = self.academy_reader.get_pending_promotions()
-        except Exception as e:
-            self.audit_logger.log_error("academy_intake", f"Failed to read promotions: {e}")
-            return 0
-
-        if not promotions:
-            return 0
-
-        count = 0
-        for promo in promotions:
-            base_score = self.academy_reader.priority_to_score(promo.get("priority", "high"))
-            priority_score = base_score * self.config.academy_weight
-            idea = self.academy_reader.promotion_to_idea(promo)
-
-            item = PriorityItem(
-                source="academy",
-                source_id=promo.get("promotion_id", f"promo-{promo.get('persona_id', 'unknown')}"),
-                title=f"{promo.get('persona_name', promo.get('persona_id', 'unknown'))} - Agent Build",
-                description=idea["description"],
-                priority_score=priority_score,
-                idea_data=json.dumps(idea, default=str),
-            )
-
-            if dry_run:
-                print(f"  [DRY RUN] Would enqueue Academy: {item.title} (score={priority_score:.1f})")
-                count += 1
-            else:
-                row_id = self.state_db.enqueue_item(item)
-                if row_id > 0:
-                    # Mark as dispatched in promotions JSONL
-                    try:
-                        self.academy_reader.mark_dispatched(promo.get("promotion_id", ""))
-                    except Exception as e:
-                        self.audit_logger.log_error(
-                            "academy_intake",
-                            f"Failed to mark {promo.get('promotion_id')} dispatched: {e}"
-                        )
-                    count += 1
-
-        return count
-
     def _reset_priority_queue_for_retry(self, queue_job_id: str):
         """Reset the priority_queue item to 'pending' for a retried build.
 
@@ -473,7 +351,7 @@ class CycleOrchestrator:
         parts = base_id.split("-", 2)
         source = None
         source_id = None
-        if len(parts) >= 3 and parts[0] == "metroplex" and parts[1] in ("ideaforge", "skylynx", "linear", "academy"):
+        if len(parts) >= 3 and parts[0] == "metroplex" and parts[1] in ("ideaforge", "skylynx"):
             source = parts[1]
             source_id = parts[2]
         elif len(parts) == 2 and parts[0] == "metroplex" and parts[1].isdigit():
@@ -490,11 +368,204 @@ class CycleOrchestrator:
             )
             self.state_db.conn.commit()
 
+    def _process_auto_retries(self) -> None:
+        """Abandon exhausted builds and re-dispatch retryable ones (Phase 13f).
+
+        Extracted from run_cycle for testability. Two steps:
+          1. Abandon builds that have exhausted MAX_RETRIES (the ONLY place a
+             non-deterministic failure is abandoned for retry-count reasons).
+          2. Re-dispatch builds whose backoff has elapsed.
+
+        A non-exhausted build is NEVER abandoned by the retry path. Earlier this
+        method abandoned a build whenever ``mark_build_for_retry`` returned
+        False, conflating "already scheduled for a backoff window" with "stuck".
+        Because the per-row guard in ``mark_build_for_retry`` returns False for
+        any row already carrying ``next_retry_at`` — exactly the rows whose
+        backoff has now elapsed and that ``get_retryable_builds`` re-surfaces —
+        this stranded builds with retry slots still open (idea-436: abandoned
+        with 2 failures against MAX_RETRIES=5, priority_queue left at
+        'dispatched'). The correct action for a non-exhausted build is to
+        re-pend the priority_queue row so Gate 2 picks it up.
+        """
+        try:
+            # 1. Abandon builds that have exhausted all retries
+            exhausted = self.state_db.get_exhausted_builds()
+            for build in exhausted:
+                queue_job_id = build["queue_job_id"]
+                if self.state_db.mark_build_abandoned(queue_job_id):
+                    print(f"  ABANDONED (max {self.state_db.MAX_RETRIES} retries): {build['title']} ({queue_job_id})")
+                    self.audit_logger.log_decision(
+                        "build", "max_retries_exceeded",
+                        {
+                            "queue_job_id": queue_job_id,
+                            "title": build["title"],
+                            "max_retries": self.state_db.MAX_RETRIES,
+                        },
+                    )
+                    self.notifier.notify(
+                        f"Build ABANDONED after {self.state_db.MAX_RETRIES} retries: {build['title']}",
+                        "error",
+                    )
+                    if self.outcome_emitter:
+                        self.outcome_emitter.emit(
+                            idea_id=int(build["idea_id"]) if str(build["idea_id"]).isdigit() else 0,
+                            idea_title=build["title"],
+                            outcome="build_failed",
+                            build_outcome=f"max_retries_exceeded: {queue_job_id}",
+                            tags=["build", "abandoned"],
+                        )
+                    # Close feedback loops for abandoned builds (L5 B2+B3)
+                    try:
+                        resolve_prediction(self.state_db, queue_job_id, "failure")
+                        idea_id = int(build["idea_id"]) if str(build["idea_id"]).isdigit() else None
+                        if idea_id:
+                            self._write_ideaforge_outcome(idea_id, "build_failed")
+                    except Exception as e:
+                        import logging
+                        logging.getLogger(__name__).warning(
+                            "Failed to close feedback loop for abandoned build %s: %s",
+                            queue_job_id, e,
+                        )
+
+            # 2. Retry builds that haven't exhausted retries and whose backoff has expired
+            #    Skip deterministic failures (dependency, test, build errors) — retrying won't help
+            retryable = self.state_db.get_retryable_builds()
+            for build in retryable:
+                queue_job_id = build["queue_job_id"]
+                if not self.state_db.is_retryable_failure(queue_job_id):
+                    category = self.state_db.get_failure_category(queue_job_id)
+                    print(f"  Skip retry (deterministic {category}): {build['title']} ({queue_job_id})")
+                    self.audit_logger.log_decision(
+                        "build", "skip_retry_deterministic",
+                        {"queue_job_id": queue_job_id, "failure_category": category}
+                    )
+                    self.state_db.mark_build_abandoned(queue_job_id)
+                    continue
+                if self.state_db.mark_build_for_retry(queue_job_id):
+                    retry_num = (build.get("retry_count") or 0) + 1
+                    print(f"  Auto-retry #{retry_num}: {build['title']} ({queue_job_id})")
+                    self.audit_logger.log_decision(
+                        "build", "auto_retry",
+                        {"queue_job_id": queue_job_id, "retry_count": retry_num}
+                    )
+                    self.notifier.notify(
+                        f"Build auto-retry #{retry_num}: {build['title']}"
+                    )
+                    # Reset priority_queue to 'pending' so run_from_queue
+                    # re-dispatches on the next cycle (backoff already enforced
+                    # by get_retryable_builds checking next_retry_at).
+                    self._reset_priority_queue_for_retry(queue_job_id)
+                else:
+                    # mark_build_for_retry returned False. Two cases:
+                    #   (a) genuinely exhausted -> step 1 (get_exhausted_builds)
+                    #       owns the abandon; do nothing here.
+                    #   (b) the row was already stamped with next_retry_at on a
+                    #       prior cycle and its backoff window has now elapsed
+                    #       (get_retryable_builds only returns next_retry_at<=now).
+                    #       This is NOT a stuck build -- it needs RE-DISPATCH, not
+                    #       abandonment. Re-pend the priority_queue row (which may
+                    #       be stranded at 'dispatched' or 'failed') so Gate 2
+                    #       picks it up. The MAX_RETRIES cap in get_retryable_builds
+                    #       still bounds the total number of real attempts.
+                    if self.state_db.has_exhausted_retries(build.get("base_job_id", queue_job_id)):
+                        # Exhausted: leave for get_exhausted_builds to abandon cleanly.
+                        continue
+                    print(f"  Re-dispatch (backoff elapsed, row already scheduled): {build['title']} ({queue_job_id})")
+                    self.audit_logger.log_decision(
+                        "build", "retry_redispatch",
+                        {"queue_job_id": queue_job_id, "title": build["title"]}
+                    )
+                    self._reset_priority_queue_for_retry(queue_job_id)
+        except Exception as e:
+            self.audit_logger.log_error("build", f"Auto-retry check failed: {e}")
+
+    def _reap_stuck_builds(self) -> int:
+        """Reap builds wedged in 'started' past the build timeout (S5).
+
+        ``health._check_stuck_builds`` only emits a CRIT alert; nothing ever
+        transitioned a wedged 'started' row, so a build whose runner died
+        mid-flight rotted indefinitely (idea-441 sat 'started' for 333h). This
+        reaper marks each stale row 'failed' and leaves it for the auto-retry
+        block (which runs immediately after) to RE-DISPATCH through the normal
+        retry path — never abandoned, unless MAX_RETRIES is genuinely exhausted
+        (get_exhausted_builds owns that, after enough real timeouts).
+
+        Routing through the retry path (rather than abandoning, the way
+        reset_stale_queued_build does for stuck-*queued* rows) is deliberate: a
+        timeout is a transient failure mode, so a wedged build deserves the same
+        backoff-bounded retries as any other transient failure.
+
+        Respects:
+          - circuit breaker: skips entirely when the build gate is halted.
+            Re-dispatch would be blocked downstream anyway, and we don't want to
+            manufacture retry churn on a deliberately-halted gate.
+          - per-cycle cap: reaps at most ``max_approve_per_cycle`` builds per
+            cycle and logs how many were deferred (no silent truncation).
+
+        Returns:
+            Number of builds actually reaped this cycle.
+        """
+        if self.circuit_breaker.is_halted("build"):
+            return 0
+
+        try:
+            stuck = self.state_db.get_stuck_started_builds(
+                self.config.build_timeout_seconds
+            )
+        except Exception as e:
+            self.audit_logger.log_error("build", f"Stuck-build reap query failed: {e}")
+            return 0
+
+        if not stuck:
+            return 0
+
+        cap = self.config.max_approve_per_cycle
+        reaped = 0
+        for build in stuck[:cap]:
+            queue_job_id = build["queue_job_id"]
+            try:
+                if self.state_db.update_build_job_status(queue_job_id, "failed"):
+                    reaped += 1
+                    print(
+                        f"  REAPED stuck build (>{self.config.build_timeout_seconds}s "
+                        f"in 'started'): {build['title']} ({queue_job_id})"
+                    )
+                    self.audit_logger.log_decision(
+                        "build", "reaped_stuck_build",
+                        {
+                            "queue_job_id": queue_job_id,
+                            "title": build["title"],
+                            "queued_at": build["queued_at"],
+                            "timeout_seconds": self.config.build_timeout_seconds,
+                        },
+                    )
+                    self.notifier.notify(
+                        f"Reaped stuck build (timeout): {build['title']}",
+                        "warning",
+                    )
+            except Exception as e:
+                self.audit_logger.log_error(
+                    "build", f"Failed to reap stuck build {queue_job_id}: {e}"
+                )
+
+        overflow = len(stuck) - cap
+        if overflow > 0:
+            print(
+                f"  Reaper cap hit: reaped {reaped}/{len(stuck)} stuck build(s) "
+                f"this cycle (cap={cap}); {overflow} deferred to next cycle"
+            )
+            self.audit_logger.log_decision(
+                "build", "reap_cap_deferred",
+                {"total_stuck": len(stuck), "reaped": reaped, "cap": cap},
+            )
+
+        return reaped
+
     def dispatch_queue_items(self, dry_run: bool = False) -> int:
         """
         Dispatch non-buildable priority queue items to ClaudeClaw workers.
 
-        Buildable items (ideaforge/linear/academy) are handled by Gate 2 (build).
+        Buildable items (ideaforge) are handled by Gate 2 (build).
         Non-buildable items (skylynx) route to ClaudeClaw workers via the dispatcher.
 
         Args:
@@ -672,11 +743,76 @@ class CycleOrchestrator:
 
         return result
 
+    def _score_review_pass_builds(self, review_results, dry_run: bool = False) -> int:
+        """Score builds that passed the review gate.
+
+        Extracted from run_cycle (Phase 14b inline loop) for testability and
+        to centralize the scoring_rubric forwarding (R-A item 3, 2026-05-12).
+
+        For each review result with verdict='pass':
+          1. Look up the build_jobs row by queue_job_id.
+          2. Skip rows missing project_dir or where the dir does not exist.
+          3. Read scoring_rubric from the build row (NULL -> no rubric arg
+             effect; passed through as None which score_project short-circuits).
+          4. Call score_project(project_dir, scoring_rubric=rubric).
+          5. Persist the resulting total_score (unless dry_run).
+          6. Emit an audit-log decision with quality_score, breakdown, and
+             — when the life_domain category gate fired —
+             category_failure_reason for operator visibility.
+
+        Args:
+            review_results: Iterable of review results (objects with
+                .verdict, .queue_job_id, .title attributes).
+            dry_run: If True, skip DB writes (audit-log still emits).
+
+        Returns:
+            Number of builds for which scoring was actually attempted
+            (i.e. had a project_dir on disk).
+        """
+        scored_builds = 0
+        for r in review_results:
+            if r.verdict != "pass":
+                continue
+            build = self.state_db.get_build_by_queue_job_id(r.queue_job_id)
+            if not build or not build.get("project_dir"):
+                continue
+            project_dir = Path(build["project_dir"])
+            if not project_dir.is_dir():
+                continue
+
+            # R-A item 3: read scoring_rubric from the build row and forward
+            # it to the scorer. NULL -> None -> backward-compat (no gate).
+            # 'life_domain' -> gate fires when agent shape is missing.
+            # 'tech' -> gate bypassed (publish-path safe).
+            rubric = build.get("scoring_rubric") if isinstance(build, dict) else None
+            breakdown = score_project(project_dir, scoring_rubric=rubric)
+            if not dry_run:
+                self.state_db.update_build_quality_score(
+                    r.queue_job_id, breakdown.total_score,
+                )
+            scored_builds += 1
+            self.audit_logger.log_decision(
+                gate="quality",
+                action="scored",
+                details={
+                    "queue_job_id": r.queue_job_id,
+                    "title": r.title,
+                    "quality_score": breakdown.total_score,
+                    "static_score": breakdown.static_score,
+                    "source_files": breakdown.source_file_count,
+                    "test_files": breakdown.test_file_count,
+                    "scoring_rubric": rubric,
+                    "category_failed": breakdown.category_failed,
+                    "category_failure_reason": breakdown.category_failure_reason,
+                },
+            )
+        return scored_builds
+
     def run_cycle(self, dry_run: bool = False) -> CycleResult:
         """
-        Run a single Metroplex cycle: intake -> triage -> build -> patch.
+        Run a single Metroplex cycle: intake -> triage -> build -> publish.
 
-        Intake: Sky-Lynx + Linear (bypass triage, direct to queue).
+        Intake: Sky-Lynx (bypass triage, direct to queue).
         Build gate pulls from the priority queue (populated by triage + intake).
 
         Args:
@@ -685,10 +821,6 @@ class CycleOrchestrator:
         Returns:
             CycleResult with cycle metrics
         """
-        # Ensure A2A server is running (if manager exists)
-        if self.a2a_manager:
-            self.a2a_manager.ensure_running()
-
         # Generate cycle ID with microseconds to ensure uniqueness
         now = datetime.now()
         cycle_id = f"cycle-{now.strftime('%Y%m%d-%H%M%S')}-{now.microsecond:06d}"
@@ -704,7 +836,6 @@ class CycleOrchestrator:
 
         triage_count = 0
         build_count = 0
-        patch_count = 0
         errors = []
         outcome_count_before = self.outcome_emitter.emit_count if self.outcome_emitter else 0
 
@@ -720,18 +851,6 @@ class CycleOrchestrator:
         if skylynx_count > 0:
             print(f"+ Sky-Lynx intake: {skylynx_count} recommendations enqueued")
             self.notifier.notify(f"Sky-Lynx: {skylynx_count} recommendations enqueued")
-
-        # Linear Intake (enqueue issues directly into priority queue)
-        linear_count = self.ingest_linear(dry_run=dry_run)
-        if linear_count > 0:
-            print(f"+ Linear intake: {linear_count} issues enqueued")
-            self.notifier.notify(f"Linear: {linear_count} issues enqueued")
-
-        # Academy Intake (enqueue persona promotions directly into priority queue)
-        academy_count = self.ingest_academy(dry_run=dry_run)
-        if academy_count > 0:
-            print(f"+ Academy intake: {academy_count} promotions enqueued")
-            self.notifier.notify(f"Academy: {academy_count} persona promotions enqueued")
 
         # Gate 1: Triage (scores ideas, enqueues approved into priority_queue)
         if self.circuit_breaker.is_halted("triage"):
@@ -808,7 +927,7 @@ class CycleOrchestrator:
             print(f"! {budget_msg} — skipping builds this cycle")
             self.notifier.notify(f"BUDGET EXCEEDED: {budget_msg}", "error")
 
-        # Gate 2: Build (pulls from priority queue, dispatches to YCE Harness)
+        # Gate 2: Build (pulls from priority queue, dispatches via the configured BuildAdapter)
         if not budget_ok:
             pass  # Skip build gate when over budget
         elif self.circuit_breaker.is_halted("build"):
@@ -908,7 +1027,7 @@ class CycleOrchestrator:
                                 idea_id=int(build["idea_id"]) if str(build["idea_id"]).isdigit() else 0,
                                 idea_title=build["title"],
                                 outcome="build_failed",
-                                build_outcome=f"yce_build_failed: {job_id}",
+                                build_outcome=f"build_failed: {job_id}",
                                 tags=["build"],
                             )
 
@@ -951,89 +1070,16 @@ class CycleOrchestrator:
             except Exception as e:
                 self.audit_logger.log_error("build", f"Oz build poll failed: {e}")
 
-        # Auto-retry failed builds (Phase 13f, hardened against infinite loops)
+        # Reap builds wedged in 'started' past the build timeout (S5). Runs
+        # BEFORE auto-retry so reaped rows (now 'failed', next_retry_at=NULL)
+        # are re-dispatched through the normal retry path in the same cycle.
         try:
-            # 1. Abandon builds that have exhausted all retries
-            exhausted = self.state_db.get_exhausted_builds()
-            for build in exhausted:
-                queue_job_id = build["queue_job_id"]
-                if self.state_db.mark_build_abandoned(queue_job_id):
-                    print(f"  ABANDONED (max {self.state_db.MAX_RETRIES} retries): {build['title']} ({queue_job_id})")
-                    self.audit_logger.log_decision(
-                        "build", "max_retries_exceeded",
-                        {
-                            "queue_job_id": queue_job_id,
-                            "title": build["title"],
-                            "max_retries": self.state_db.MAX_RETRIES,
-                        },
-                    )
-                    self.notifier.notify(
-                        f"Build ABANDONED after {self.state_db.MAX_RETRIES} retries: {build['title']}",
-                        "error",
-                    )
-                    if self.outcome_emitter:
-                        self.outcome_emitter.emit(
-                            idea_id=int(build["idea_id"]) if str(build["idea_id"]).isdigit() else 0,
-                            idea_title=build["title"],
-                            outcome="build_failed",
-                            build_outcome=f"max_retries_exceeded: {queue_job_id}",
-                            tags=["build", "abandoned"],
-                        )
-                    # Close feedback loops for abandoned builds (L5 B2+B3)
-                    try:
-                        resolve_prediction(self.state_db, queue_job_id, "failure")
-                        idea_id = int(build["idea_id"]) if str(build["idea_id"]).isdigit() else None
-                        if idea_id:
-                            self._write_ideaforge_outcome(idea_id, "build_failed")
-                    except Exception as e:
-                        import logging
-                        logging.getLogger(__name__).warning(
-                            "Failed to close feedback loop for abandoned build %s: %s",
-                            queue_job_id, e,
-                        )
-
-            # 2. Retry builds that haven't exhausted retries and whose backoff has expired
-            #    Skip deterministic failures (dependency, test, build errors) — retrying won't help
-            retryable = self.state_db.get_retryable_builds()
-            for build in retryable:
-                queue_job_id = build["queue_job_id"]
-                if not self.state_db.is_retryable_failure(queue_job_id):
-                    category = self.state_db.get_failure_category(queue_job_id)
-                    print(f"  Skip retry (deterministic {category}): {build['title']} ({queue_job_id})")
-                    self.audit_logger.log_decision(
-                        "build", "skip_retry_deterministic",
-                        {"queue_job_id": queue_job_id, "failure_category": category}
-                    )
-                    self.state_db.mark_build_abandoned(queue_job_id)
-                    continue
-                if self.state_db.mark_build_for_retry(queue_job_id):
-                    retry_num = (build.get("retry_count") or 0) + 1
-                    print(f"  Auto-retry #{retry_num}: {build['title']} ({queue_job_id})")
-                    self.audit_logger.log_decision(
-                        "build", "auto_retry",
-                        {"queue_job_id": queue_job_id, "retry_count": retry_num}
-                    )
-                    self.notifier.notify(
-                        f"Build auto-retry #{retry_num}: {build['title']}"
-                    )
-                    # Reset priority_queue to 'pending' so run_from_queue
-                    # re-dispatches on the next cycle (backoff already enforced
-                    # by get_retryable_builds checking next_retry_at).
-                    self._reset_priority_queue_for_retry(queue_job_id)
-                else:
-                    # mark_build_for_retry returned False -- either exhausted
-                    # (handled by get_exhausted_builds above) or already marked
-                    # for retry but Gate 2 never picked it up. In the latter
-                    # case, abandon to prevent infinite retry loops.
-                    if not self.state_db.has_exhausted_retries(build.get("base_job_id", queue_job_id)):
-                        print(f"  ABANDON (retry stuck, Gate 2 never consumed): {build['title']} ({queue_job_id})")
-                        self.state_db.mark_build_abandoned(queue_job_id)
-                        self.audit_logger.log_decision(
-                            "build", "retry_stuck_abandoned",
-                            {"queue_job_id": queue_job_id, "title": build["title"]}
-                        )
+            self._reap_stuck_builds()
         except Exception as e:
-            self.audit_logger.log_error("build", f"Auto-retry check failed: {e}")
+            self.audit_logger.log_error("build", f"Stuck-build reaper failed: {e}")
+
+        # Auto-retry failed builds (Phase 13f, hardened against infinite loops)
+        self._process_auto_retries()
 
         # Dispatch: route non-buildable queue items to ClaudeClaw workers
         dispatch_count = 0
@@ -1122,36 +1168,9 @@ class CycleOrchestrator:
         # Quality scoring (Phase 14b) — score builds that passed review
         if review_count > 0:
             try:
-                scored_builds = 0
-                for r in review_results:
-                    if r.verdict != "pass":
-                        continue
-                    build = self.state_db.get_build_by_queue_job_id(r.queue_job_id)
-                    if not build or not build.get("project_dir"):
-                        continue
-                    project_dir = Path(build["project_dir"])
-                    if not project_dir.is_dir():
-                        continue
-
-                    breakdown = score_project(project_dir)
-                    if not dry_run:
-                        self.state_db.update_build_quality_score(
-                            r.queue_job_id, breakdown.total_score,
-                        )
-                    scored_builds += 1
-                    self.audit_logger.log_decision(
-                        gate="quality",
-                        action="scored",
-                        details={
-                            "queue_job_id": r.queue_job_id,
-                            "title": r.title,
-                            "quality_score": breakdown.total_score,
-                            "static_score": breakdown.static_score,
-                            "source_files": breakdown.source_file_count,
-                            "test_files": breakdown.test_file_count,
-                        },
-                    )
-
+                scored_builds = self._score_review_pass_builds(
+                    review_results, dry_run=dry_run,
+                )
                 if scored_builds > 0:
                     print(f"+ Quality scored: {scored_builds} builds")
             except Exception as e:
@@ -1332,30 +1351,6 @@ class CycleOrchestrator:
                 except Exception as e:
                     print(f"x Gate 4.8 (swindle) error: {e}")
 
-        # Gate 3: Patch
-        if self.circuit_breaker.is_halted("patch"):
-            error_msg = "Gate 3 (patch) halted by circuit breaker"
-            errors.append(error_msg)
-            print(f"! {error_msg}")
-            if "patch" not in self._halted_notified:
-                self.notifier.notify(f"ALERT: patch gate halted by circuit breaker", "warning")
-                self._halted_notified.add("patch")
-        else:
-            self._halted_notified.discard("patch")
-            try:
-                print(f"Running Gate 3 (patch)...")
-                patches = self.patch_gate.run(dry_run=dry_run)
-                patch_count = len(patches)
-
-                self.circuit_breaker.record_success("patch")
-                print(f"+ Gate 3 completed: {patch_count} patches")
-            except Exception as e:
-                error_msg = f"Gate 3 (patch) failed: {str(e)}"
-                errors.append(error_msg)
-                print(f"x {error_msg}")
-                self.circuit_breaker.record_failure("patch", error_msg)
-                self.audit_logger.log_error("patch", error_msg)
-
         # Log outcome emission count for this cycle
         if self.outcome_emitter:
             cycle_outcomes = self.outcome_emitter.emit_count - outcome_count_before
@@ -1380,15 +1375,15 @@ class CycleOrchestrator:
             )
 
         # End cycle
-        self.state_db.end_cycle(cycle_id, triage_count, build_count, patch_count, errors, publish_count)
-        self.audit_logger.log_cycle_end(cycle_id, triage_count, build_count, patch_count, errors)
+        self.state_db.end_cycle(cycle_id, triage_count, build_count, 0, errors, publish_count)
+        self.audit_logger.log_cycle_end(cycle_id, triage_count, build_count, 0, errors)
 
         # Only notify on cycles with actual activity or new errors.
         # Suppress summary when the only "errors" are halted-gate messages (already notified once).
         halted_only = all("halted by circuit breaker" in e for e in errors)
         has_activity = (
             triage_count > 0 or build_count > 0 or publish_count > 0
-            or dispatch_count > 0 or patch_count > 0
+            or dispatch_count > 0
         )
         if has_activity or (errors and not halted_only):
             error_text = f", {len(errors)} errors" if errors else ""
@@ -1396,7 +1391,7 @@ class CycleOrchestrator:
             disp_text = f", {dispatch_count} dispatched" if dispatch_count > 0 else ""
             summary_level = "warning" if errors else "info"
             self.notifier.notify(
-                f"Metroplex: {triage_count} triaged, {build_count} built{pub_text}{disp_text}, {patch_count} patched{error_text}",
+                f"Metroplex: {triage_count} triaged, {build_count} built{pub_text}{disp_text}{error_text}",
                 summary_level,
             )
 
@@ -1415,7 +1410,6 @@ class CycleOrchestrator:
         cycle_result.triage_count = triage_count
         cycle_result.build_count = build_count
         cycle_result.publish_count = publish_count
-        cycle_result.patch_count = patch_count
         cycle_result.errors = errors
 
         return cycle_result
@@ -1506,7 +1500,6 @@ class CycleOrchestrator:
             print(f"  Triage: {cycle_result.triage_count}")
             print(f"  Build: {cycle_result.build_count}")
             print(f"  Publish: {cycle_result.publish_count}")
-            print(f"  Patch: {cycle_result.patch_count}")
             print(f"  Errors: {len(cycle_result.errors)}")
 
             # Check if should continue
@@ -1524,10 +1517,6 @@ class CycleOrchestrator:
                     return results
                 time.sleep(1)
 
-        # Stop A2A server on shutdown
-        if self.a2a_manager:
-            self.a2a_manager.stop()
-
         print(f"\nCompleted {cycle_count} cycles")
         return results
 
@@ -1544,7 +1533,7 @@ class CycleOrchestrator:
         self.state_db.connect()
         cursor = self.state_db.conn.cursor()
         cursor.execute("""
-            SELECT cycle_id, started_at, completed_at, triage_count, build_count, patch_count, errors
+            SELECT cycle_id, started_at, completed_at, triage_count, build_count, errors
             FROM cycles
             ORDER BY started_at DESC
             LIMIT 10

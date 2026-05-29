@@ -1,6 +1,6 @@
 # CLAUDE.md — Metroplex
 
-L5 autonomy layer for the ST Metro ecosystem. Closes all human gates in the feedback loop: triage ideas, build projects, apply persona patches, and publish to GitHub.
+L5 autonomy layer for the ST Metro ecosystem. Closes all human gates in the feedback loop: triage ideas, build projects, and publish to GitHub.
 
 ## Setup
 
@@ -20,8 +20,7 @@ All API keys sourced from `~/.env.shared` — no separate `.env` needed.
 ```bash
 source venv/bin/activate
 python metroplex.py triage [--dry-run]                          # Gate 1: score & threshold
-python metroplex.py build [--dry-run] [--idea-id N]             # Gate 2: spec + YCE dispatch
-python metroplex.py patch [--dry-run]                           # Gate 3: persona YAML patches
+python metroplex.py build [--dry-run] [--idea-id N]             # Gate 2: spec + adapter dispatch
 python metroplex.py publish [--dry-run]                         # Gate 4: GitHub repo push
 ```
 
@@ -52,7 +51,6 @@ pytest tests/ -v                          # All 315 tests
 pytest tests/test_orchestrator.py -v      # Orchestrator
 pytest tests/test_triage.py -v            # Triage gate
 pytest tests/test_build.py -v             # Build gate
-pytest tests/test_patcher.py -v           # Patch gate
 pytest tests/test_dispatcher.py -v        # EA-Claude dispatch
 pytest tests/test_continuous.py -v        # Systemd + circuit breakers
 pytest tests/test_safety.py -v            # Circuit breaker, caps, shutdown
@@ -72,13 +70,12 @@ Service unit: `deploy/metroplex.service` — runs `run-all --cycles 0` with `Res
 
 ## Architecture
 
-### Four Gates
+### Gates
 
 | Gate | Class | Purpose |
 |------|-------|---------|
 | 1 Triage | `gates/triage.py` | Score IdeaForge ideas against thresholds, approve/reject/defer |
-| 2 Build | `gates/build.py` | Generate spec via LLM, dispatch to YCE Harness |
-| 3 Patch | `gates/patcher.py` | Apply ST Records persona YAML patches via git clone/commit/push |
+| 2 Build | `gates/build.py` | Generate spec via LLM, dispatch via the configured BuildAdapter (SelfHealing or Oz) |
 | 4 Publish | `gates/publish.py` | Create repos on configured hosts (GitHub `m2ai-portfolio` org and/or GitLab `m2ai-portfolio` group), push completed builds. First entry in `publish_targets` is primary; subsequent entries are mirrors (their URLs go in `publish_jobs.mirror_urls`, per-target outcome in `targets_status`). |
 | 4.5 Review | `gates/review.py` | Automated quality checks before publish (source code, README, no secrets, no large files) |
 
@@ -87,22 +84,26 @@ Service unit: `deploy/metroplex.service` — runs `run-all --cycles 0` with `Res
 | Reader | DB | Access |
 |--------|----|--------|
 | `readers/ideaforge_reader.py` | ideaforge.db | Read + claim (status='classified') |
-| `readers/st_records_reader.py` | persona_metrics.db | Read + patch status updates |
 | `readers/skylynx_reader.py` | persona_metrics.db | Read-only (recommendations) |
-| `readers/linear_reader.py` | Linear API (Arcade) | Read-only |
-| `readers/academy_reader.py` | File system | Read-only (promotions) |
 
 ### Priority Queue
 
 All approved/recommended items compete via weighted scores:
 - IdeaForge: weight 1.0
 - Sky-Lynx: weight 1.5
-- Linear: weight 2.0
-- Academy: weight 2.0
 
-### YCE Dispatch
+### Build Adapter Dispatch
 
-Build gate generates an app spec via LLM, then dispatches to YCE Harness for autonomous build. Timeout watchdog kills builds after 90 min (configurable: `METROPLEX_BUILD_TIMEOUT_SECONDS`).
+Build gate generates an app spec via LLM, then dispatches via the configured BuildAdapter selected by `METROPLEX_BUILD_TARGET`. Valid targets:
+
+| Target | Adapter | Runtime |
+|--------|---------|---------|
+| `self_healing` (default) | `SelfHealingAdapter` | Long-running Claude Code daemon processing the `/self-healing-pipeline` skill |
+| `cloud` | `OzAdapter` | Oz cloud agent via `oz_bridge.submit_to_oz()` |
+
+Legacy targets (`local` yce-harness queue_runner, `a2a` Google A2A protocol via `yce-harness/a2a_server.py`, `auto` a2a/local fallback chain) were retired in CLEANUP-B 2026-05-12. The Google A2A path never dispatched a production build; CCOS / ClaudeClaw owns inter-agent communication via its own `delegateToAgent` primitive.
+
+Timeout watchdog kills builds after 90 min (configurable: `METROPLEX_BUILD_TIMEOUT_SECONDS`).
 
 ### Auto-Retry (Phase 13f)
 
@@ -111,7 +112,7 @@ Failed builds are automatically retried up to 3 times with exponential backoff (
 ### Safety Systems
 
 - **Circuit breaker**: 3 consecutive failures halts a gate. Reset via `metroplex.py reset`.
-- **Cycle caps**: Max 3 approvals, 5 patches, 3 publishes per cycle.
+- **Cycle caps**: Max 3 approvals, 3 publishes per cycle.
 - **Shutdown handler**: SIGTERM triggers finish-current-cycle then clean exit.
 - **Schedule windows**: Hour range + day-of-week filters.
 
@@ -136,8 +137,7 @@ Non-buildable items routed to EA-Claude workers via `WORKER_ROUTES` dict. Writes
 |------|---------|
 | `data/decisions.log` | JSON Lines audit trail (every gate action) |
 | `data/metroplex.log` | Python logging output |
-| `data/runner.log` | YCE queue_runner subprocess output |
-| `data/build_logs/` | Per-build YCE dispatch logs (timestamped) |
+| `data/build_logs/` | Per-build dispatch logs (timestamped) |
 | `data/specs/` | Generated app spec files |
 
 ## Key Environment Variables
@@ -149,7 +149,6 @@ Non-buildable items routed to EA-Claude workers via `WORKER_ROUTES` dict. Writes
 
 ### Cycle Limits
 - `METROPLEX_MAX_APPROVE_PER_CYCLE` (3)
-- `METROPLEX_MAX_PATCHES_PER_CYCLE` (5)
 - `METROPLEX_MAX_PUBLISH_PER_CYCLE` (3)
 - `METROPLEX_MAX_CONCURRENT_BUILDS` (1)
 
@@ -183,9 +182,9 @@ After changing any of these, restart the metroplex service (`systemctl --user re
 ## Design Decisions
 
 1. **No cross-project imports** — reads upstream SQLite directly, no IdeaForge/ST Records code imports
-2. **Subprocess isolation** — YCE builds and git ops run as subprocesses, never in-process
+2. **Subprocess isolation** — git ops run as subprocesses, never in-process
 3. **Score scaling** — IdeaForge 0-10 scaled to 0-100 for threshold intuition (guard validates range)
-4. **Fire-and-forget builds** — YCE dispatch subprocess; results polled on next cycle
+4. **Fire-and-forget builds** — BuildAdapter dispatches asynchronously; results polled on next cycle
 5. **Per-cycle caps** — hard limits prevent runaway autonomy
 6. **Circuit breaker per-gate** — one gate failure doesn't halt others
 
@@ -193,10 +192,8 @@ After changing any of these, restart the metroplex service (`systemctl --user re
 
 ```
 pydantic>=2.0
-jinja2
 pyyaml
 pytest
-arcadepy
 anthropic>=0.40.0
 ```
 
@@ -221,26 +218,6 @@ sqlite3 data/metroplex.db "
   ORDER BY queued_at DESC LIMIT 20;"
 ```
 
-### Cleaning YCE queue.json
-
-The YCE queue runner reads `data/yce_queue/queue.json`. Stale entries accumulate when builds are killed or time out.
-
-```bash
-# Inspect current queue
-cat data/yce_queue/queue.json | python3 -m json.tool
-
-# Remove a specific stale entry (replace JOB_ID)
-python3 -c "
-import json
-with open('data/yce_queue/queue.json') as f: q = json.load(f)
-q = [j for j in q if j.get('job_id') != 'JOB_ID']
-with open('data/yce_queue/queue.json', 'w') as f: json.dump(q, f, indent=2)
-"
-
-# Nuclear option: empty the queue (builds in progress will orphan)
-echo '[]' > data/yce_queue/queue.json
-```
-
 ### Recovering Abandoned Builds
 
 Builds with `next_retry_at = 'abandoned'` are permanently skipped. To allow re-evaluation:
@@ -258,6 +235,27 @@ sqlite3 data/metroplex.db "
   SET next_retry_at = NULL, retry_count = 0, status = 'failed'
   WHERE queue_job_id = 'JOB_ID' AND next_retry_at = 'abandoned';"
 ```
+
+#### ⚠ When the UPDATE recipe is insufficient
+
+The `UPDATE` recipe above only works when `count_failed_builds(base_job_id) < MAX_RETRIES` (default 3). `get_retryable_builds()` counts `status='failed'` rows directly — once you hit 3 failed rows for a `base_job_id`, the build is permanently excluded from retry no matter what `next_retry_at` says.
+
+Use `metroplex.py recover` for this case. It deletes the most-recent failed rows so the count drops below MAX_RETRIES, then re-pends the matching `priority_queue` row.
+
+```bash
+# Re-enable a fully-exhausted build (idea 427, base_job_id derived without -rN suffix)
+python metroplex.py recover --base-job-id metroplex-ideaforge-427
+
+# Also nuke workspace + failed/ queue files for a clean dispatch
+python metroplex.py recover --base-job-id metroplex-ideaforge-427 \
+  --clean-workspace --clean-failed-queue --yes
+```
+
+Note: `data/self_healing_queue/failed/` filenames can appear in two forms:
+- `metroplex-ideaforge-427-r2.json` (queue file moved by daemon after Judge fail)
+- `metroplex-ideaforge-427-r2_attemptN_TIMESTAMP.json` (queue file moved by orchestrator after Ravage review rejection — the `_attemptN_TIMESTAMP` suffix matches `build_jobs.retry_count`)
+
+`metroplex.py recover --clean-failed-queue` globs `<queue_job_id>*.json` so both variants are removed.
 
 ### Resetting Circuit Breakers
 
@@ -416,6 +414,6 @@ journalctl --user -u metroplex -n 100 --no-pager
 # Check decision audit log
 tail -20 data/decisions.log | python3 -m json.tool
 
-# Check for orphan build processes
-ps aux | grep queue_runner
+# Check the self-healing daemon heartbeat
+stat -c '%Y %n' data/self_healing_queue/heartbeat-worker-1.txt
 ```

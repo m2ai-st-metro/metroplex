@@ -10,27 +10,25 @@ logger = logging.getLogger(__name__)
 
 
 def create_adapter(config: Config, event_emitter=None) -> BuildAdapter:
-    """Create the appropriate build adapter based on config.build_target."""
+    """Create the appropriate build adapter based on config.build_target.
+
+    Valid targets (post-CLEANUP-B 2026-05-12):
+      - 'self_healing': SelfHealingAdapter (Claude Code daemon, default)
+      - 'cloud': OzAdapter (Oz cloud agent)
+
+    The legacy 'local' (yce-harness queue_runner subprocess), 'a2a'
+    (Google A2A protocol via yce-harness/a2a_server.py), and 'auto'
+    (a2a/local fallback chain) targets were retired with yce-harness.
+    event_emitter is preserved in the signature for backward compatibility
+    with adapter constructors that accept it.
+    """
     if config.build_target == "cloud":
         from adapters.oz_adapter import OzAdapter
         return OzAdapter(config)
-    elif config.build_target == "a2a":
-        from adapters.a2a_adapter import A2AAdapter
-        return A2AAdapter(config, event_emitter=event_emitter)
     elif config.build_target == "self_healing":
         from adapters.self_healing_adapter import SelfHealingAdapter
         return SelfHealingAdapter(config)
-    elif config.build_target == "auto":
-        # Try A2A first, fall back to local
-        from adapters.a2a_adapter import A2AAdapter
-        a2a = A2AAdapter(config, event_emitter=event_emitter)
-        if a2a.is_active():
-            logger.info("Auto-selected A2A adapter (server reachable)")
-            return a2a
-        logger.info("A2A server not reachable, falling back to local adapter")
-        from adapters.local_adapter import LocalAdapter
-        return LocalAdapter(config)
-    else:
-        # "local" — default
-        from adapters.local_adapter import LocalAdapter
-        return LocalAdapter(config)
+    raise ValueError(
+        f"Unknown build_target {config.build_target!r}. "
+        "Valid options: 'cloud', 'self_healing'."
+    )

@@ -254,6 +254,56 @@ class TestCapturePostmortem:
         assert row["failure_category"] == "build_error"
 
 
+class TestGateStatusClassification:
+    """Gate-based classification (no crash log) — review_rejected must not
+    fall through to the spec_unclear default (the bug that mislabeled the
+    426-441 cohort and blinded Sky-Lynx)."""
+
+    def test_review_rejected_classified_as_review_rejected(self):
+        """review_status='review_rejected' classifies as 'review_rejected',
+        NOT 'spec_unclear'."""
+        from postmortem import _classify_from_gate_status
+
+        cat, stage, sig = _classify_from_gate_status("review_rejected", None)
+        assert cat == "review_rejected"
+        assert cat != "spec_unclear"
+        assert stage == "review"
+        assert "Ravage" in sig or "review" in sig.lower()
+
+    def test_review_failed_still_classified_as_review_failed(self):
+        """The pre-existing review_failed branch is preserved."""
+        from postmortem import _classify_from_gate_status
+
+        cat, stage, _ = _classify_from_gate_status("review_failed", 55.0)
+        assert cat == "review_failed"
+        assert stage == "review"
+
+    def test_capture_postmortem_review_rejected_end_to_end(self, state_db):
+        """capture_postmortem with review_status='review_rejected' and no log
+        stores category 'review_rejected', not 'spec_unclear'."""
+        result = capture_postmortem(
+            state_db=state_db,
+            queue_job_id="metroplex-ideaforge-436",
+            idea_id=436,
+            title="Elder-care safety companion",
+            review_status="review_rejected",
+        )
+        assert result is True
+
+        state_db.connect()
+        row = state_db.conn.execute(
+            "SELECT * FROM build_postmortems WHERE queue_job_id = ?",
+            ("metroplex-ideaforge-436",),
+        ).fetchone()
+        assert row["failure_category"] == "review_rejected"
+        assert row["failure_stage"] == "review"
+
+    def test_review_rejected_is_retryable(self, state_db):
+        """review_rejected must remain retryable (not in NON_RETRYABLE_CATEGORIES)
+        so the Ravage->Planner feedback loop gets its retry budget."""
+        assert "review_rejected" not in state_db.NON_RETRYABLE_CATEGORIES
+
+
 class TestGetFailurePatterns:
     """Test aggregation of failure patterns."""
 

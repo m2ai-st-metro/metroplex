@@ -144,7 +144,6 @@ class TestBudgetCheck:
 
         triage = MagicMock()
         build = MagicMock()
-        patch = MagicMock()
         cb = CircuitBreaker(threshold=3, state_db=in_memory_db)
         caps = CycleCaps(config)
         shutdown = ShutdownHandler()
@@ -154,7 +153,6 @@ class TestBudgetCheck:
             config=config,
             triage_gate=triage,
             build_orchestrator=build,
-            patch_gate=patch,
             circuit_breaker=cb,
             cycle_caps=caps,
             shutdown_handler=shutdown,

@@ -140,14 +140,48 @@ Repeat until `SHUTDOWN_FLAG` is present:
        ```
        This is option (b) from the diagnostic at `~/diagnostics/daemon-flapping-2026-05-04.md` -- option (a) (touches between Agent dispatch and return) is not possible because Claude Code dispatches tools in parallel within a single turn; the daemon's session is blocked during waits. The trade-off is that a hung daemon session would still appear alive via the keep-alive; this is acceptable because the realistic failure mode here is "session healthily waiting on Agent" not "session crashed."
     b. Spawn **both** review agents in parallel using the Agent tool (two Agent calls in a single response). For each agent, the prompt must specify the absolute `{target_dir}` path and instruct the agent to review all source files there (not a git diff -- this is a freshly generated project, so all files are "new"). Exclude `.git/`, `.self-healing-pipeline/`, `node_modules/`, `__pycache__/`, `venv/`, and `*.lock` files from review scope.
-       - **Agent 1 -- code-reviewer** (`subagent_type: "pr-review-toolkit:code-reviewer"`): review for bugs, security vulnerabilities, and code quality issues. Ask it to report issues with confidence >= 80 only, grouped by Critical (90-100) and Important (80-89). Tell it the project has no CLAUDE.md guidelines -- judge purely on correctness and security.
-       - **Agent 2 -- silent-failure-hunter** (`subagent_type: "pr-review-toolkit:silent-failure-hunter"`): review for empty catch blocks, swallowed errors, silent fallbacks, and missing error propagation. Ask it to report issues with severity CRITICAL, HIGH, or MEDIUM.
-    c. When both agents return, write their combined output to `{target_dir}/.self-healing-pipeline/review-report.md` with sections `## Code Review` and `## Silent Failure Analysis`.
-    d. Parse the results for **CRITICAL** issues: code-reviewer issues with confidence >= 90, OR silent-failure-hunter issues with severity CRITICAL. Count them.
-    e. Update `{target_dir}/.self-healing-pipeline/state.json` with three new fields:
+
+       **Structured-findings request** (applies to both agents): in addition to the prose report, ask each agent to emit a structured findings block at the END of its output, fenced by `<findings-json>` and `</findings-json>` tags, containing a JSON array. Each finding object has these fields (use `null` when a field doesn't apply):
+       - `severity`: for code-reviewer one of `"critical"` / `"important"` / `"medium"`; for silent-failure-hunter one of `"CRITICAL"` / `"HIGH"` / `"MEDIUM"`
+       - `confidence`: integer 0-100 (code-reviewer) or `null` (silent-failure-hunter)
+       - `title`: short label (≤80 chars), e.g. `"Smart-apostrophe regression silently downgrades ER signals"`
+       - `category`: one snake_case tag, drawn from `input_normalization`, `negation_handling`, `word_boundary`, `register_shift`, `log_resilience`, `error_handling`, `narrative_drift`, `privacy`, `security`, `correctness`, `concurrency`, `other`
+       - `input_shape`: one-sentence description of the input class that triggers the failure (or `null` if not input-driven)
+       - `trigger_examples`: array of 1-5 example inputs that fail (or `[]`)
+       - `expected_behavior`: one sentence
+       - `observed_behavior`: one sentence
+       - `file_paths`: array of `"path:line-range"` strings (or `[]`)
+       - `claim_class`: one of `"SAFETY"`, `"FAILURE"`, `"USER-VOICE"`, `"TONE"`, `"OUT-OF-SCOPE"`, `"BEHAVIOR"` — the spec-claim category this finding would map to if rewritten as a Stage 1A claim
+
+       The prose review above the JSON block is for humans and is the authoritative report. The JSON block is consumed downstream by the retry's Stage 1A injection (see `state.json:review_findings_path` below). If a reviewer cannot produce valid JSON, it should still emit the prose — downstream code falls back gracefully.
+
+       - **Agent 1 -- code-reviewer** (`subagent_type: "pr-review-toolkit:code-reviewer"`): review for bugs, security vulnerabilities, and code quality issues. Ask it to report issues with confidence >= 80 only, grouped by Critical (90-100) and Important (80-89). Tell it the project has no CLAUDE.md guidelines -- judge purely on correctness and security. Include the structured-findings block per the above instruction.
+       - **Agent 2 -- silent-failure-hunter** (`subagent_type: "pr-review-toolkit:silent-failure-hunter"`): review for empty catch blocks, swallowed errors, silent fallbacks, and missing error propagation. Ask it to report issues with severity CRITICAL, HIGH, or MEDIUM. Include the structured-findings block per the above instruction.
+    c. When both agents return, write their combined prose output to `{target_dir}/.self-healing-pipeline/review-report.md` with sections `## Code Review` and `## Silent Failure Analysis`. **Strip the `<findings-json>...</findings-json>` blocks from the prose before writing** — they go in a separate file (10.5c-bis), not the human-readable report.
+    c-bis. **Extract structured findings JSON.** For each agent's output, locate the `<findings-json>` block via regex (`<findings-json>(.*?)</findings-json>` with DOTALL). For each block:
+       - Parse the inner content as JSON. If parse fails, log `"WARN: code-reviewer/silent-failure-hunter findings JSON malformed; downstream retry will fall back to prose extraction"` and skip this block.
+       - Tag every finding object with `"source": "code-reviewer"` or `"source": "silent-failure-hunter"` and `"finding_id": "F-NN"` (sequentially assigned starting at F-01, across both sources).
+       - Concatenate all valid findings into one array.
+
+       Write the combined object to `{target_dir}/.self-healing-pipeline/review-findings.json`:
+       ```json
+       {
+         "review_id": "{job_id}",
+         "reviewed_at": "<ISO timestamp>",
+         "verdict": "approved" | "rejected",
+         "findings": [
+           { "finding_id": "F-01", "source": "code-reviewer", "severity": "critical", "confidence": 98, "title": "...", "category": "input_normalization", "input_shape": "...", "trigger_examples": ["..."], "expected_behavior": "...", "observed_behavior": "...", "file_paths": ["..."], "claim_class": "SAFETY" },
+           { "finding_id": "F-02", "source": "silent-failure-hunter", "severity": "CRITICAL", "confidence": null, "title": "...", "category": "log_resilience", "input_shape": null, "trigger_examples": [], "expected_behavior": "...", "observed_behavior": "...", "file_paths": ["episode_log.py:59-66"], "claim_class": "FAILURE" }
+         ]
+       }
+       ```
+       If BOTH agents emitted malformed/missing JSON, write an empty findings array (`"findings": []`) but still write the file — its absence would be ambiguous downstream. Set `verdict` to the same value computed in step 10.5d.
+    d. Parse the results for **CRITICAL** issues: code-reviewer issues with confidence >= 90, OR silent-failure-hunter issues with severity CRITICAL. Count them. Use the prose report as the authoritative source for this count — the JSON sidecar is consumed by retries, not by the verdict gate.
+    e. Update `{target_dir}/.self-healing-pipeline/state.json` with four new fields:
        - `review_verdict`: `"approved"` (0 critical issues) or `"rejected"` (1+ critical issues)
        - `review_critical_count`: integer count of critical issues found
        - `review_report_path`: absolute path to `review-report.md`
+       - `review_findings_path`: absolute path to `review-findings.json` (always set, even if findings array is empty)
     f. If `review_verdict == "rejected"`: print `"Ravage review REJECTED: {N} critical issues found. See {review_report_path}"`. Override the routing status for Step 11 -- this build goes to `FAILED_DIR` even though the Judge passed it. Update `state.json` `status` to `"review_rejected"`.
     g. If `review_verdict == "approved"`: print `"Ravage review approved ({N} non-critical issues noted)"` where N is the total issue count minus critical.
     h. **Stop heartbeat keep-alive and refresh:**
@@ -324,7 +358,13 @@ have to actually read it.
 - It does NOT escalate to humans via Telegram or other channels. Escalations
   are written to `FAILED_DIR` and picked up by Metroplex's existing
   postmortem/notification paths.
-- It does NOT retry on review rejection. Step 10.5 Ravage review is pass/fail
-  only. A `review_rejected` build goes straight to `FAILED_DIR`. The Builder
-  is not re-invoked with review feedback (future enhancement -- would require
-  a new retry trigger type in the self-healing-pipeline).
+- The daemon itself does NOT re-invoke its own Builder on review rejection.
+  Step 10.5 Ravage review is pass/fail within the daemon session; a
+  `review_rejected` build is routed to `FAILED_DIR`. Retry is then
+  **Metroplex-mediated**: the orchestrator treats `review_rejected` as a
+  retryable failure (it is not in `NON_RETRYABLE_CATEGORIES`), re-pends the
+  `priority_queue` row, and dispatches a fresh daemon job whose Planner
+  receives the prior Ravage findings injected as `claim_class`-tagged
+  spec-claims (`review-findings.json` -> `build_sessions` ->
+  `_inject_session_context`). So review feedback *does* reach the next attempt
+  across the daemon/Metroplex boundary, up to `MAX_RETRIES`.
