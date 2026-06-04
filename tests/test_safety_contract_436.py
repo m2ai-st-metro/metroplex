@@ -19,6 +19,7 @@ from pathlib import Path
 import pytest
 
 SKILL_MD = Path.home() / ".claude" / "skills" / "self-healing-pipeline" / "SKILL.md"
+pytestmark = pytest.mark.skipif(not SKILL_MD.exists(), reason="SKILL.md not found in environment")
 
 
 def _checklist_section() -> str:

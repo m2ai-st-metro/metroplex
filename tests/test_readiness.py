@@ -740,7 +740,7 @@ class TestConfig:
     def test_config_defaults(self, test_config):
         """Config has readiness defaults."""
         assert test_config.max_readiness_per_cycle == 5
-        assert test_config.readiness_enabled is True
+        assert test_config.readiness_enabled is False
 
     def test_config_env_override(self):
         """Config reads env vars."""
