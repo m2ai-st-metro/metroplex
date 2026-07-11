@@ -172,7 +172,13 @@ class EAClaudeDispatcher:
 
 
 class LogDispatcher:
-    """No-op dispatcher that logs dispatch calls. Used when no DB is configured."""
+    """Terminal fallback dispatcher used when no live dispatch backend is configured.
+
+    dispatch() only logs the call. check_result() reports the task as failed so
+    sync_dispatch_status() resolves items to a visible terminal state instead of
+    leaving them stuck at 'dispatched' forever (the 2026-07-11 loop-map G1 black
+    hole: 98 rows orphaned after the claudeclaw dispatch DB was deleted 2026-05-29).
+    """
 
     def __init__(self):
         self.dispatched: list[dict] = []
@@ -196,7 +202,10 @@ class LogDispatcher:
         return task_id
 
     def check_result(self, task_id: str) -> dict | None:
-        return None
+        return {
+            "status": "failed",
+            "result": "log dispatcher is terminal: no live dispatch backend configured",
+        }
 
 
 

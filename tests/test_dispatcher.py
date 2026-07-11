@@ -189,11 +189,14 @@ class TestLogDispatcher:
         assert disp.dispatched[0]["worker_type"] == "soundwave"
         assert disp.dispatched[1]["prompt"] == "Task B"
 
-    def test_check_result_always_none(self):
-        """LogDispatcher.check_result always returns None."""
+    def test_check_result_terminal_failed(self):
+        """LogDispatcher.check_result reports failed so items resolve instead of
+        sticking at 'dispatched' forever (loop-map G1)."""
         disp = LogDispatcher()
         task_id = disp.dispatch(prompt="Test", worker_type="ravage")
-        assert disp.check_result(task_id) is None
+        result = disp.check_result(task_id)
+        assert result is not None
+        assert result["status"] == "failed"
 
 
 # --- Factory Tests ---
