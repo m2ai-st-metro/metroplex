@@ -107,7 +107,7 @@ Timeout watchdog kills builds after 90 min (configurable: `METROPLEX_BUILD_TIMEO
 
 ### Auto-Retry (Phase 13f)
 
-Failed builds are automatically retried up to 3 times with exponential backoff (5min, 20min, 60min). Tracked via `retry_count` and `next_retry_at` columns on `build_jobs`. Retryable builds are checked each cycle.
+Failed builds are automatically retried up to 5 times (`db.py MAX_RETRIES = 5`) with exponential backoff (5, 20, 60, 120, 240 min). Tracked via `retry_count` and `next_retry_at` columns on `build_jobs`. Retryable builds are checked each cycle. (Corrected 2026-07-11, Q-20260711-0013: this doc previously said 3 retries; code says 5 and code wins.)
 
 ### Safety Systems
 
