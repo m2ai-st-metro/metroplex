@@ -18,6 +18,12 @@ from config import Config
 from models import PublishJob
 from db import StateDB
 from audit import AuditLogger
+from gates.review import (
+    BUILD_ARTIFACT_FILES,
+    BUILD_ARTIFACT_DIRS,
+    LEAK_CONTENT_PATTERNS,
+    CONTENT_SCAN_MAX_BYTES,
+)
 
 
 class PublishGate:
@@ -208,11 +214,62 @@ class PublishGate:
         remote_name: str,
     ) -> tuple[str, str | None, str | None]:
         """Dispatch to the per-host publisher. Returns (status, repo_url, error)."""
+        denylist_hit = self._pretpush_denylist_scan(project_dir)
+        if denylist_hit:
+            return ("failed", None, f"publish blocked by artifact denylist: {denylist_hit}")
+
         if target == "github":
             return self._publish_github(project_dir, repo_name, title, remote_name)
         if target == "gitlab":
             return self._publish_gitlab(project_dir, repo_name, title, remote_name)
         return ("failed", None, f"unknown publish target: {target}")
+
+    # --- pre-push denylist scan (second independent layer) -------------------
+
+    def _pretpush_denylist_scan(self, project_dir: Path) -> str | None:
+        """Re-check for the artifact denylist / leak signatures immediately
+        before push, independent of whether ReviewGate (Gate 4.5) already ran.
+
+        This is the second of the two required enforcement points for this
+        invariant (per the two-layer-gate rule: guard a critical invariant at
+        both the point of intent and the point of action). ReviewGate is the
+        point of intent — it runs earlier in the pipeline and can be skipped
+        entirely if `require_review=False`, or raced by a build step that
+        writes files into project_dir after review passed (see
+        test_self_healing_publish_ravage_race.py for a documented race in this
+        exact seam). This scan is the point of action: it runs in the same
+        call that performs the actual `git push`, so nothing reaches a remote
+        without passing it, regardless of what happened upstream.
+
+        Returns a short string describing the first hit, or None if clean.
+        Deliberately reuses gates.review's constants (not a re-derived copy)
+        so the two layers can never silently drift out of sync.
+        """
+        try:
+            all_files = [p for p in project_dir.rglob("*") if p.is_file() and ".git" not in p.relative_to(project_dir).parts]
+        except OSError as e:
+            return f"scan error: {e}"
+
+        for f in all_files:
+            if f.name in BUILD_ARTIFACT_FILES:
+                return f"artifact file {f.relative_to(project_dir)}"
+
+        for d in project_dir.rglob("*"):
+            if d.is_dir() and d.name in BUILD_ARTIFACT_DIRS and d.name != ".git":
+                return f"artifact dir {d.relative_to(project_dir)}/"
+
+        for f in all_files:
+            try:
+                if f.stat().st_size > CONTENT_SCAN_MAX_BYTES:
+                    continue
+                text = f.read_text(encoding="utf-8", errors="strict")
+            except (UnicodeDecodeError, OSError):
+                continue
+            for pat in LEAK_CONTENT_PATTERNS:
+                if pat.search(text):
+                    return f"leaked content pattern {pat.pattern!r} in {f.relative_to(project_dir)}"
+
+        return None
 
     # --- target URL helpers --------------------------------------------------
 

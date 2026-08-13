@@ -4,6 +4,11 @@ Automated quality checks on completed builds before they can be published.
 Lightweight file-system checks — no LLM calls.
 """
 import logging
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -30,6 +35,50 @@ SECRET_FILE_PATTERNS = {
     "credentials.json", "service-account.json",
     "id_rsa", "id_ed25519",
 }
+
+# GATE A — internal pipeline artifact filenames. Confirmed by the 2026-08
+# 10-product publish audit as the exact filenames that leaked into public
+# repos (7 of 10 products). These are written into the workspace by the
+# self-healing-daemon build loop (metroplex/.claude/skills/self-healing-daemon,
+# per project CLAUDE.md), not by metroplex's own Python code — grepped, no
+# writer found in gates/adapters/*.py. This gate is the enforcement point on
+# the metroplex side: whatever wrote them, they must never reach a push.
+# Kept in review.py (not readiness.py) because THIS gate runs pre-push and
+# blocks; readiness.py's copy of a similar list runs post-push and can only
+# delete from the live tree (git history keeps the blob). See gates/readiness.py
+# BUILD_ARTIFACT_FILES for the reactive fallback layer.
+BUILD_ARTIFACT_FILES = {
+    ".codebase_learnings.json",
+    ".linear_project.json",
+    "app_spec.txt",
+    ".claude_settings.json",
+    ".heartbeat-callback",
+    "spec.md",
+}
+
+# Directory names that are pipeline-internal or accidentally-vendored and must
+# never be part of a published tree. Unlike IGNORED_DIRS (which are considered
+# harmless build byproducts we simply don't scan), these are a hard fail if
+# present at all — venv/ vendors the whole environment (secrets in pip config,
+# absolute paths in shebangs); screenshots/ was observed carrying internal
+# ticket-ID filenames in the audit.
+BUILD_ARTIFACT_DIRS = {"venv", ".venv", "screenshots"}
+
+# Content-level leak signatures (2026-08 audit): the pipeline's own absolute
+# home path, Linear ticket IDs, and internal build-job IDs, found inside
+# file CONTENTS (not just filenames) and inside git commit MESSAGES. A file
+# named innocuously can still carry these strings (e.g. a log excerpt pasted
+# into a README, or a job ID baked into a generated comment).
+LEAK_CONTENT_PATTERNS = [
+    re.compile(r"/home/apexaipc"),
+    re.compile(r"M2A-\d+"),
+    re.compile(r"metroplex-ideaforge-\d+"),
+]
+
+# Skip binary-ish / huge files when content-scanning for leak signatures —
+# same rationale as MAX_FILE_SIZE_BYTES, just a tighter cap since this is a
+# read-and-regex pass over every file, not a stat() call.
+CONTENT_SCAN_MAX_BYTES = 2 * 1024 * 1024
 
 # Max file size that suggests a binary blob was committed (10MB)
 MAX_FILE_SIZE_BYTES = 10 * 1024 * 1024
@@ -264,7 +313,178 @@ class ReviewGate:
         # with no data dir / .gitignore is unaffected.
         self._check_safety(project_dir, files, passed, failed)
 
+        # GATE A — 11. No internal pipeline artifact files/dirs in the tree.
+        artifact_hits = self._check_no_build_artifacts(project_dir, files)
+        if not artifact_hits:
+            passed.append("no_build_artifacts")
+        else:
+            failed.append(f"no_build_artifacts({','.join(artifact_hits)})")
+
+        # GATE A — 12. No leaked internal paths/ticket-IDs/job-IDs in file content.
+        content_hits = self._check_no_leaked_content(project_dir, files)
+        if not content_hits:
+            passed.append("no_leaked_content")
+        else:
+            failed.append(f"no_leaked_content({','.join(content_hits)})")
+
+        # GATE A — 13. No leaked internal paths/ticket-IDs/job-IDs in commit messages.
+        commit_hits = self._check_no_leaked_commit_messages(project_dir)
+        if not commit_hits:
+            passed.append("no_leaked_commit_messages")
+        else:
+            failed.append(f"no_leaked_commit_messages({','.join(commit_hits)})")
+
+        # GATE B — 14. The built project actually installs and imports in a
+        # clean environment. "Tests pass in the source tree" is explicitly not
+        # sufficient (2026-08 audit: 91 passing tests, generated projects still
+        # failed to import). Config-gated because venv spin-up is comparatively
+        # slow; off is an explicit opt-out, not a silent skip.
+        if self.config.review_build_verify_enabled:
+            build_ok, build_detail = self._check_builds_clean(project_dir)
+            if build_ok:
+                passed.append(f"builds_clean({build_detail})" if build_detail else "builds_clean")
+            else:
+                failed.append(f"builds_clean({build_detail})")
+
         return passed, failed
+
+    # --- GATE A: artifact denylist ------------------------------------------
+
+    def _check_no_build_artifacts(self, project_dir: Path, files: list[Path]) -> list[str]:
+        """Return the list of denylisted artifact files/dirs present in the tree."""
+        hits = []
+        for f in files:
+            if f.name in BUILD_ARTIFACT_FILES:
+                hits.append(str(f.relative_to(project_dir)))
+        for d in project_dir.rglob("*"):
+            if d.is_dir() and d.name in BUILD_ARTIFACT_DIRS and d.name != ".git":
+                hits.append(str(d.relative_to(project_dir)) + "/")
+        return hits
+
+    def _check_no_leaked_content(self, project_dir: Path, files: list[Path]) -> list[str]:
+        """Scan tracked file contents for leak signatures. Returns matched files."""
+        hits = []
+        for f in files:
+            try:
+                if f.stat().st_size > CONTENT_SCAN_MAX_BYTES:
+                    continue
+            except OSError:
+                continue
+            try:
+                text = f.read_text(encoding="utf-8", errors="strict")
+            except (UnicodeDecodeError, OSError):
+                continue  # binary or unreadable — not a text leak vector
+            if any(pat.search(text) for pat in LEAK_CONTENT_PATTERNS):
+                hits.append(str(f.relative_to(project_dir)))
+        return hits
+
+    def _check_no_leaked_commit_messages(self, project_dir: Path) -> list[str]:
+        """Scan git commit messages (subject + body) for leak signatures.
+
+        Returns the list of matched commit subjects (truncated), or a single
+        diagnostic entry if git log itself failed. No-op ("no hits") if the
+        directory has no git history yet (nothing to leak).
+        """
+        if not (project_dir / ".git").is_dir():
+            return []
+        try:
+            result = subprocess.run(
+                ["git", "-C", str(project_dir), "log", "--format=%H%n%B%n---METROPLEX-SEP---"],
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+        except (subprocess.TimeoutExpired, OSError) as e:
+            return [f"git log failed: {e}"]
+
+        if result.returncode != 0:
+            # Empty repo (no commits yet), or a bare ".git" placeholder dir with
+            # no real history (as used by test fixtures), is not a leak — there
+            # are no commit messages to leak from.
+            stderr = result.stderr.strip()
+            if "does not have any commits" in stderr or "not a git repository" in stderr:
+                return []
+            return [f"git log failed: {stderr[:200]}"]
+
+        hits = []
+        for commit_block in result.stdout.split("---METROPLEX-SEP---"):
+            commit_block = commit_block.strip()
+            if not commit_block:
+                continue
+            if any(pat.search(commit_block) for pat in LEAK_CONTENT_PATTERNS):
+                subject = commit_block.splitlines()[1] if len(commit_block.splitlines()) > 1 else commit_block[:60]
+                hits.append(subject.strip()[:60])
+        return hits
+
+    # --- GATE B: build-the-artifact verification ----------------------------
+
+    def _check_builds_clean(self, project_dir: Path) -> tuple[bool, str]:
+        """Install the project into a fresh throwaway venv and import it.
+
+        Python-only (matches the audit evidence: `pip install -e .` failures,
+        missing packaging file, tests that never installed the built
+        artifact). Returns (ok, detail). Skips (ok=True) with a clear detail
+        string for project shapes this check doesn't cover yet, rather than
+        failing a build for a gap in the checker.
+        """
+        has_pkg_file = (project_dir / "pyproject.toml").is_file() or (project_dir / "setup.py").is_file()
+        if not has_pkg_file:
+            return True, "skipped: no pyproject.toml/setup.py (not a Python package)"
+
+        pkg_name = self._infer_package_name(project_dir)
+        if not pkg_name:
+            return False, "no importable package name found under project root"
+
+        tmp_venv = None
+        try:
+            tmp_venv = Path(tempfile.mkdtemp(prefix="metroplex-review-buildverify-"))
+            venv_result = subprocess.run(
+                [sys.executable, "-m", "venv", str(tmp_venv)],
+                capture_output=True, text=True,
+                timeout=min(60, self.config.review_build_verify_timeout_seconds),
+            )
+            if venv_result.returncode != 0:
+                return False, f"venv creation failed: {venv_result.stderr.strip()[:200]}"
+
+            venv_python = tmp_venv / "bin" / "python"
+            install_result = subprocess.run(
+                [str(venv_python), "-m", "pip", "install", "--quiet", "-e", "."],
+                cwd=str(project_dir),
+                capture_output=True, text=True,
+                timeout=self.config.review_build_verify_timeout_seconds,
+            )
+            if install_result.returncode != 0:
+                return False, f"pip install -e . failed: {install_result.stderr.strip()[-300:]}"
+
+            import_result = subprocess.run(
+                [str(venv_python), "-c", f"import {pkg_name}"],
+                cwd=str(tmp_venv),  # run OUTSIDE project_dir so it can't import from source dir by path accident
+                capture_output=True, text=True,
+                timeout=30,
+            )
+            if import_result.returncode != 0:
+                return False, f"import {pkg_name} failed after install: {import_result.stderr.strip()[-300:]}"
+
+            return True, f"installed + imported {pkg_name}"
+        except subprocess.TimeoutExpired:
+            return False, f"build verify timed out ({self.config.review_build_verify_timeout_seconds}s)"
+        except Exception as e:
+            return False, f"build verify error: {e}"
+        finally:
+            if tmp_venv is not None and tmp_venv.is_dir():
+                shutil.rmtree(tmp_venv, ignore_errors=True)
+
+    def _infer_package_name(self, project_dir: Path) -> str | None:
+        """Best-effort import-name discovery: a top-level dir with __init__.py,
+        skipping tests/docs/build noise. Falls back to a src/-layout package."""
+        skip = {"tests", "test", "docs", "build", "dist", ".git", "__pycache__", "venv", ".venv"}
+        for candidate_root in (project_dir, project_dir / "src"):
+            if not candidate_root.is_dir():
+                continue
+            for child in sorted(candidate_root.iterdir()):
+                if child.is_dir() and child.name not in skip and (child / "__init__.py").is_file():
+                    return child.name
+        return None
 
     def _is_data_artifact(self, path: Path, project_dir: Path) -> bool:
         """True if path lives under a runtime data dir OR is a *.jsonl log."""

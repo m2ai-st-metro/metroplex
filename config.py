@@ -91,6 +91,14 @@ class Config:
     max_publish_per_cycle: int = field(default=3)
     require_review: bool = field(default=True)
 
+    # Review gate (Gate 4.5) — build-the-artifact verification sub-check.
+    # Installs the built project into a clean throwaway venv and imports it,
+    # rather than trusting "tests pass in the source tree" (which does not
+    # catch a project that fails to import once packaged). Off switch exists
+    # because the venv spin-up is slow relative to the other zero-cost checks.
+    review_build_verify_enabled: bool = field(default=True)
+    review_build_verify_timeout_seconds: int = field(default=180)
+
     # Readiness gate (Gate 4.9)
     # Disabled 2026-05-06: gate uses GitHub-only API calls (gh CLI for topics,
     # description, license checks). After m2ai-portfolio archive, those calls
@@ -250,6 +258,18 @@ class Config:
             pass
         self.publish_visibility = os.environ.get("METROPLEX_PUBLISH_VISIBILITY", self.publish_visibility)
         self.require_review = os.environ.get("METROPLEX_REQUIRE_REVIEW", "").lower() not in ("0", "false", "no")
+        self.review_build_verify_enabled = self._env_bool(
+            "METROPLEX_REVIEW_BUILD_VERIFY_ENABLED", self.review_build_verify_enabled
+        )
+        try:
+            self.review_build_verify_timeout_seconds = int(
+                os.environ.get(
+                    "METROPLEX_REVIEW_BUILD_VERIFY_TIMEOUT_SECONDS",
+                    self.review_build_verify_timeout_seconds,
+                )
+            )
+        except ValueError:
+            pass
         try:
             self.max_publish_per_cycle = int(os.environ.get("METROPLEX_MAX_PUBLISH_PER_CYCLE", self.max_publish_per_cycle))
         except ValueError:

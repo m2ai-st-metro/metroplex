@@ -9,7 +9,9 @@ README structure: Scene (the struggle) -> Weight (the cost) -> Turn (the possibi
 article, not a product manual. Hero images depict real-life scenes of the problem
 being solved, not abstract tech illustrations.
 """
+import json
 import os
+import re
 import logging
 import subprocess
 from datetime import datetime
@@ -392,6 +394,18 @@ class ReadmeGate:
         readme_content = self._normalize_clone_url(readme_content, clone_url)
         readme_content = self._replace_file_tree_block(readme_content, file_tree)
 
+        # 6b. GATE C — claims-vs-code check (report only, never blocks publish).
+        # The listing text is generated from the SPEC, not the BUILD (2026-08
+        # audit, 10 of 10 products: marketing claims not implemented). This
+        # extracts the feature bullets from the generated README and checks
+        # each against the actual source for at least weak keyword backing,
+        # then writes a report for human review. A human decides what to do
+        # with unbacked claims; this never fails the README job or the publish.
+        try:
+            self._run_claims_check(build_job_id, title, readme_content, project_path)
+        except Exception as e:
+            logger.warning(f"Claims-vs-code check failed for {build_job_id} (non-fatal): {e}")
+
         # 7. Write README.md
         readme_path = project_path / "README.md"
         readme_path.write_text(readme_content)
@@ -422,6 +436,123 @@ class ReadmeGate:
 
         print(f"+ README enhanced: {title}")
         return {"build_job_id": build_job_id, "status": "completed", "error": None}
+
+    # --- GATE C: claims-vs-code check (report only) --------------------------
+
+    _CLAIMS_STOPWORDS = {
+        "that", "this", "with", "your", "from", "have", "will", "into",
+        "when", "what", "does", "them", "they", "each", "just", "than",
+        "then", "over", "about", "instead", "keeps", "helps", "stops",
+        "gives", "makes", "lets", "automatic", "automatically", "user",
+        "users", "project", "tool", "system", "using", "based",
+    }
+
+    def _extract_feature_bullets(self, readme_content: str) -> list[str]:
+        """Extract the bullet lines under 'What <title> Does' section.
+
+        Looks for a heading containing "does" (case-insensitive) — matches
+        both the "### 5. What {title} Does" spec and any LLM heading drift —
+        and collects '-'/'*'/'+' bullets until the next heading.
+        """
+        bullets = []
+        in_section = False
+        for line in readme_content.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("#"):
+                if "does" in stripped.lower():
+                    in_section = True
+                    continue
+                elif in_section:
+                    break  # left the section at the next heading
+            if in_section and stripped.startswith(("-", "*", "+")):
+                bullets.append(stripped.lstrip("-*+ ").strip())
+        return bullets
+
+    def _keywords_for_bullet(self, bullet: str) -> list[str]:
+        """Pull candidate identifying words out of a claim bullet.
+
+        Heuristic, not NLP: lowercase alnum tokens >= 5 chars, minus a small
+        stopword list of generic connective/marketing words that would match
+        almost any codebase and produce false "backed" verdicts.
+        """
+        words = re.findall(r"[a-zA-Z][a-zA-Z0-9_-]{4,}", bullet.lower())
+        return [w for w in words if w not in self._CLAIMS_STOPWORDS]
+
+    def _run_claims_check(
+        self, build_job_id: str, title: str, readme_content: str, project_path: Path
+    ) -> None:
+        """Extract feature claims from the generated README and flag any with
+        no keyword-level backing anywhere in the project's source files.
+
+        Report-only by design (Gate C in the publish-gates plan): a false
+        positive here (a claim phrased differently than the code) should not
+        block a real publish, so this writes a report for human review and an
+        audit_logger entry rather than a pass/fail verdict. Cost is bounded:
+        keyword search over an already-read project tree, no LLM calls.
+        """
+        from gates.review import CODE_EXTENSIONS, IGNORED_DIRS, DOC_FILES
+
+        bullets = self._extract_feature_bullets(readme_content)
+        if not bullets:
+            return
+
+        # Build one haystack of lowercased source content (code + README-eligible
+        # docs) to search claim keywords against. Bounded to files under the
+        # project tree, skipping the same dependency/build noise ReviewGate skips.
+        haystack_parts = []
+        for f in project_path.rglob("*"):
+            if not f.is_file():
+                continue
+            try:
+                rel_parts = set(f.relative_to(project_path).parts)
+            except ValueError:
+                continue
+            if rel_parts & IGNORED_DIRS:
+                continue
+            if f.suffix not in CODE_EXTENSIONS and f.name not in DOC_FILES:
+                continue
+            try:
+                if f.stat().st_size > 1_000_000:
+                    continue
+                haystack_parts.append(f.read_text(encoding="utf-8", errors="replace").lower())
+            except OSError:
+                continue
+        haystack = "\n".join(haystack_parts)
+
+        unbacked = []
+        for bullet in bullets:
+            keywords = self._keywords_for_bullet(bullet)
+            if not keywords:
+                continue  # nothing distinctive to check — not flagged either way
+            if not any(kw in haystack for kw in keywords):
+                unbacked.append(bullet)
+
+        report = {
+            "build_job_id": build_job_id,
+            "title": title,
+            "checked_at": datetime.now().isoformat(),
+            "claims_total": len(bullets),
+            "claims_unbacked": unbacked,
+        }
+
+        reports_dir = Path("data") / "claims_reports"
+        reports_dir.mkdir(parents=True, exist_ok=True)
+        report_path = reports_dir / f"{build_job_id}.json"
+        report_path.write_text(json.dumps(report, indent=2))
+
+        self.audit_logger.log_decision(
+            gate="claims_check",
+            action="unbacked_claims_found" if unbacked else "all_claims_backed",
+            details={
+                "build_job_id": build_job_id,
+                "title": title,
+                "claims_total": len(bullets),
+                "claims_unbacked": unbacked,
+                "report_path": str(report_path),
+            },
+        )
+        if unbacked:
+            print(f"  ! claims check: {len(unbacked)}/{len(bullets)} unbacked claims for {title} -> {report_path}")
 
     def _read_spec(self, build_job_id: str) -> str:
         """Read the spec file for a build job from the DB."""
