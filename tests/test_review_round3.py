@@ -105,3 +105,27 @@ def test_r6_granting_card_without_stored_attestation_asks_for_a_new_yes(work, st
     d.intake.resume_granting()
     assert store.get_card(card_id)["status"] == "awaiting_yes"
     assert "tap Yes again" in transport.sent[-1]["text"]
+
+
+def test_q1_a_rejected_first_yes_is_not_replayed_forever(work, store):
+    d, transport = daemon(work, store, ScriptedReasoner())
+    d.handle(text("build the thing"))
+    yes = yes_button(transport)
+    card_id = yes.split(":")[1]
+    first = button(yes, who="7001")
+    first.from_id = "9999"  # an id Metroplex lists but Teletraan does not
+    d.bot.approvers.add("9999")
+    d.handle(first)
+    assert store.get_card(card_id)["status"] == "awaiting_yes"
+    d.handle(button(yes))  # Matthew's real yes
+    assert store.get_card(card_id)["status"] == "granted"
+
+
+def test_q2_control_command_failures_do_not_lock_intake(work, store):
+    d, transport = daemon(work, store, ScriptedReasoner())
+    real = work.clients["cos"].wake_pending
+    work.clients["cos"].wake_pending = lambda: (_ for _ in ()).throw(WorkError("SOCKET_DOWN"))
+    for _ in range(3):
+        d.handle(text("/status"))
+    work.clients["cos"].wake_pending = real
+    assert not d.breaker.is_open("intake")

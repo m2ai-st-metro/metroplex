@@ -221,6 +221,14 @@ class Intake:
         approval_id = f"approval-{card_id}-{digest[:12]}"
         try:
             self.client.command("approval.record", approval_id, 0, {"scope": "project", "cardHash": digest, **attest}, command_id=f"cos:approval:{card_id}:{digest[:12]}")
+        except WorkError as e:
+            if e.command_rejected and e.code != "COMMAND_ID_CONFLICT":
+                # Teletraan refused this yes (e.g. approver not recognized): it
+                # recorded nothing, so forget it; the next yes is a fresh one (Q1).
+                self.store.set(f"approval_payload:{card_id}:{digest[:12]}", None)
+                self.store.set_card_status(card_id, "awaiting_yes")
+            raise
+        try:
             self.client.command("project.create", project_id, 0, {"card": card, "approvalId": approval_id}, command_id=f"cos:project:{card_id}:{digest[:12]}")
         except WorkError as e:
             if e.command_rejected and e.code not in ("COMMAND_ID_CONFLICT",):

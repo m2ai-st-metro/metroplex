@@ -119,7 +119,7 @@ class Daemon:
                 self.bot.send("That conflicts with an earlier action on the same item; nothing new was done. Send /status, or start the item over.")
             else:
                 self.bot.send(f"That did not finish ({type(e).__name__}: {e}). Tap or send it again to retry; nothing is duplicated.")
-            if self.breaker.record_failure("intake", now=self.clock()):
+            if command not in CONTROL and self.breaker.record_failure("intake", now=self.clock()):  # (Q2)
                 self.bot.send(f"Metroplex intake stopped after 3 failures ({e}). `metroplex reset intake` after fixing.")
 
     def _callback(self, item: Inbound) -> str:
