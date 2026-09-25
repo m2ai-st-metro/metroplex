@@ -83,7 +83,9 @@ class Config:
             jev_model=os.environ.get("TYPESAFE_DEFAULT_MODEL", "jev-latest"),
             reasoning_base_url=os.environ.get("METROPLEX_REASONING_BASE_URL", "https://api.deepinfra.com/v1/openai"),
             reasoning_api_key=os.environ.get("DEEPINFRA_API_KEY") or None,
-            reasoning_model=os.environ.get("METROPLEX_REASONING_MODEL") or None,
+            # No hardcoded model name: reuse the DeepInfra model the gate-era spec
+            # expander already ran in production unless explicitly overridden.
+            reasoning_model=os.environ.get("METROPLEX_REASONING_MODEL") or os.environ.get("METROPLEX_SPEC_LLM_MODEL") or None,
             local_base_url=os.environ.get("METROPLEX_LOCAL_BASE_URL") or None,
             local_model=os.environ.get("METROPLEX_LOCAL_MODEL") or None,
             env=os.environ.get("METROPLEX_ENV", "pilot"),
