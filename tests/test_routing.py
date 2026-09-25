@@ -196,7 +196,7 @@ def test_c4_reserved_action_blocks_with_an_approve_button_before_any_agent_start
     buttons = notes[0][1]
     data = buttons[0][0]["callback_data"]
     assert data.startswith("r:") and len(data.encode()) <= 64, "Telegram caps callback data at 64 bytes"
-    assert store.get(f"cb:{data[2:]}") == {"taskId": "ship", "scopeRevision": 1}, "the token maps to task and revision, never to an action"
+    assert store.get(f"cb:{data[2:]}") == {"taskId": "ship", "scopeRevision": 1, "blockRevision": work.get("task", "ship")["revision"]}, "the token maps to task and block episode, never to an action"
 
 
 def test_paused_project_holds_its_wakes_unacknowledged(work, store):

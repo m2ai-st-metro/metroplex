@@ -39,7 +39,19 @@ NOT_NOW = {"PROJECT_CAPACITY_EXHAUSTED", "WRITABLE_SCOPE_CONFLICT", "BINDING_BUS
 
 
 def notice_key(task: dict[str, Any], kind: str) -> str:
-    return f"notified:{task['id']}:{task['scopeRevision']}:{kind}"
+    """One notice per block episode. A block writes a new task revision, so a
+    task blocked again (after a failed attempt or an operator resume) is a new
+    episode with a new notice, even at the same scope revision (review N1/N5)."""
+    return f"notified:{task['id']}:r{task['revision']}:{kind}"
+
+
+def awaiting_review(snap: dict[str, Any], task: dict[str, Any]) -> bool:
+    """A current-scope result or accepted contribution is the owner's to review
+    or complete; routing must never send a second worker (review N2)."""
+    rev = task.get("scopeRevision")
+    if any(c["taskId"] == task["id"] and (c.get("accepted") or {}).get("scopeRevision") == rev for c in snap.get("contribution", [])):
+        return True
+    return any(a["taskId"] == task["id"] and a["status"] == "completed" and a.get("resultCurrent") and a.get("scopeRevision") == rev for a in snap.get("attempt", []))
 
 
 def escalation_notice(store: LocalStore, task: dict[str, Any], project: dict[str, Any], kind: str, need: str) -> tuple[str, list[list[dict[str, str]]] | None]:
@@ -48,8 +60,8 @@ def escalation_notice(store: LocalStore, task: dict[str, Any], project: dict[str
     and scope revision in the local store, never to an action."""
     buttons = None
     if kind == "reserved":
-        token = hashlib.sha256(f"{task['id']}:{task['scopeRevision']}".encode()).hexdigest()[:12]
-        store.set(f"cb:{token}", {"taskId": task["id"], "scopeRevision": task["scopeRevision"]})
+        token = hashlib.sha256(f"{task['id']}:{task['scopeRevision']}:{task['revision']}".encode()).hexdigest()[:12]
+        store.set(f"cb:{token}", {"taskId": task["id"], "scopeRevision": task["scopeRevision"], "blockRevision": task["revision"]})
         buttons = [[{"text": "Approve", "callback_data": f"r:{token}"}, {"text": "Hold", "callback_data": f"hold:{token}"}]]
     return f"{project['title']}: {task['title']}\nNeeds you ({kind}): {need}.\nOther work continues.", buttons
 
@@ -149,6 +161,9 @@ class Router:
         if project.get("paused"):
             out.decision = "hold: project paused"
             return out  # resume raises fresh wakes; leave this one for later
+        if project["id"] in {c["project_id"] for c in self.store.cards_in("granting")}:
+            out.decision = "hold: project setup not finished"
+            return out  # decomposition and dependencies are not all in place yet
         spec = task.get("spec") or {}
         if task["status"] in TERMINAL:
             return self._ack(wake, key, f"noop: task {task['status']}", out)
@@ -168,7 +183,7 @@ class Router:
                 self.notify(f"Stalled: {task['title']} ({project['title']}). Attempt {live[0]['id']} is alive but has not checkpointed. Owner {task['owner']} should look; Metroplex will not replace a live worker.", None)
                 return self._ack(wake, key, f"wait: attempt {live[0]['id']} live but stalled; owner and Matthew notified", out)
             return self._ack(wake, key, "wait: live attempt on task", out)
-        if wake["reason"] == "result":
+        if wake["reason"] == "result" or awaiting_review(snap, task):
             return self._ack(wake, key, f"await: owner {task['owner']} reviews the result", out)
         if wake["reason"] not in ROUTABLE_REASONS:
             return self._ack(wake, key, f"noop: reason {wake['reason']}", out)
@@ -203,7 +218,8 @@ class Router:
         # Fresh-snapshot guard: the chosen agent must still be free (plan 2.3).
         fresh = self.client.snapshot()
         fresh_task = _by_id(fresh.get("task", [])).get(task["id"])
-        busy = any(a["worker"] == choice and a["status"] in LIVE for a in fresh.get("attempt", []))
+        # Also refuse if anyone (e.g. the owner) started work on this task meanwhile.
+        busy = any((a["worker"] == choice or a["taskId"] == task["id"]) and a["status"] in LIVE for a in fresh.get("attempt", []))
         if not fresh_task or fresh_task["scopeRevision"] != task["scopeRevision"] or busy:
             return self._ack(wake, key, f"wait: guard_override ({choice} busy or task changed)", out)
         return self._assign(wake, key, task, project, choice, judgment_id, why, fresh, out)
@@ -288,8 +304,9 @@ class Router:
 
     def _escalate(self, wake, key, task, project, kind: str, need: str, out: Outcome, approve_reserved: str | None = None) -> Outcome:
         reason = f"{kind}: {need}"
-        self._cmd(out, "task.block", task["id"], task["revision"], {"reason": reason}, f"cos:{key}:block")
-        self.ensure_notice({**task, "reason": reason}, project)
+        receipt = self._cmd(out, "task.block", task["id"], task["revision"], {"reason": reason}, f"cos:{key}:block")
+        blocked = next((o for o in receipt.get("objects", []) if o.get("kind") == "task" and o.get("id") == task["id"]), {**task, "reason": reason, "revision": task["revision"] + 1})
+        self.ensure_notice(blocked, project)
         return self._ack(wake, key, f"escalate: {reason}", out)
 
     def ensure_notice(self, task: dict[str, Any], project: dict[str, Any]) -> bool:
@@ -311,9 +328,10 @@ class Router:
         out.decision, out.acked = decision, True
         return out
 
-    def _cmd(self, out: Outcome, op: str, object_id: str, expected: int, payload: dict[str, Any], command_id: str) -> None:
-        self.client.command(op, object_id, expected, payload, command_id=command_id)
+    def _cmd(self, out: Outcome, op: str, object_id: str, expected: int, payload: dict[str, Any], command_id: str) -> dict[str, Any]:
+        receipt = self.client.command(op, object_id, expected, payload, command_id=command_id)
         out.commands.append(op)
+        return receipt or {}
 
     @staticmethod
     def _deps_done(task, tasks) -> bool:
@@ -344,10 +362,13 @@ def route_pending(router: Router, client: TeletraanClient) -> list[Outcome]:
             if e.code.startswith("STALE_") or e.code == "ALREADY_EXISTS":
                 log.info("wake %s skipped: %s", wake["id"], e.code)
                 continue
-            failed = True
+            failed = f"{e.code} on {wake['id']}"
             log.error("wake %s failed: %s", wake["id"], e.code)
-            if router.breaker.record_failure("turn"):
-                router.notify(f"Metroplex routing stopped after 3 consecutive failures (last: {e.code} on {wake['id']}). `metroplex reset turn` after fixing.", None)
-    if not failed:
-        router.breaker.record_success("turn")  # consecutive means consecutive
+    # The breaker counts failed passes, not failed wakes: three bad wakes in one
+    # pass are one failure; three consecutive failed passes open it (review N10).
+    if failed:
+        if router.breaker.record_failure("turn"):
+            router.notify(f"Metroplex routing stopped after 3 consecutive failed passes (last: {failed}). `metroplex reset turn` after fixing.", None)
+    else:
+        router.breaker.record_success("turn")
     return outcomes

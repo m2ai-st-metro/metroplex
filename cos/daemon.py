@@ -24,6 +24,8 @@ from cos.safety import LOOPS, CircuitBreaker, ShutdownHandler
 from cos.store import LocalStore
 from cos.teletraan_client import TeletraanClient, WorkError
 
+CONTROL = ("/pause", "/resume", "/stop", "/status")
+
 log = logging.getLogger(__name__)
 
 
@@ -75,6 +77,11 @@ class Daemon:
 
     # ------------------------------------------------------------------ inbound
     def handle(self, item: Inbound) -> None:
+        command = item.text.strip().split()[0].lower() if item.kind == "text" and item.text.strip() else ""
+        if self.breaker.is_open("intake", now=self.clock()) and command not in CONTROL:
+            # The breaker is honored, not just announced (review N11).
+            self.bot.send("Metroplex intake is paused after repeated failures. `metroplex reset intake` to resume; /status /pause /resume /stop still work.")
+            return
         try:
             if item.kind == "callback":
                 reply = self._callback(item)
@@ -104,7 +111,10 @@ class Daemon:
             # (every step is replay-safe, nothing is duplicated).
             if item.kind == "callback" and item.callback_id:
                 self.bot.answer(item.callback_id, "That did not finish")
-            self.bot.send(f"That did not finish ({type(e).__name__}: {e}). Tap or send it again to retry; nothing is duplicated.")
+            if isinstance(e, WorkError) and e.code == "COMMAND_ID_CONFLICT":
+                self.bot.send("That conflicts with an earlier action on the same item; nothing new was done. Send /status, or start the item over.")
+            else:
+                self.bot.send(f"That did not finish ({type(e).__name__}: {e}). Tap or send it again to retry; nothing is duplicated.")
             if self.breaker.record_failure("intake", now=self.clock()):
                 self.bot.send(f"Metroplex intake stopped after 3 failures ({e}). `metroplex reset intake` after fixing.")
 
@@ -125,7 +135,7 @@ class Daemon:
                 return "That button has expired."
             if kind == "hold":
                 return "Held. The task stays blocked until you approve it."
-            result = self.intake.approve_reserved(ref["taskId"], ref["scopeRevision"], item.from_id, item.chat_id, item.message_id)
+            result = self.intake.approve_reserved(ref["taskId"], ref["scopeRevision"], item.from_id, item.chat_id, item.message_id, block_revision=ref["blockRevision"])
             self._log("reserved_yes", task=ref["taskId"], result=result)
             return result
         return "Unknown button."

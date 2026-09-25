@@ -42,7 +42,9 @@ class LocalStore:
             raise ValueError(status)
         now = time.time()
         self.db.execute(
-            "INSERT INTO cards VALUES(?,?,?,?,?,?,NULL,?,?) ON CONFLICT(card_id) DO UPDATE SET card=excluded.card, card_hash=excluded.card_hash, status=excluded.status, question=excluded.question, updated_at=excluded.updated_at",
+            # created_at restarts on every (re)draft: the 7-day expiry counts from when
+            # Matthew was last shown the card (review N11).
+            "INSERT INTO cards VALUES(?,?,?,?,?,?,NULL,?,?) ON CONFLICT(card_id) DO UPDATE SET card=excluded.card, card_hash=excluded.card_hash, status=excluded.status, question=excluded.question, created_at=excluded.created_at, updated_at=excluded.updated_at",
             (card_id, json.dumps(card), card_hash, status, source, question, now, now),
         )
 

@@ -63,12 +63,16 @@ def test_b3_hourly_resume_finishes_granting_cards(work, store):
     d, transport = daemon(work, store, ScriptedReasoner())
     d.handle(text("build the thing"))
     card_id = yes_button(transport).split(":")[1]
-    card = store.get_card(card_id)
-    work.cmd("cos", "approval.record", f"approval-{card_id}", {"scope": "project", "cardHash": card["card_hash"], "fromId": "7001", "chatId": "7001", "messageId": "1"})
-    work.cmd("cos", "project.create", "p-x", {"card": card["card"], "approvalId": f"approval-{card_id}"})
-    store.set_card_status(card_id, "granting", "p-x")
+    real = work.clients["cos"].command
+    def no_tasks(op, *a, **k):
+        if op == "task.create":
+            raise WorkError("SOCKET_DROPPED")
+        return real(op, *a, **k)
+    work.clients["cos"].command = no_tasks
+    d.handle(button(yes_button(transport)))
+    work.clients["cos"].command = real
     assert d.intake.resume_granting() == [card_id]
-    assert len(work["operator"].snapshot()["task"]) == 2
+    assert len(work["operator"].snapshot()["task"]) == 2 and store.get_card(card_id)["status"] == "granted"
 
 
 def test_b5_failed_escalation_notice_is_resent_by_the_sweep(work, store):
@@ -150,8 +154,8 @@ def test_b9_card_command_turns_a_proposal_into_a_card(work, store):
     d.intake.reasoner = ScriptedReasoner()
     d.handle(text(f"card {pid}", mid="2"))
     assert transport.sent[-1]["text"].startswith("CARD: ")
-    d.handle(text("card nope", mid="3"))
-    assert "No card or proposal named nope" in transport.sent[-1]["text"]
+    d.handle(text("card Q-nope", mid="3"))
+    assert "No card or proposal named Q-nope" in transport.sent[-1]["text"]
 
 
 def test_jev_is_not_paid_twice_after_a_crash_between_call_and_record(work, store):

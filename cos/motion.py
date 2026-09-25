@@ -18,7 +18,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Callable
 
-from cos.routing import ESCALATION_KINDS, escalation_notice, notice_key
+from cos.routing import ESCALATION_KINDS, awaiting_review, escalation_notice, notice_key
 from cos.store import LocalStore
 from cos.teletraan_client import TeletraanClient, WorkError
 
@@ -87,7 +87,7 @@ def find(snap: dict[str, Any], thresholds: Any, now: float) -> list[Finding]:
         deps_done = all(tasks.get(d, {}).get("status") == "done" for d in t.get("dependencies", []))
         # M3 unassigned: ready OR active with nothing live (an attempt failed and
         # the retry waited), unblocked, nothing pending, quiet for the window.
-        if t["status"] in ("ready", "active") and deps_done and t["id"] not in live_tasks and not any(k[0] == t["id"] for k in pending):
+        if t["status"] in ("ready", "active") and deps_done and t["id"] not in live_tasks and not any(k[0] == t["id"] for k in pending) and not awaiting_review(snap, t):
             quiet_since = last_ack.get(t["id"])
             if quiet_since is not None and now - quiet_since > thresholds.unassigned_s:
                 findings.append(Finding("M3 unassigned", t["id"], "unassigned", f"{t['status']} with nothing running for {int((now - quiet_since) // 60)} min"))

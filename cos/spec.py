@@ -22,7 +22,9 @@ def _canonical(value: Any) -> Any:
     if isinstance(value, list):
         return [_canonical(v) for v in value]
     if isinstance(value, dict):
-        return {k: _canonical(value[k]) for k in sorted(value)}
+        # Order keys by UTF-16 code units, exactly like JS Array.prototype.sort
+        # (Python's sort_keys uses code points; they differ above U+FFFF).
+        return {k: _canonical(value[k]) for k in sorted(value, key=lambda k: k.encode("utf-16-be"))}
     return value
 
 
@@ -31,7 +33,7 @@ def card_digest(card: dict[str, Any]) -> str:
     Teletraan, which drops only `undefined` (a value Python cannot produce).
     Cards carry strings, booleans, ints and lists only: no floats, so number
     formatting cannot diverge between the two languages."""
-    text = json.dumps(_canonical(card), sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    text = json.dumps(_canonical(card), separators=(",", ":"), ensure_ascii=False)
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 

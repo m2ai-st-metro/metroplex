@@ -48,7 +48,8 @@ class Intake:
 
     # ------------------------------------------------------------------ I1/I2
     def handle_text(self, text: str, message_id: str) -> str:
-        command = re.match(r"^\s*card\s+(\S+)\s*$", text, re.I)
+        # Only real ids: "card games" is an idea, not a command (review N9).
+        command = re.match(r"^\s*card\s+(card-[0-9a-f]{8}|Q-\S+)\s*$", text, re.I)
         if command:
             return self.card_command(command.group(1))
         open_card = self.store.get("open_question")
@@ -76,10 +77,13 @@ class Intake:
         """'card <id>': redraft a card that is still drafting, or turn an inert
         proposal (any tool may have filed it) into a card for Matthew's yes."""
         stored = self.store.get_card(ref)
+        if stored is None and not ref.startswith("card-"):
+            stored = self.store.get_card(f"card-{_short(ref)}")  # the card made from this proposal
         if stored and stored["status"] == "drafting":
-            return self._draft(ref, stored["source"] or stored["card"].get("title", ""))
+            return self._draft(stored["card_id"], stored["source"] or stored["card"].get("title", ""))
         if stored:
-            self.send(f"{ref} is {stored['status']}; nothing to redraft.", None)
+            # Never rewrite a card that is waiting, granting, or granted (review N4).
+            self.send(f"{ref} is already {stored['status']}; nothing to redraft.", None)
             return "closed"
         proposal = next((p for p in self.client.snapshot().get("proposal", []) if p["id"] == ref), None)
         if not proposal:
@@ -184,11 +188,29 @@ class Intake:
         card = stored["card"]
         if card_digest(card) != stored["card_hash"]:
             return "The stored card changed after drafting; not approving."
-        approval_id = f"approval-{card_id}"
-        project_id = f"p-{_slug(card['title'])}-{card_id[-4:]}"
-        self.client.command("approval.record", approval_id, 0, {"scope": "project", "cardHash": stored["card_hash"], "fromId": from_id, "chatId": chat_id, "messageId": message_id}, command_id=f"cos:approval:{card_id}")
-        self.client.command("project.create", project_id, 0, {"card": card, "approvalId": approval_id}, command_id=f"cos:project:{card_id}")
-        self.store.set_card_status(card_id, "granting", project_id)
+        if stored["status"] == "awaiting_yes":
+            # Record intent locally BEFORE any Teletraan command, so a crash at
+            # any later point leaves a 'granting' card the hourly resume finishes
+            # (review round 2, Codex). The attestation is stored so replays send
+            # byte-identical commands.
+            project_id = f"p-{_slug(card['title'])}-{card_id[-4:]}"
+            self.store.set(f"approval_payload:{card_id}", {"fromId": from_id, "chatId": chat_id, "messageId": message_id})
+            self.store.set_card_status(card_id, "granting", project_id)
+        return self._finish_grant(card_id)
+
+    def _finish_grant(self, card_id: str) -> str:
+        stored = self.store.get_card(card_id)
+        card, digest, project_id = stored["card"], stored["card_hash"], stored["project_id"]
+        attest = self.store.get(f"approval_payload:{card_id}") or {}
+        approval_id = f"approval-{card_id}-{digest[:12]}"
+        try:
+            self.client.command("approval.record", approval_id, 0, {"scope": "project", "cardHash": digest, **attest}, command_id=f"cos:approval:{card_id}:{digest[:12]}")
+            self.client.command("project.create", project_id, 0, {"card": card, "approvalId": approval_id}, command_id=f"cos:project:{card_id}:{digest[:12]}")
+        except WorkError as e:
+            if e.command_rejected and e.code not in ("COMMAND_ID_CONFLICT",):
+                # Proven no-effect domain rejection: the yes did not take; ask again.
+                self.store.set_card_status(card_id, "awaiting_yes")
+            raise
         created = self.decompose(project_id, card)
         self.store.set_card_status(card_id, "granted", project_id)
         return f"Granted {project_id}. {created} tasks created and queued for routing."
@@ -198,9 +220,7 @@ class Intake:
         done = []
         for c in self.store.cards_in("granting"):
             try:
-                n = self.decompose(c["project_id"], c["card"])
-                self.store.set_card_status(c["card_id"], "granted", c["project_id"])
-                self.send(f"Finished setting up {c['project_id']}: {n} tasks queued for routing.", None)
+                self.send(self._finish_grant(c["card_id"]).replace("Granted", "Finished setting up", 1), None)
                 done.append(c["card_id"])
             except Exception as e:  # noqa: BLE001 - retried next hour; Matthew is told
                 self.send(f"{c['project_id']} is approved but setup is still incomplete ({e}). I retry hourly; tapping Yes again also retries.", None)
@@ -245,13 +265,13 @@ class Intake:
         ids = [f"{project_id}:t{i + 1}" for i in range(len(tasks))]
         existing = {t["id"]: t for t in self.client.snapshot().get("task", [])}
         for task_id, t in zip(ids, tasks):
-            if task_id in existing:
-                continue
-            checkpoints, quality = default_checks(goals[t["goalId"]])
-            spec = validate_task_spec({"cardGoalId": t["goalId"], "doneWhen": t["acceptance"], "checkpoints": checkpoints, "qualityChecks": quality, "reservedAction": None, "humanOnly": False, "synthetic": False})
-            self.client.command("task.create", task_id, 0, {"projectId": project_id, "owner": card["owner"], "title": t["title"], "objective": t["objective"], "acceptance": spec["doneWhen"], "spec": spec}, command_id=f"cos:decompose:{task_id}")
-        existing = {t["id"]: t for t in self.client.snapshot().get("task", [])}
-        for task_id, t in zip(ids, tasks):
+            if task_id not in existing:
+                checkpoints, quality = default_checks(goals[t["goalId"]])
+                spec = validate_task_spec({"cardGoalId": t["goalId"], "doneWhen": t["acceptance"], "checkpoints": checkpoints, "qualityChecks": quality, "reservedAction": None, "humanOnly": False, "synthetic": False})
+                receipt = self.client.command("task.create", task_id, 0, {"projectId": project_id, "owner": card["owner"], "title": t["title"], "objective": t["objective"], "acceptance": spec["doneWhen"], "spec": spec}, command_id=f"cos:decompose:{task_id}")
+                existing[task_id] = next(o for o in receipt["objects"] if o.get("kind") == "task" and o["id"] == task_id)
+            # Dependencies right after each task, not in a second pass: dependsOn
+            # only points at earlier tasks, which already exist (review N3).
             deps = [ids[j] for j in t["dependsOn"]]
             if deps and not existing[task_id].get("dependencies"):
                 self.client.command("task.dependencies", task_id, existing[task_id]["revision"], {"dependencies": deps}, command_id=f"cos:deps:{task_id}")
@@ -283,16 +303,18 @@ class Intake:
         return expired
 
     # ------------------------------------------------------------------ reserved actions (C4)
-    def approve_reserved(self, task_id: str, scope_revision: int, from_id: str, chat_id: str, message_id: str) -> str:
-        """The button carries only task and scope revision (Telegram's 64-byte
-        limit); the action approved is read from the task spec, never the button."""
+    def approve_reserved(self, task_id: str, scope_revision: int, from_id: str, chat_id: str, message_id: str, *, block_revision: int) -> str:
+        """One approval per block episode (review N1). The button maps to the task,
+        its scope revision and the revision it was blocked at; the action comes
+        from the task spec, never the button. Each episode gets its own approval
+        and command ids, so a re-ask after a failed attempt can be approved."""
         task = next((t for t in self.client.snapshot().get("task", []) if t["id"] == task_id), None)
-        if not task or task["scopeRevision"] != scope_revision:
+        if not task or task["scopeRevision"] != scope_revision or task["status"] != "blocked" or task["revision"] != block_revision:
             return "That task changed since you were asked; I will ask again if it still needs you."
         action = (task.get("spec") or {}).get("reservedAction")
         if not action:
             return "That task no longer needs a reserved action."
-        self.client.command("approval.record", f"reserved-{task_id}-{scope_revision}", 0, {"scope": "reserved_action", "taskId": task_id, "action": action, "scopeRevision": scope_revision, "fromId": from_id, "chatId": chat_id, "messageId": message_id}, command_id=f"cos:reserved:{task_id}:{scope_revision}")
-        if task["status"] == "blocked":
-            self.client.command("task.resume", task_id, task["revision"], {}, command_id=f"cos:reserved-resume:{task_id}:{scope_revision}")
+        episode = f"{task_id}:r{block_revision}"
+        self.client.command("approval.record", f"reserved-{task_id}-r{block_revision}", 0, {"scope": "reserved_action", "taskId": task_id, "action": action, "scopeRevision": scope_revision, "fromId": from_id, "chatId": chat_id, "messageId": message_id}, command_id=f"cos:reserved:{episode}")
+        self.client.command("task.resume", task_id, block_revision, {}, command_id=f"cos:reserved-resume:{episode}")
         return f"Approved {action.replace('_', ' ')} for {task['title']}. Routing it now."
