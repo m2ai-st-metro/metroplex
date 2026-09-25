@@ -177,11 +177,14 @@ class Daemon:
     def run(self) -> None:
         self.shutdown.install()
         offset = self.store.get("bot_offset")
+        skipped_note = ""
         if offset is None:
-            offset = self.bot.skip_backlog()
+            offset, skipped = self.bot.skip_backlog()
             self.store.set("bot_offset", offset)
-            log.info("first start: skipped Telegram backlog, offset %s", offset)
-        self.bot.send("Metroplex is up. " + self.status())
+            log.info("first start: skipped Telegram backlog, offset %s, pending %s", offset, skipped)
+            if skipped:
+                skipped_note = f" Skipped {skipped} message(s) sent before first start; resend anything you still want."
+        self.bot.send("Metroplex is up. " + self.status() + skipped_note)
         while not self.shutdown.requested:
             try:
                 items, offset = self.bot.poll(offset, timeout=min(25, self.config.wake_poll_s))

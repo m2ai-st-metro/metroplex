@@ -67,11 +67,16 @@ class Bot:
         except Exception as e:  # noqa: BLE001
             log.warning("telegram callback answer failed: %s", e)
 
-    def skip_backlog(self) -> int:
-        """Offset just past the newest pending update, without handling any:
-        messages sent before Metroplex first started are never taken as ideas."""
+    def skip_backlog(self) -> tuple[int, int | None]:
+        """(offset just past the newest pending update, how many were pending).
+        Messages sent before Metroplex first started are never taken as ideas,
+        and Matthew is told how many were skipped."""
+        try:
+            pending = (self.call("getWebhookInfo", {}) or {}).get("pending_update_count")
+        except Exception:  # noqa: BLE001 - the count is informational only
+            pending = None
         updates = self.call("getUpdates", {"offset": -1, "timeout": 0}) or []
-        return (updates[-1]["update_id"] + 1) if updates else 0
+        return ((updates[-1]["update_id"] + 1) if updates else 0), pending
 
     def poll(self, offset: int, timeout: int = 25) -> tuple[list[Inbound], int]:
         updates = self.call("getUpdates", {"offset": offset, "timeout": timeout, "allowed_updates": ["message", "callback_query"]}) or []

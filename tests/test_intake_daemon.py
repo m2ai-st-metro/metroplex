@@ -179,5 +179,5 @@ def test_first_start_skips_the_telegram_backlog():
         calls.append((method, payload))
         return [{"update_id": 41, "message": {"message_id": 1, "text": "old idea", "from": {"id": MATTHEW}, "chat": {"id": MATTHEW}}}] if method == "getUpdates" else True
     bot = Bot(transport, MATTHEW, (MATTHEW,))
-    assert bot.skip_backlog() == 42
-    assert calls == [("getUpdates", {"offset": -1, "timeout": 0})]
+    assert bot.skip_backlog()[0] == 42
+    assert ("getUpdates", {"offset": -1, "timeout": 0}) in calls

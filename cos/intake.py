@@ -41,14 +41,18 @@ DECOMPOSE_SYSTEM = ("Break an approved project into the smallest set of tasks th
 # err toward reserved: a wrong tag costs Matthew one tap, a missed one costs
 # the approval gate (live E2E finding 4).
 _RESERVED_WORDS = {
-    "publish_push_deploy": ("publish", "deploy", "release", "git push", "push to", "pypi", "npm publish", "ship to", "go live", "upload to"),
-    "external_contact": ("email", "e-mail", "send a message", "message the", "contact", "post to", "post on", "post the", "tweet", "slack", "notify customer", "reach out"),
-    "live_fleet_config": ("systemd", "crontab", "cron job", "restart the", "restart service", "live config", "production config", "credential", "env.shared", "pm2"),
+    "live_fleet_config": ("systemd", "systemctl", "crontab", "cron job", "restart", "credential", "api key", "secret", "rotate",
+                          "env.shared", "pm2", "kubectl", "helm", "ansible", "live config", "production config"),
+    "publish_push_deploy": ("publish", "deploy", "release", "roll out", "rollout", "git push", "push the", "push to", "docker push",
+                            "merge", "pull request", "open a pr", "pypi", "npm publish", "ship to", "go live", "go-live", "upload to",
+                            "terraform", "dns", "production"),
+    "external_contact": ("email", "e-mail", "send the", "send a", "message the", "contact", "post to", "post on", "post the", "tweet",
+                         "slack", "notify customer", "reach out", "reply to", "newsletter", "announce", "invite", "sms", "whatsapp"),
 }
 
 
-def infer_reserved(title: str, objective: str) -> str | None:
-    text = f"{title} {objective}".lower()
+def infer_reserved(title: str, objective: str, acceptance: str = "") -> str | None:
+    text = f"{title} {objective} {acceptance}".lower()
     for action, words in _RESERVED_WORDS.items():
         if any(w in text for w in words):
             return action
@@ -293,10 +297,18 @@ class Intake:
                 goal = goals[t["goalId"]]
                 deps = t.get("dependsOn") if isinstance(t.get("dependsOn"), list) else []
                 title, objective = str(t.get("title") or goal["statement"])[:120], str(t.get("objective") or goal["statement"])
-                tagged = t.get("reservedAction") if t.get("reservedAction") in RESERVED_ACTIONS else None  # invented names are dropped
-                tasks.append({"goalId": goal["goalId"], "title": title, "objective": objective,
-                              "acceptance": str(t.get("acceptance") or goal["doneWhen"]), "dependsOn": [j for j in deps if isinstance(j, int) and not isinstance(j, bool) and 0 <= j < len(tasks)],
-                              "reservedAction": tagged or infer_reserved(title, objective)})
+                acceptance = str(t.get("acceptance") or goal["doneWhen"])
+                raw_tag = t.get("reservedAction")
+                if raw_tag in RESERVED_ACTIONS:
+                    tagged = raw_tag
+                elif raw_tag:
+                    # The model said "reserved" with a name we do not know: keep
+                    # the signal, never erase it (E2E review E1).
+                    tagged = infer_reserved(str(raw_tag), title, objective + " " + acceptance) or "publish_push_deploy"
+                else:
+                    tagged = infer_reserved(title, objective, acceptance)
+                tasks.append({"goalId": goal["goalId"], "title": title, "objective": objective, "acceptance": acceptance,
+                              "dependsOn": [j for j in deps if isinstance(j, int) and not isinstance(j, bool) and 0 <= j < len(tasks)], "reservedAction": tagged})
                 if len(tasks) >= limit:
                     break
         except ReasoningUnavailable:
@@ -304,7 +316,7 @@ class Intake:
         covered = {t["goalId"] for t in tasks}
         for g in card["goals"]:
             if g["goalId"] not in covered:
-                tasks.append({"goalId": g["goalId"], "title": g["statement"][:120], "objective": g["statement"], "acceptance": g["doneWhen"], "dependsOn": [], "reservedAction": infer_reserved(g["statement"], g["doneWhen"])})
+                tasks.append({"goalId": g["goalId"], "title": g["statement"][:120], "objective": g["statement"], "acceptance": g["doneWhen"], "dependsOn": [], "reservedAction": infer_reserved(g["statement"], "", g["doneWhen"])})
         return tasks
 
     def decompose(self, project_id: str, card: dict[str, Any]) -> int:
@@ -320,7 +332,7 @@ class Intake:
         for task_id, t in zip(ids, tasks):
             if task_id not in existing:
                 checkpoints, quality = default_checks(goals[t["goalId"]])
-                spec = validate_task_spec({"cardGoalId": t["goalId"], "doneWhen": t["acceptance"], "checkpoints": checkpoints, "qualityChecks": quality, "reservedAction": t.get("reservedAction"), "humanOnly": False, "synthetic": False})
+                spec = validate_task_spec({"cardGoalId": t["goalId"], "doneWhen": t["acceptance"], "checkpoints": checkpoints, "qualityChecks": quality, "reservedAction": t["reservedAction"] if "reservedAction" in t else infer_reserved(t["title"], t["objective"], t["acceptance"]), "humanOnly": False, "synthetic": False})
                 receipt = self.client.command("task.create", task_id, 0, {"projectId": project_id, "owner": card["owner"], "title": t["title"], "objective": t["objective"], "acceptance": spec["doneWhen"], "spec": spec}, command_id=f"cos:decompose:{task_id}")
                 existing[task_id] = next(o for o in receipt["objects"] if o.get("kind") == "task" and o["id"] == task_id)
             # Dependencies right after each task, not in a second pass: dependsOn
