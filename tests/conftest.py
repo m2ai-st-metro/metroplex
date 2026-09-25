@@ -18,7 +18,21 @@ sys.path.insert(0, str(ROOT))
 from cos.store import LocalStore  # noqa: E402
 from cos.teletraan_client import TeletraanClient  # noqa: E402
 
-TELETRAAN_ROOT = Path(os.environ.get("METROPLEX_TELETRAAN_ROOT", str(Path.home() / "projects/worktrees/teletraan-continuity-pair")))
+def _teletraan_root() -> Path:
+    """The first checkout that has the work service with the CoS deltas. Before
+    Path B activation the live teletraan-core checkout is on the deployed V1
+    branch, so the merged code is found in the pilot worktree; after it, in
+    teletraan-core itself. An explicit env var always wins."""
+    if os.environ.get("METROPLEX_TELETRAAN_ROOT"):
+        return Path(os.environ["METROPLEX_TELETRAAN_ROOT"])
+    for candidate in (Path.home() / "projects/teletraan-core", Path.home() / "projects/worktrees/teletraan-continuity-pair"):
+        work = candidate / "src/domain/work.mjs"
+        if work.exists() and "cardDigest" in work.read_text():
+            return candidate
+    return Path.home() / "projects/teletraan-core"
+
+
+TELETRAAN_ROOT = _teletraan_root()
 MATTHEW = "7001"
 
 

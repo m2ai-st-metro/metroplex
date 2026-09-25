@@ -63,6 +63,7 @@ provider (DeepInfra is not used by Metroplex).
 venv/bin/python -m pytest tests/ -q
 ```
 
-Integration tests start a real Teletraan work service from the pilot checkout
-(`METROPLEX_TELETRAAN_ROOT`, default `~/projects/worktrees/teletraan-continuity-pair`)
-on a temp socket, and skip when node or the checkout is missing.
+Integration tests start a real Teletraan work service on a temp socket, from the first
+checkout that has the CoS work service (`~/projects/teletraan-core` once it runs `main`,
+else the pilot worktree; override with `METROPLEX_TELETRAAN_ROOT`). They skip when none is
+found; set `METROPLEX_REQUIRE_INTEGRATION=1` to make that a failure (always, before merging).
