@@ -48,9 +48,10 @@ class Intake:
 
     # ------------------------------------------------------------------ I1/I2
     def handle_text(self, text: str, message_id: str) -> str:
-        # Only real ids: "card games" is an idea, not a command (review N9).
-        command = re.match(r"^\s*card\s+(card-[0-9a-f]{8}|Q-\S+)\s*$", text, re.I)
-        if command:
+        # "card <id>" is a command only when <id> resolves to a known card or
+        # proposal (any tool's id format); anything else is an idea (N9, R3).
+        command = re.match(r"^\s*card\s+(\S+)\s*$", text, re.I)
+        if command and self._resolves(command.group(1)):
             return self.card_command(command.group(1))
         open_card = self.store.get("open_question")
         if open_card:
@@ -72,6 +73,11 @@ class Intake:
             self.send(f"One question before I draft the card:\n{question}", None)
             return "asked"
         return self._draft(card_id, text)
+
+    def _resolves(self, ref: str) -> bool:
+        if self.store.get_card(ref):
+            return True
+        return any(p["id"] == ref for p in self.client.snapshot().get("proposal", []))
 
     def card_command(self, ref: str) -> str:
         """'card <id>': redraft a card that is still drafting, or turn an inert
@@ -194,14 +200,24 @@ class Intake:
             # (review round 2, Codex). The attestation is stored so replays send
             # byte-identical commands.
             project_id = f"p-{_slug(card['title'])}-{card_id[-4:]}"
-            self.store.set(f"approval_payload:{card_id}", {"fromId": from_id, "chatId": chat_id, "messageId": message_id})
+            # The first yes for this card version is the attestation; retries
+            # replay it byte-identically instead of conflicting (round-3 R2).
+            key = f"approval_payload:{card_id}:{stored['card_hash'][:12]}"
+            if not self.store.get(key):
+                self.store.set(key, {"fromId": from_id, "chatId": chat_id, "messageId": message_id})
             self.store.set_card_status(card_id, "granting", project_id)
         return self._finish_grant(card_id)
 
     def _finish_grant(self, card_id: str) -> str:
         stored = self.store.get_card(card_id)
         card, digest, project_id = stored["card"], stored["card_hash"], stored["project_id"]
-        attest = self.store.get(f"approval_payload:{card_id}") or {}
+        attest = self.store.get(f"approval_payload:{card_id}:{digest[:12]}")
+        if not attest:
+            # No stored yes for this version (e.g. a card left over from older
+            # code): fail closed and ask again rather than replaying blind (R6).
+            self.store.set_card_status(card_id, "awaiting_yes")
+            self.send(f"{card['title']}: I have no record of your yes for this version; tap Yes again.", None)
+            return "Waiting for a fresh yes."
         approval_id = f"approval-{card_id}-{digest[:12]}"
         try:
             self.client.command("approval.record", approval_id, 0, {"scope": "project", "cardHash": digest, **attest}, command_id=f"cos:approval:{card_id}:{digest[:12]}")
@@ -220,8 +236,10 @@ class Intake:
         done = []
         for c in self.store.cards_in("granting"):
             try:
-                self.send(self._finish_grant(c["card_id"]).replace("Granted", "Finished setting up", 1), None)
-                done.append(c["card_id"])
+                result = self._finish_grant(c["card_id"])
+                if self.store.get_card(c["card_id"])["status"] == "granted":
+                    self.send(result.replace("Granted", "Finished setting up", 1), None)
+                    done.append(c["card_id"])
             except Exception as e:  # noqa: BLE001 - retried next hour; Matthew is told
                 self.send(f"{c['project_id']} is approved but setup is still incomplete ({e}). I retry hourly; tapping Yes again also retries.", None)
         return done
@@ -288,6 +306,13 @@ class Intake:
 
     def drop(self, card_id: str) -> str:
         stored = self.store.get_card(card_id)
+        if stored and stored["status"] == "granting":
+            # A stuck 'granting' card can be dropped only if no project exists
+            # yet; an existing project is cancelled in Teletraan instead (R2).
+            if any(p["id"] == stored["project_id"] for p in self.client.snapshot().get("project", [])):
+                return f"{stored['project_id']} already exists; cancel it in Teletraan instead."
+            self.store.set_card_status(card_id, "dropped")
+            return "Dropped. No project had been created."
         if not stored or stored["status"] not in ("drafting", "awaiting_yes"):
             return "That card is already closed."
         self.store.set_card_status(card_id, "dropped")

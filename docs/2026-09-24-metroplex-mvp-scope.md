@@ -102,3 +102,21 @@ Deviations from the plan, each deliberate:
 Not yet done (step 7): an integrated isolated run (real bot, real Jev, real reasoning model
 against a separate Teletraan state dir) and an independent review of both branches. Both
 need Matthew's go-ahead: the run sends Telegram messages and calls hosted APIs.
+
+## Independent review (2026-09-24/25)
+
+Three rounds, Codex (second vendor) and a fresh Claude reviewer each round, findings reproduced
+before fixing. Reports: `~/.claude/agents/.artifacts/{codex,claude}-review-cos-mvp.md`,
+`*-rereview-cos-mvp.md`, `*-rereview3-cos-mvp.md`. Round 3: Teletraan APPROVE (both); Metroplex
+APPROVE WITH FIXES (both, minors only), fixed in the commit after 4960e45.
+
+Accepted residuals, deliberately not fixed:
+- Teletraan allows concurrent contributions on one task by design (continuity plan KTD2).
+  Metroplex's fresh-snapshot guard refuses to add a worker to a task with any live attempt;
+  an owner queueing in the milliseconds between that snapshot and Metroplex's queue command
+  can still produce two attempts.
+- `approve_reserved` records the approval and then resumes the task. If the owner edits the
+  task in between, the resume fails and an extra approval (a real yes from Matthew) remains, so
+  one later retry of that reserved action runs without asking again.
+- The cos principal attests Matthew's Telegram yes itself (spec T2 honest limit): the cos
+  token is approval-equivalent and must be protected like an operator key.

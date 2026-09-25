@@ -29,6 +29,7 @@ class Thresholds:
     unassigned_s: int = 10 * 60
     orphan_wake_s: int = 15 * 60
     card_expiry_s: int = 7 * 24 * 3600
+    review_overdue_s: int = 24 * 3600
 
 
 @dataclass(frozen=True)

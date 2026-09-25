@@ -154,8 +154,9 @@ def test_b9_card_command_turns_a_proposal_into_a_card(work, store):
     d.intake.reasoner = ScriptedReasoner()
     d.handle(text(f"card {pid}", mid="2"))
     assert transport.sent[-1]["text"].startswith("CARD: ")
+    before = len(transport.sent)
     d.handle(text("card Q-nope", mid="3"))
-    assert "No card or proposal named Q-nope" in transport.sent[-1]["text"]
+    assert all("No card or proposal" not in m["text"] for m in transport.sent[before:]), "an unknown id is an idea, not a failed command (R3)"
 
 
 def test_jev_is_not_paid_twice_after_a_crash_between_call_and_record(work, store):

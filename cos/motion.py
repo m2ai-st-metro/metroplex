@@ -103,6 +103,13 @@ def find(snap: dict[str, Any], thresholds: Any, now: float) -> list[Finding]:
             if kind in ESCALATION_KINDS:
                 findings.append(Finding("E notice", t["id"], None, reason, notice_key(t, kind)))
 
+    # M7 overdue owner review: a current result nobody has reviewed for a day.
+    for w in wakes:
+        t = tasks.get(w["taskId"])
+        raised = _ts(w.get("raisedAt"))
+        if w["reason"] == "result" and t and t["status"] not in ("done", "cancelled") and raised is not None and now - raised > thresholds.review_overdue_s and awaiting_review(snap, t):
+            findings.append(Finding("M7 review", t["id"], None, f"{t['title']}: result awaiting owner review ({t['owner']}) for {int((now - raised) // 3600)} h", f"review:{w['id']}:{w['cycle']}"))
+
     # M4 orphaned wake: pending past the window. The wake loop retries pending
     # wakes every poll, so an orphan means that loop is failing.
     for w in wakes:
@@ -119,7 +126,7 @@ def sweep(client: TeletraanClient, store: LocalStore, thresholds: Any, max_wakes
     findings = find(snap, thresholds, now)
     tasks = {t["id"]: t for t in snap.get("task", [])}
     projects = {p["id"]: p for p in snap.get("project", [])}
-    raised, orphans, queued = 0, [], []
+    raised, orphans, queued, reviews = 0, [], [], []
     for f in findings:
         if f.check == "E notice":
             if not dry_run and not store.get(f.ref):
@@ -131,7 +138,7 @@ def sweep(client: TeletraanClient, store: LocalStore, thresholds: Any, max_wakes
             continue
         if f.reason is None:
             if not store.get(f"sent:{f.ref}"):
-                (orphans if f.check == "M4 orphan" else queued).append(f)
+                (orphans if f.check == "M4 orphan" else reviews if f.check == "M7 review" else queued).append(f)
             continue
         if f.ref and store.get(f"raised:{f.ref}"):
             continue  # already raised for this episode; new progress starts a new one
@@ -149,7 +156,7 @@ def sweep(client: TeletraanClient, store: LocalStore, thresholds: Any, max_wakes
         except WorkError as e:
             log.info("wake.raise %s %s skipped: %s", f.task_id, f.reason, e.code)
     # One batched message per sweep for new notice-only findings, never one each.
-    for label, batch in (("stuck wakes (routing loop failing)", orphans), ("attempts never started", queued)):
+    for label, batch in (("stuck wakes (routing loop failing)", orphans), ("attempts never started", queued), ("results awaiting owner review", reviews)):
         if batch and not dry_run:
             lines = "\n".join(f"- {f.detail}" for f in batch[:10]) + (f"\n...and {len(batch) - 10} more" if len(batch) > 10 else "")
             if notify(f"Metroplex: {len(batch)} {label}.\n{lines}\nCheck `metroplex status`.", None):

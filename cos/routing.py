@@ -49,9 +49,18 @@ def awaiting_review(snap: dict[str, Any], task: dict[str, Any]) -> bool:
     """A current-scope result or accepted contribution is the owner's to review
     or complete; routing must never send a second worker (review N2)."""
     rev = task.get("scopeRevision")
-    if any(c["taskId"] == task["id"] and (c.get("accepted") or {}).get("scopeRevision") == rev for c in snap.get("contribution", [])):
-        return True
-    return any(a["taskId"] == task["id"] and a["status"] == "completed" and a.get("resultCurrent") and a.get("scopeRevision") == rev for a in snap.get("attempt", []))
+    attempts = {a["id"]: a for a in snap.get("attempt", [])}
+    for c in snap.get("contribution", []):
+        if c["taskId"] != task["id"]:
+            continue
+        if (c.get("accepted") or {}).get("scopeRevision") == rev:
+            return True  # accepted: the owner completes the task
+        # Only the contribution's CURRENT attempt counts: a rework the owner
+        # queued that then failed is not awaiting review (round-3 R1).
+        a = attempts.get(c.get("currentAttempt"))
+        if a and a["status"] == "completed" and a.get("resultCurrent") and a.get("scopeRevision") == rev:
+            return True
+    return False
 
 
 def escalation_notice(store: LocalStore, task: dict[str, Any], project: dict[str, Any], kind: str, need: str) -> tuple[str, list[list[dict[str, str]]] | None]:

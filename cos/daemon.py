@@ -79,7 +79,10 @@ class Daemon:
     def handle(self, item: Inbound) -> None:
         command = item.text.strip().split()[0].lower() if item.kind == "text" and item.text.strip() else ""
         if self.breaker.is_open("intake", now=self.clock()) and command not in CONTROL:
-            # The breaker is honored, not just announced (review N11).
+            # The breaker is honored, not just announced (review N11), and a
+            # tapped button always gets an answer so its spinner stops (R4).
+            if item.kind == "callback" and item.callback_id:
+                self.bot.answer(item.callback_id, "Metroplex intake is paused")
             self.bot.send("Metroplex intake is paused after repeated failures. `metroplex reset intake` to resume; /status /pause /resume /stop still work.")
             return
         try:
@@ -104,7 +107,8 @@ class Daemon:
                 self.bot.send("Commands: /status /pause /resume /stop. Anything else is an idea.")
             else:
                 self.intake.handle_text(text, item.message_id)
-            self.breaker.record_success("intake")
+            if command not in CONTROL:
+                self.breaker.record_success("intake")  # control commands never close it (R4)
         except Exception as e:  # noqa: BLE001 - one bad message must not stop the bot
             log.exception("inbound failed")
             # Never fail silently: say what broke and that a retry is safe
