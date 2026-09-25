@@ -73,3 +73,31 @@ F1 to F3, J4, K3.
 5. `spec.py`, `cards.py`, `bot_intake.py`, decompose mode (C1 to C3, C6, P1 to P5).
 6. Escalation path (C4) and motion checks (K1, K2).
 7. Integrated isolated run against a separate Teletraan state dir and socket, then independent review.
+
+## Build status (2026-09-24)
+
+Built on branches, nothing pushed, nothing activated:
+- Teletraan pilot `feat/organization-continuity-pair`: `9b935bf` (stale test fix), `fc333f6`
+  (MVP deltas), `87050bd` (judgment on contribution), `415ffac` (motion timestamps),
+  `0178310` (cos agent visibility). Full suite 95/95. CCOS pilot Teletraan-backed tests 18/18.
+- Metroplex `feature/cos-mvp` (worktree `~/projects/worktrees/metroplex-cos-mvp`): `b077759`,
+  `75dc09b`, `2cfa07f`, `09d6921`. 68 tests against a real Teletraan work service, ruff clean.
+  mypy is not installed in the venv, so types were not checked.
+
+Deviations from the plan, each deliberate:
+- Routing creates a contribution for the chosen worker and never calls `task.assign`: the
+  owner stays accountable (continuity plan R2). The judgment link moved to
+  `contribution.create` (new Teletraan check).
+- D9 tightened: citing a card goal needs the `assign` grant; work-only agents add children
+  only under tasks they own.
+- Stalled attempts (M1/M2): owner and Matthew are notified once per stall episode; no assist
+  contributor is added in the MVP. Assist moves to after the MVP (K1 re-scoped).
+- Thrash cap is per task (3 routing turns per 15 minutes), not per project.
+- `cos` sees every active persistent agent (identities only) so it can name card owners.
+- Teletraan now records `raisedAt`/`acknowledgedAt` on wakes and `startedAt` on attempts.
+- Found in passing: the pilot's approval runs used selected test subsets only; one test in
+  the full suite was stale and failing. Fixed and committed separately.
+
+Not yet done (step 7): an integrated isolated run (real bot, real Jev, real reasoning model
+against a separate Teletraan state dir) and an independent review of both branches. Both
+need Matthew's go-ahead: the run sends Telegram messages and calls hosted APIs.
