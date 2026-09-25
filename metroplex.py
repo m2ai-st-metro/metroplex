@@ -39,7 +39,7 @@ def build(config: Config):
         raise SystemExit("METROPLEX_TELEGRAM_BOT_TOKEN, METROPLEX_TELEGRAM_CHAT_ID and METROPLEX_APPROVER_IDS are required")
     bot = Bot(http_transport(config.bot_token), config.chat_id, config.approver_ids)
     send = lambda text, buttons=None: bot.send(text, buttons)  # noqa: E731
-    router = Router(client, config, breaker, caps, notify=send)
+    router = Router(client, config, store, breaker, caps, notify=send)
     intake = Intake(client, store, reasoner_for(config, True), send, config)
     return store, client, bot, intake, router, breaker
 

@@ -54,6 +54,11 @@ class Work:
 def work(tmp_path):
     node = shutil.which("node")
     if not node or not (TELETRAAN_ROOT / "src/domain/work.mjs").exists():
+        # These are the crash-recovery, approval and routing tests. Where they
+        # must run (pre-merge, local), set METROPLEX_REQUIRE_INTEGRATION=1 so a
+        # missing checkout fails loudly instead of skipping to a false green.
+        if os.environ.get("METROPLEX_REQUIRE_INTEGRATION") == "1":
+            pytest.fail(f"integration required but Teletraan checkout not found at {TELETRAAN_ROOT}")
         pytest.skip("Teletraan pilot checkout or node not available")
     proc = subprocess.Popen([node, str(ROOT / "tests/fixtures/work_service.mjs"), str(TELETRAAN_ROOT), str(tmp_path), MATTHEW], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     line = proc.stdout.readline()

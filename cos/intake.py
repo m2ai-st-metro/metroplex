@@ -48,6 +48,9 @@ class Intake:
 
     # ------------------------------------------------------------------ I1/I2
     def handle_text(self, text: str, message_id: str) -> str:
+        command = re.match(r"^\s*card\s+(\S+)\s*$", text, re.I)
+        if command:
+            return self.card_command(command.group(1))
         open_card = self.store.get("open_question")
         if open_card:
             self.store.set("open_question", None)
@@ -68,6 +71,23 @@ class Intake:
             self.send(f"One question before I draft the card:\n{question}", None)
             return "asked"
         return self._draft(card_id, text)
+
+    def card_command(self, ref: str) -> str:
+        """'card <id>': redraft a card that is still drafting, or turn an inert
+        proposal (any tool may have filed it) into a card for Matthew's yes."""
+        stored = self.store.get_card(ref)
+        if stored and stored["status"] == "drafting":
+            return self._draft(ref, stored["source"] or stored["card"].get("title", ""))
+        if stored:
+            self.send(f"{ref} is {stored['status']}; nothing to redraft.", None)
+            return "closed"
+        proposal = next((p for p in self.client.snapshot().get("proposal", []) if p["id"] == ref), None)
+        if not proposal:
+            self.send(f"No card or proposal named {ref}.", None)
+            return "unknown"
+        card_id = f"card-{_short(ref)}"
+        self.store.put_card(card_id, {"title": proposal["title"]}, "", "drafting", source=proposal["body"])
+        return self._draft(card_id, proposal["body"])
 
     def _file_note(self, text: str, message_id: str, why: str) -> str:
         pid = f"Q-metroplex-{_short(message_id + text)}"
@@ -130,21 +150,35 @@ class Intake:
             "specTemplate": SPEC_TEMPLATE_VERSION,
         }
 
-    @staticmethod
-    def render(card: dict[str, Any]) -> str:
+    RENDERED_KEYS = frozenset({"title", "objective", "doneWhen", "owner", "goals", "scopeIn", "scopeOut", "reservedActions", "kill", "hostedAllowed", "humanOnly", "specTemplate"})
+
+    @classmethod
+    def render(cls, card: dict[str, Any]) -> str:
+        """Every field covered by the approval hash is on screen: a yes may only
+        grant what Matthew was shown (review finding B1)."""
+        unknown = set(card) - cls.RENDERED_KEYS
+        if unknown:
+            raise ValueError(f"card has fields the approval screen does not show: {sorted(unknown)}")
         goals = "\n".join(f"  {g['goalId']}. {g['statement']} (done: {g['doneWhen']})" for g in card["goals"])
-        out = "\n".join(f"  - {s}" for s in card.get("scopeOut", [])) or "  - (none listed)"
+        lst = lambda items: "\n".join(f"  - {i}" for i in items) or "  - (none listed)"  # noqa: E731
         return (f"CARD: {card['title']}\n{card['objective']}\n\nDone when: {card['doneWhen']}\nOwner: {card['owner']}\nGoals:\n{goals}\n"
-                f"Out of scope:\n{out}\nReserved for you: {', '.join(a.replace('_', ' ') for a in card['reservedActions'])}\nKill: {card['kill']}\n\nYes grants this project. Nothing runs before you tap it.")
+                f"In scope:\n{lst(card.get('scopeIn', []))}\nOut of scope:\n{lst(card.get('scopeOut', []))}\n"
+                f"Reserved for you: {', '.join(a.replace('_', ' ') for a in card['reservedActions']) or 'none'}\nKill: {card['kill']}\n"
+                f"Hosted routing via Jev (TypeSafe): {'yes' if card.get('hostedAllowed') else 'no'}\n"
+                f"Human-only (never routed): {'yes' if card.get('humanOnly') else 'no'}\nSpec template: {card.get('specTemplate')}\n\n"
+                f"Yes grants this project. Nothing runs before you tap it.")
 
     # ------------------------------------------------------------------ I4
     def approve(self, card_id: str, hash_prefix: str, from_id: str, chat_id: str, message_id: str) -> str:
+        """Every step is replay-safe (deterministic command ids, stored plan), and
+        the card is 'granted' only after decomposition finishes. A crash or error
+        leaves it 'granting': tapping Yes again, or the hourly resume, finishes it."""
         stored = self.store.get_card(card_id)
-        if not stored or stored["status"] != "awaiting_yes":
+        if not stored or stored["status"] not in ("awaiting_yes", "granting"):
             return "That card is no longer waiting for a yes."
         if not stored["card_hash"].startswith(hash_prefix):
             return "That button belongs to an older version of the card."
-        if self.clock() - stored["created_at"] > self.config.thresholds.card_expiry_s:
+        if stored["status"] == "awaiting_yes" and self.clock() - stored["created_at"] > self.config.thresholds.card_expiry_s:
             self.store.set_card_status(card_id, "expired")
             return "That card expired. Send the idea again for a fresh card."
         card = stored["card"]
@@ -154,37 +188,73 @@ class Intake:
         project_id = f"p-{_slug(card['title'])}-{card_id[-4:]}"
         self.client.command("approval.record", approval_id, 0, {"scope": "project", "cardHash": stored["card_hash"], "fromId": from_id, "chatId": chat_id, "messageId": message_id}, command_id=f"cos:approval:{card_id}")
         self.client.command("project.create", project_id, 0, {"card": card, "approvalId": approval_id}, command_id=f"cos:project:{card_id}")
-        self.store.set_card_status(card_id, "granted", project_id)
+        self.store.set_card_status(card_id, "granting", project_id)
         created = self.decompose(project_id, card)
+        self.store.set_card_status(card_id, "granted", project_id)
         return f"Granted {project_id}. {created} tasks created and queued for routing."
 
+    def resume_granting(self) -> list[str]:
+        """Finish any approved card whose decomposition was interrupted."""
+        done = []
+        for c in self.store.cards_in("granting"):
+            try:
+                n = self.decompose(c["project_id"], c["card"])
+                self.store.set_card_status(c["card_id"], "granted", c["project_id"])
+                self.send(f"Finished setting up {c['project_id']}: {n} tasks queued for routing.", None)
+                done.append(c["card_id"])
+            except Exception as e:  # noqa: BLE001 - retried next hour; Matthew is told
+                self.send(f"{c['project_id']} is approved but setup is still incomplete ({e}). I retry hourly; tapping Yes again also retries.", None)
+        return done
+
     # ------------------------------------------------------------------ S2-S4
-    def decompose(self, project_id: str, card: dict[str, Any]) -> int:
-        """One reasoning pass bounded to max tasks; deterministic fallback is one
-        task per goal, so an outage never blocks an approved project."""
+    def plan(self, card: dict[str, Any]) -> list[dict[str, Any]]:
+        """One bounded reasoning pass, validated field by field (model JSON is
+        untrusted). Any approved goal the model skipped gets a fallback task, so
+        a partial answer can never silently drop work Matthew approved."""
         goals = {g["goalId"]: g for g in card["goals"]}
         limit = self.config.caps.max_decompose_tasks
+        tasks: list[dict[str, Any]] = []
         try:
-            plan = self.reasoner.complete_json(DECOMPOSE_SYSTEM.format(max=limit), json.dumps({"card": card}))
-            tasks = [t for t in plan.get("tasks", []) if isinstance(t, dict) and t.get("goalId") in goals][:limit]
+            raw = self.reasoner.complete_json(DECOMPOSE_SYSTEM.format(max=limit), json.dumps({"card": card}))
+            items = raw.get("tasks") if isinstance(raw, dict) else None
+            for t in items if isinstance(items, list) else []:
+                if not isinstance(t, dict) or not isinstance(t.get("goalId"), str) or t["goalId"] not in goals:
+                    continue
+                goal = goals[t["goalId"]]
+                deps = t.get("dependsOn") if isinstance(t.get("dependsOn"), list) else []
+                tasks.append({"goalId": goal["goalId"], "title": str(t.get("title") or goal["statement"])[:120], "objective": str(t.get("objective") or goal["statement"]),
+                              "acceptance": str(t.get("acceptance") or goal["doneWhen"]), "dependsOn": [j for j in deps if isinstance(j, int) and not isinstance(j, bool) and 0 <= j < len(tasks)]})
+                if len(tasks) >= limit:
+                    break
         except ReasoningUnavailable:
             tasks = []
-        if not tasks:
-            tasks = [{"goalId": g["goalId"], "title": g["statement"][:80], "objective": g["statement"], "acceptance": g["doneWhen"], "dependsOn": []} for g in card["goals"]]
-        ids: list[str] = []
-        for i, t in enumerate(tasks):
-            goal = goals[t["goalId"]]
-            checkpoints, quality = default_checks(goal)
-            spec = validate_task_spec({"cardGoalId": goal["goalId"], "doneWhen": str(t.get("acceptance") or goal["doneWhen"]), "checkpoints": checkpoints, "qualityChecks": quality, "reservedAction": None, "humanOnly": False, "synthetic": False})
-            task_id = f"{project_id}:t{i + 1}"
-            self.client.command("task.create", task_id, 0, {"projectId": project_id, "owner": card["owner"], "title": str(t.get("title") or goal["statement"])[:120], "objective": str(t.get("objective") or goal["statement"]), "acceptance": spec["doneWhen"], "spec": spec}, command_id=f"cos:decompose:{task_id}")
-            ids.append(task_id)
-        snap = self.client.snapshot()
-        revisions = {t["id"]: t["revision"] for t in snap.get("task", [])}
-        for i, t in enumerate(tasks):
-            deps = [ids[j] for j in t.get("dependsOn") or [] if isinstance(j, int) and 0 <= j < i]
-            if deps:
-                self.client.command("task.dependencies", ids[i], revisions[ids[i]], {"dependencies": deps}, command_id=f"cos:deps:{ids[i]}")
+        covered = {t["goalId"] for t in tasks}
+        for g in card["goals"]:
+            if g["goalId"] not in covered:
+                tasks.append({"goalId": g["goalId"], "title": g["statement"][:120], "objective": g["statement"], "acceptance": g["doneWhen"], "dependsOn": []})
+        return tasks
+
+    def decompose(self, project_id: str, card: dict[str, Any]) -> int:
+        """Create the planned tasks. The plan is stored before any task exists, so
+        a resume replays the same plan instead of asking the model again."""
+        tasks = self.store.get(f"plan:{project_id}")
+        if tasks is None:
+            tasks = self.plan(card)
+            self.store.set(f"plan:{project_id}", tasks)
+        goals = {g["goalId"]: g for g in card["goals"]}
+        ids = [f"{project_id}:t{i + 1}" for i in range(len(tasks))]
+        existing = {t["id"]: t for t in self.client.snapshot().get("task", [])}
+        for task_id, t in zip(ids, tasks):
+            if task_id in existing:
+                continue
+            checkpoints, quality = default_checks(goals[t["goalId"]])
+            spec = validate_task_spec({"cardGoalId": t["goalId"], "doneWhen": t["acceptance"], "checkpoints": checkpoints, "qualityChecks": quality, "reservedAction": None, "humanOnly": False, "synthetic": False})
+            self.client.command("task.create", task_id, 0, {"projectId": project_id, "owner": card["owner"], "title": t["title"], "objective": t["objective"], "acceptance": spec["doneWhen"], "spec": spec}, command_id=f"cos:decompose:{task_id}")
+        existing = {t["id"]: t for t in self.client.snapshot().get("task", [])}
+        for task_id, t in zip(ids, tasks):
+            deps = [ids[j] for j in t["dependsOn"]]
+            if deps and not existing[task_id].get("dependencies"):
+                self.client.command("task.dependencies", task_id, existing[task_id]["revision"], {"dependencies": deps}, command_id=f"cos:deps:{task_id}")
         return len(ids)
 
     # ------------------------------------------------------------------ Edit / Drop / expiry

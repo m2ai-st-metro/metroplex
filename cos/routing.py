@@ -8,6 +8,7 @@ owner stays accountable and is the only one who can accept the work.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import time
@@ -17,6 +18,7 @@ from typing import Any, Callable
 from cos import jev_client
 from cos.reasoning import ReasoningUnavailable, reasoner_for
 from cos.safety import CircuitBreaker, CycleCaps
+from cos.store import LocalStore
 from cos.teletraan_client import TeletraanClient, WorkError
 
 log = logging.getLogger(__name__)
@@ -31,6 +33,25 @@ ESCAPES = {
 }
 
 Notify = Callable[[str, list[list[dict[str, str]]] | None], Any]
+ESCALATION_KINDS = ("intent", "authority", "reserved")
+# Teletraan rejections that mean "not now", not "broken": the turn waits.
+NOT_NOW = {"PROJECT_CAPACITY_EXHAUSTED", "WRITABLE_SCOPE_CONFLICT", "BINDING_BUSY", "DEPENDENCY_NOT_DONE", "RESERVED_ACTION_REQUIRES_APPROVAL", "PROJECT_PAUSED", "ATTEMPT_STILL_LIVE"}
+
+
+def notice_key(task: dict[str, Any], kind: str) -> str:
+    return f"notified:{task['id']}:{task['scopeRevision']}:{kind}"
+
+
+def escalation_notice(store: LocalStore, task: dict[str, Any], project: dict[str, Any], kind: str, need: str) -> tuple[str, list[list[dict[str, str]]] | None]:
+    """Text and buttons for an escalation. Reserved-action buttons carry a short
+    token (Telegram caps callback data at 64 bytes); the token maps to the task
+    and scope revision in the local store, never to an action."""
+    buttons = None
+    if kind == "reserved":
+        token = hashlib.sha256(f"{task['id']}:{task['scopeRevision']}".encode()).hexdigest()[:12]
+        store.set(f"cb:{token}", {"taskId": task["id"], "scopeRevision": task["scopeRevision"]})
+        buttons = [[{"text": "Approve", "callback_data": f"r:{token}"}, {"text": "Hold", "callback_data": f"hold:{token}"}]]
+    return f"{project['title']}: {task['title']}\nNeeds you ({kind}): {need}.\nOther work continues.", buttons
 
 
 @dataclass
@@ -49,6 +70,7 @@ class Router:
         self,
         client: TeletraanClient,
         config: Any,
+        store: LocalStore,
         breaker: CircuitBreaker,
         caps: CycleCaps,
         notify: Notify,
@@ -58,6 +80,7 @@ class Router:
     ):
         self.client = client
         self.config = config
+        self.store = store
         self.breaker = breaker
         self.caps = caps
         self.notify = notify
@@ -135,6 +158,7 @@ class Router:
             if wake["reason"] == "unblock" and self._deps_done(task, tasks):
                 self._cmd(out, "task.resume", task["id"], task["revision"], {}, f"cos:{key}:resume")
                 return self._ack(wake, key, "resume: blocker cleared", out)
+            self.ensure_notice(task, project)
             return self._ack(wake, key, f"noop: blocked ({task.get('reason') or 'no reason'})", out)
         if task["status"] == "paused":
             return self._ack(wake, key, "noop: task paused", out)
@@ -151,7 +175,7 @@ class Router:
         if not self._deps_done(task, tasks):
             return self._ack(wake, key, "wait: dependencies not done", out)
         reserved = spec.get("reservedAction")
-        if reserved and reserved in project.get("reservedActions", []) and not self._reserved_approved(snap, task, reserved):
+        if reserved and not self._reserved_approved(snap, task, reserved):
             return self._escalate(wake, key, task, project, "reserved", f"needs your approval for {reserved.replace('_', ' ')} before any agent starts", out, approve_reserved=reserved)
         contribution_id = f"{task['id']}:{wake['reason']}:{wake['cycle']}"
         prior = _by_id(snap.get("contribution", [])).get(contribution_id)
@@ -163,6 +187,9 @@ class Router:
         if not self.caps.take(f"turns:{task['id']}", self.config.caps.turns_per_project_per_cycle, now=self.clock()):
             out.decision = "hold: task routed 3 times this cycle (thrash guard)"
             return out
+        limit = project.get("concurrencyLimit")
+        if limit is not None and sum(1 for a in snap.get("attempt", []) if a["projectId"] == project["id"] and a["status"] in LIVE) >= limit:
+            return self._ack(wake, key, "wait: project at its concurrency limit", out)
         cands, total = self.candidates(snap, task, project)
         if not cands:
             if total:
@@ -189,17 +216,24 @@ class Router:
         judgment = None
         jid = f"route:{key}"
         existing = _by_id(snap.get("judgment", [])).get(jid)
-        use_jev = project.get("hostedAllowed") and not self.breaker.is_open("jev", now=self.clock()) and self.caps.take("jev", self.config.caps.jev_per_cycle, now=self.clock())
+        inflight = self.store.get(f"jev_inflight:{jid}")
         if existing:
-            judgment = existing  # crash replay: never pay for the same question twice
-        elif use_jev:
+            judgment = existing  # crash replay: reuse the recorded answer
+        elif project.get("hostedAllowed") and not self.breaker.is_open("jev", now=self.clock()) and self.caps.take("jev", self.config.caps.jev_per_cycle, now=self.clock()):
             request = self.jev_request(task, project, cands, wake)
+            # A crash after the HTTP call but before judgment.record must not buy
+            # a second call: mark in flight first; a replay records "unknown".
+            post = self.jev_post
+            if inflight:
+                def post(key, req):  # noqa: ARG001 - replay never calls the provider
+                    raise RuntimeError("JEV_OUTCOME_UNKNOWN_AFTER_RESTART")
+            self.store.set(f"jev_inflight:{jid}", True)
             judgment = jev_client.evaluate(
                 judgment_id=jid, task_id=task["id"], scope_revision=task["scopeRevision"], context_revision=task["revision"],
                 question_version=QUESTION_VERSION, threshold_version=th.version, min_confidence=th.jev_min_confidence,
                 hosted_allowed=True, request=request, api_key=self.config.typesafe_api_key,
                 persist=lambda rec: self.client.command("judgment.record", jid, 0, {**rec, "taskId": task["id"]}, command_id=f"cos:{jid}"),
-                post=self.jev_post, env=self.config.env,
+                post=post, env=self.config.env,
             )
             if judgment["status"] == "unavailable":
                 self.breaker.record_failure("jev", now=self.clock())
@@ -212,15 +246,18 @@ class Router:
         return self._reason(task, project, cands, judgment, jid if judgment else None)
 
     def _reason(self, task, project, cands, judgment, jid) -> tuple[str, str | None, str]:
+        if self.breaker.is_open("reasoning", now=self.clock()):
+            return "wait", jid, "local reasoning is paused by its breaker (`metroplex reset reasoning`)"
         reasoner = self.reasoner_factory(self.config, bool(project.get("hostedAllowed")))
         system = ("You route one task to one agent for Metroplex, Matthew's chief of staff. Choose exactly one agent id from the candidates, "
                   "or 'wait', or 'none_fit'. Never invent an agent. JSON: {\"choice\": str, \"reason\": str}.")
         user = json.dumps({"task": {k: task.get(k) for k in ("title", "objective", "acceptance", "spec")}, "projectObjective": project["objective"], "candidates": cands, "jev": judgment and {k: judgment.get(k) for k in ("status", "answers", "error")}})
         try:
             result = reasoner.complete_json(system, user)
-            self.breaker.record_success("turn")
+            self.breaker.record_success("reasoning")
         except ReasoningUnavailable as e:
-            self.breaker.record_failure("turn", now=self.clock())
+            if self.breaker.record_failure("reasoning", now=self.clock()):
+                self.notify(f"Metroplex: local Qwen reasoning failed 3 times in a row ({e}). Routing continues on confident Jev answers only; other tasks wait. `metroplex reset reasoning` after fixing.", None)
             return "wait", jid, f"no Jev verdict and reasoning unavailable ({e})"
         choice = result.get("choice")
         if choice not in {c["agent"] for c in cands} | set(ESCAPES):
@@ -241,15 +278,33 @@ class Router:
         if binding:
             queue["bindingId"] = binding["id"]
         if f"{contribution_id}:a1" not in _by_id(snap.get("attempt", [])):
-            self._cmd(out, "attempt.queue", f"{contribution_id}:a1", 0, queue, f"cos:{key}:queue")
+            try:
+                self._cmd(out, "attempt.queue", f"{contribution_id}:a1", 0, queue, f"cos:{key}:queue")
+            except WorkError as e:
+                if e.code not in NOT_NOW:
+                    raise
+                return self._ack(wake, key, f"wait: {e.code} while queuing {agent}", out)
         return self._ack(wake, key, f"assign: {agent} ({why})", out)
 
     def _escalate(self, wake, key, task, project, kind: str, need: str, out: Outcome, approve_reserved: str | None = None) -> Outcome:
         reason = f"{kind}: {need}"
         self._cmd(out, "task.block", task["id"], task["revision"], {"reason": reason}, f"cos:{key}:block")
-        buttons = [[{"text": "Approve", "callback_data": f"r:{task['id']}:{task['scopeRevision']}"}, {"text": "Hold", "callback_data": f"hold:{task['id']}"}]] if approve_reserved else None
-        self.notify(f"{project['title']}: {task['title']}\nNeeds you ({kind}): {need}.\nOther work continues.", buttons)
+        self.ensure_notice({**task, "reason": reason}, project)
         return self._ack(wake, key, f"escalate: {reason}", out)
+
+    def ensure_notice(self, task: dict[str, Any], project: dict[str, Any]) -> bool:
+        """Send the escalation notice for a Metroplex-blocked task unless one was
+        already delivered for this scope revision. Delivery is recorded only when
+        Telegram accepted the message, so a crash or send failure is retried by
+        the next wake or sweep instead of leaving the task blocked in silence."""
+        kind, _, need = (task.get("reason") or "").partition(": ")
+        if kind not in ESCALATION_KINDS or self.store.get(notice_key(task, kind)):
+            return False
+        text, buttons = escalation_notice(self.store, task, project, kind, need)
+        if self.notify(text, buttons):
+            self.store.set(notice_key(task, kind), True)
+            return True
+        return False
 
     def _ack(self, wake, key, decision: str, out: Outcome) -> Outcome:
         self._cmd(out, "wake.ack", wake["id"], wake["revision"], {"decision": decision[:500]}, f"cos:{key}:ack")
@@ -266,7 +321,9 @@ class Router:
 
     @staticmethod
     def _reserved_approved(snap, task, action) -> bool:
-        return any(a.get("scope") == "reserved_action" and a.get("taskId") == task["id"] and a.get("action") == action and a.get("scopeRevision") == task["scopeRevision"] for a in snap.get("approval", []))
+        """An unused approval for this task, action and scope revision. Each one
+        covers exactly one attempt (Teletraan enforces the same)."""
+        return any(a.get("scope") == "reserved_action" and a.get("taskId") == task["id"] and a.get("action") == action and a.get("scopeRevision") == task["scopeRevision"] and not a.get("usedBy") for a in snap.get("approval", []))
 
 
 def route_pending(router: Router, client: TeletraanClient) -> list[Outcome]:
@@ -274,9 +331,10 @@ def route_pending(router: Router, client: TeletraanClient) -> list[Outcome]:
     STALE_* rejections mean state moved under us; the next poll retries fresh."""
     pending = client.wake_pending().get("wakes", [])
     if not pending:
+        router.breaker.record_success("turn")  # a quiet pass is a clean pass
         return []
     snap = client.snapshot()
-    outcomes = []
+    outcomes, failed = [], False
     # Sequential on purpose: each turn sees the previous turn's effects.
     for wake in sorted(pending, key=lambda w: (w["projectId"], w["taskId"], w["reason"])):
         try:
@@ -286,6 +344,10 @@ def route_pending(router: Router, client: TeletraanClient) -> list[Outcome]:
             if e.code.startswith("STALE_") or e.code == "ALREADY_EXISTS":
                 log.info("wake %s skipped: %s", wake["id"], e.code)
                 continue
-            router.breaker.record_failure("turn")
+            failed = True
             log.error("wake %s failed: %s", wake["id"], e.code)
+            if router.breaker.record_failure("turn"):
+                router.notify(f"Metroplex routing stopped after 3 consecutive failures (last: {e.code} on {wake['id']}). `metroplex reset turn` after fixing.", None)
+    if not failed:
+        router.breaker.record_success("turn")  # consecutive means consecutive
     return outcomes

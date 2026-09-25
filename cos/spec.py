@@ -73,7 +73,27 @@ def validate_card(card: dict[str, Any]) -> list[str]:
     for key in ("hostedAllowed", "humanOnly"):
         if key in card and not isinstance(card[key], bool):
             problems.append(f"{key} must be true or false")
+    if not _hash_safe(card):
+        problems.append("card must contain only text, true/false, whole numbers and lists (hash parity with Teletraan)")
     return problems
+
+
+def _hash_safe(value: Any) -> bool:
+    """Values whose canonical JSON is byte-identical in Python and JS: no floats,
+    no integer-like object keys (JS orders them first), no lone surrogates."""
+    if isinstance(value, bool) or value is None:
+        return True
+    if isinstance(value, int):
+        return abs(value) <= 2**53 - 1
+    if isinstance(value, float):
+        return False
+    if isinstance(value, str):
+        return not any(0xD800 <= ord(ch) <= 0xDFFF for ch in value)
+    if isinstance(value, list):
+        return all(_hash_safe(v) for v in value)
+    if isinstance(value, dict):
+        return all(isinstance(k, str) and not k.isdigit() and _hash_safe(k) and _hash_safe(v) for k, v in value.items())
+    return False
 
 
 def validate_task_spec(spec: dict[str, Any]) -> dict[str, Any]:

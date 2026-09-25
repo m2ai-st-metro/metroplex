@@ -100,6 +100,11 @@ class Daemon:
             self.breaker.record_success("intake")
         except Exception as e:  # noqa: BLE001 - one bad message must not stop the bot
             log.exception("inbound failed")
+            # Never fail silently: say what broke and that a retry is safe
+            # (every step is replay-safe, nothing is duplicated).
+            if item.kind == "callback" and item.callback_id:
+                self.bot.answer(item.callback_id, "That did not finish")
+            self.bot.send(f"That did not finish ({type(e).__name__}: {e}). Tap or send it again to retry; nothing is duplicated.")
             if self.breaker.record_failure("intake", now=self.clock()):
                 self.bot.send(f"Metroplex intake stopped after 3 failures ({e}). `metroplex reset intake` after fixing.")
 
@@ -114,13 +119,15 @@ class Daemon:
             return self.intake.edit(parts[1])
         if kind == "drop" and len(parts) == 2:
             return self.intake.drop(parts[1])
-        if kind == "r" and len(parts) >= 3:
-            task_id, rev = ":".join(parts[1:-1]), int(parts[-1])
-            result = self.intake.approve_reserved(task_id, rev, item.from_id, item.chat_id, item.message_id)
-            self._log("reserved_yes", task=task_id, result=result)
+        if kind in ("r", "hold") and len(parts) == 2:
+            ref = self.store.get(f"cb:{parts[1]}")
+            if not ref:
+                return "That button has expired."
+            if kind == "hold":
+                return "Held. The task stays blocked until you approve it."
+            result = self.intake.approve_reserved(ref["taskId"], ref["scopeRevision"], item.from_id, item.chat_id, item.message_id)
+            self._log("reserved_yes", task=ref["taskId"], result=result)
             return result
-        if kind == "hold" and len(parts) >= 2:
-            return "Held. The task stays blocked until you approve it."
         return "Unknown button."
 
     # ------------------------------------------------------------------ cadences
@@ -151,6 +158,7 @@ class Daemon:
         if now >= self._next["expire"]:
             self._next["expire"] = now + 3600
             self.intake.expire_cards()
+            self.intake.resume_granting()
 
     def run(self) -> None:
         self.shutdown.install()

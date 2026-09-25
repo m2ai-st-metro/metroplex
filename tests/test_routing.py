@@ -79,7 +79,7 @@ class FakeReasoner:
 
 def router(work, store, jev=None, reasoner=None, **cfg):
     notes = []
-    r = Router(work["cos"], config(**cfg), CircuitBreaker(store), CycleCaps(store, 900), notify=lambda text, buttons=None: notes.append((text, buttons)),
+    r = Router(work["cos"], config(**cfg), store, CircuitBreaker(store), CycleCaps(store, 900), notify=lambda text, buttons=None: notes.append((text, buttons)) or "sent",
                jev_post=jev or FakeJev(), reasoner_factory=lambda c, hosted: reasoner or NoReasoner())
     r.hosted_seen = []
     return r, notes
@@ -194,7 +194,9 @@ def test_c4_reserved_action_blocks_with_an_approve_button_before_any_agent_start
     assert out.decision.startswith("escalate: reserved")
     assert jev.calls == [] and work.get("attempt", "ship:created:1:a1") is None
     buttons = notes[0][1]
-    assert buttons[0][0]["callback_data"] == "r:ship:1"
+    data = buttons[0][0]["callback_data"]
+    assert data.startswith("r:") and len(data.encode()) <= 64, "Telegram caps callback data at 64 bytes"
+    assert store.get(f"cb:{data[2:]}") == {"taskId": "ship", "scopeRevision": 1}, "the token maps to task and revision, never to an action"
 
 
 def test_paused_project_holds_its_wakes_unacknowledged(work, store):

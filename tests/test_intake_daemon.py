@@ -51,7 +51,7 @@ def daemon(work, store, reasoner):
     send = lambda text, buttons=None: bot.send(text, buttons)  # noqa: E731
     cfg = config()
     breaker = CircuitBreaker(store)
-    router = Router(work["cos"], cfg, breaker, CycleCaps(store, 900), notify=send, jev_post=FakeJev(), reasoner_factory=lambda c, h: FakeReasoner("worker"))
+    router = Router(work["cos"], cfg, store, breaker, CycleCaps(store, 900), notify=send, jev_post=FakeJev(), reasoner_factory=lambda c, h: FakeReasoner("worker"))
     d = Daemon(cfg, work["cos"], store, bot, Intake(work["cos"], store, reasoner, send, cfg), router, breaker, ShutdownHandler())
     return d, transport
 

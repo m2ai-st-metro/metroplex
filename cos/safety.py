@@ -17,8 +17,8 @@ from cos.store import LocalStore
 
 log = logging.getLogger(__name__)
 
-Loop = Literal["intake", "turn", "motion", "briefing", "jev"]
-LOOPS: tuple[str, ...] = ("intake", "turn", "motion", "briefing", "jev")
+Loop = Literal["intake", "turn", "motion", "briefing", "jev", "reasoning"]
+LOOPS: tuple[str, ...] = ("intake", "turn", "motion", "briefing", "jev", "reasoning")
 
 
 class CircuitBreaker:

@@ -22,7 +22,7 @@ CREATE TABLE IF NOT EXISTS counters(key TEXT NOT NULL, window INTEGER NOT NULL, 
 CREATE TABLE IF NOT EXISTS kv(key TEXT PRIMARY KEY, value TEXT NOT NULL);
 """
 
-CARD_STATES = ("drafting", "awaiting_yes", "granted", "dropped", "expired")
+CARD_STATES = ("drafting", "awaiting_yes", "granting", "granted", "dropped", "expired")
 
 
 class LocalStore:
