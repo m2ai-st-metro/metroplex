@@ -22,8 +22,9 @@ field is left untouched and never set by Metroplex.
 
 - Card `hosted_allowed` defaults to `true`, so Jev (TypeSafe hosted API) can route.
 - Metroplex drafts the first decomposition (S2); owners may refine within scope.
-- Reasoning turns default to DeepInfra (already wired in Metroplex); projects with
-  `hosted_allowed: false` use local reasoning only, with no Jev call.
+- Reasoning turns run on local Qwen only (`qwen3.5-122b-a10b` on the M5 llama-server),
+  decided by Matthew 2026-09-24. An earlier draft defaulted to DeepInfra without his
+  decision; that was wrong and is removed. Projects with `hosted_allowed: false` also skip Jev.
 - Jev thresholds v1: choice `minConfidence 0.60`, noul `readyThreshold 0.70`.
 - Stall thresholds v1: progress 45 min, heartbeat 10 min, unassigned 10 min, orphan 15 min.
 - Card expiry 7 days.

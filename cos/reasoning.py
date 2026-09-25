@@ -1,8 +1,10 @@
-"""Reasoning turns behind a provider adapter (OpenAI-compatible chat endpoints).
+"""Reasoning turns on the local Qwen llama-server (M5), OpenAI-compatible.
 
-Hosted: DeepInfra by default. Local: any OpenAI-compatible server (e.g. Qwen on
-the M5), used for projects that disallow hosted processing. A turn returns JSON
-only; callers validate every field against Teletraan state before acting.
+Local only by Matthew's decision (2026-09-24): no hosted reasoning provider.
+Qwen3.5 is a thinking model, so thinking is disabled per request (otherwise
+`content` can come back empty with the budget spent on reasoning). The server
+context is 16k tokens; oversized inputs are refused rather than truncated.
+A turn returns JSON only; callers validate every field before acting.
 """
 
 from __future__ import annotations
@@ -42,20 +44,25 @@ class OpenAICompatibleReasoner:
     base_url: str
     api_key: str
     model: str
-    timeout_s: float = 120.0
+    timeout_s: float = 180.0
     temperature: float = 0.2
+    max_input_chars: int = 40_000  # ~10k tokens, inside the 16k context with room to answer
 
     def complete_json(self, system: str, user: str) -> dict[str, Any]:
         try:
             from openai import OpenAI
         except ImportError as e:  # pragma: no cover - dependency is in requirements.txt
             raise ReasoningUnavailable("OPENAI_CLIENT_MISSING") from e
+        if len(system) + len(user) > self.max_input_chars:
+            raise ReasoningUnavailable("REASONING_INPUT_TOO_LARGE")
         client = OpenAI(base_url=self.base_url, api_key=self.api_key, timeout=self.timeout_s, max_retries=0)
         try:
             resp = client.chat.completions.create(
                 model=self.model,
                 temperature=self.temperature,
+                max_tokens=2048,
                 messages=[{"role": "system", "content": system + "\nRespond with one JSON object and nothing else."}, {"role": "user", "content": user}],
+                extra_body={"chat_template_kwargs": {"enable_thinking": False}},
             )
         except Exception as e:  # noqa: BLE001 - any transport/provider failure is unavailability
             raise ReasoningUnavailable(f"REASONING_PROVIDER_ERROR: {type(e).__name__}") from e
@@ -71,9 +78,9 @@ class NoReasoner:
         raise ReasoningUnavailable("REASONING_NOT_CONFIGURED")
 
 
-def reasoner_for(config: Any, hosted_allowed: bool) -> Reasoner:
-    if hosted_allowed and config.reasoning_api_key and config.reasoning_model:
-        return OpenAICompatibleReasoner(config.reasoning_base_url, config.reasoning_api_key, config.reasoning_model)
+def reasoner_for(config: Any, hosted_allowed: bool = False) -> Reasoner:
+    """Always the local server. `hosted_allowed` is accepted for call-site
+    symmetry with Jev but never selects a hosted reasoning provider."""
     if config.local_base_url and config.local_model:
         return OpenAICompatibleReasoner(config.local_base_url, "local", config.local_model)
     return NoReasoner()

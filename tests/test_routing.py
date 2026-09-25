@@ -16,8 +16,8 @@ from tests.conftest import MATTHEW
 
 def config(**overrides) -> Config:
     base = dict(data_dir=Path("/tmp"), work_socket=Path("/tmp/x"), cos_token_file=Path("/tmp/x"), bot_token=None, approver_ids=(MATTHEW,), chat_id=MATTHEW,
-                typesafe_api_key="test-key", jev_model="jev-latest", reasoning_base_url="http://x", reasoning_api_key=None, reasoning_model=None,
-                local_base_url=None, local_model=None, env="pilot", wake_poll_s=60, sweep_s=300)
+                typesafe_api_key="test-key", jev_model="jev-latest", local_base_url=None, local_model=None,
+                env="pilot", wake_poll_s=60, sweep_s=300)
     base.update(overrides)
     return Config(**base)
 

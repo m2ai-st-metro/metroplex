@@ -51,8 +51,11 @@ preserved at git tag `archive/gate-pipeline-2026-09-24`. Do not restore it.
 Required env: `METROPLEX_TELEGRAM_BOT_TOKEN`, `METROPLEX_TELEGRAM_CHAT_ID`,
 `METROPLEX_APPROVER_IDS` (Matthew's Telegram user id), `METROPLEX_WORK_SOCKET`,
 `METROPLEX_COS_TOKEN_FILE` (the `cos` credential for the Teletraan work service, which
-must also set `TELETRAAN_WORK_APPROVER_IDS`), `TYPESAFE_API_KEY`, `DEEPINFRA_API_KEY`.
-Reasoning model: `METROPLEX_REASONING_MODEL`, else the existing `METROPLEX_SPEC_LLM_MODEL`.
+must also set `TELETRAAN_WORK_APPROVER_IDS`), `TYPESAFE_API_KEY`.
+Reasoning is local only: Qwen on the M5 llama-server (`METROPLEX_LOCAL_BASE_URL`, default
+`http://10.0.0.42:8080/v1`; `METROPLEX_LOCAL_MODEL`, default `qwen3.5-122b-a10b`, verified
+via `GET /v1/models`). Thinking is disabled per request; 16k context. No hosted reasoning
+provider (DeepInfra is not used by Metroplex).
 
 ## Testing
 

@@ -52,9 +52,6 @@ class Config:
     chat_id: str | None
     typesafe_api_key: str | None
     jev_model: str
-    reasoning_base_url: str
-    reasoning_api_key: str | None
-    reasoning_model: str | None
     local_base_url: str | None
     local_model: str | None
     env: str
@@ -81,13 +78,10 @@ class Config:
             chat_id=os.environ.get("METROPLEX_TELEGRAM_CHAT_ID") or None,
             typesafe_api_key=os.environ.get("TYPESAFE_API_KEY") or None,
             jev_model=os.environ.get("TYPESAFE_DEFAULT_MODEL", "jev-latest"),
-            reasoning_base_url=os.environ.get("METROPLEX_REASONING_BASE_URL", "https://api.deepinfra.com/v1/openai"),
-            reasoning_api_key=os.environ.get("DEEPINFRA_API_KEY") or None,
-            # No hardcoded model name: reuse the DeepInfra model the gate-era spec
-            # expander already ran in production unless explicitly overridden.
-            reasoning_model=os.environ.get("METROPLEX_REASONING_MODEL") or os.environ.get("METROPLEX_SPEC_LLM_MODEL") or None,
-            local_base_url=os.environ.get("METROPLEX_LOCAL_BASE_URL") or None,
-            local_model=os.environ.get("METROPLEX_LOCAL_MODEL") or None,
+            # Reasoning is local only (Matthew, 2026-09-24): Qwen on the M5
+            # llama-server. Id verified via GET /v1/models on 2026-09-24.
+            local_base_url=os.environ.get("METROPLEX_LOCAL_BASE_URL", "http://10.0.0.42:8080/v1"),
+            local_model=os.environ.get("METROPLEX_LOCAL_MODEL", "qwen3.5-122b-a10b"),
             env=os.environ.get("METROPLEX_ENV", "pilot"),
             wake_poll_s=_int("METROPLEX_WAKE_POLL_SECONDS", 60),
             sweep_s=_int("METROPLEX_SWEEP_SECONDS", 300),
