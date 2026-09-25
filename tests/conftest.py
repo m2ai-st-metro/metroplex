@@ -1,65 +1,69 @@
-"""
-Pytest configuration and shared fixtures for Metroplex tests.
-"""
+"""Shared fixtures. Integration tests run against a real Teletraan work service
+(pilot branch) on a temp socket; they skip when node or the checkout is absent."""
+
+from __future__ import annotations
+
+import json
 import os
-from unittest.mock import patch
+import shutil
+import subprocess
+import sys
+from pathlib import Path
 
 import pytest
-from pathlib import Path
-import tempfile
 
-from config import Config
-from db import StateDB
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
 
-# Env vars that may be set in ~/.env.shared but should not affect test defaults
-_OVERRIDE_VARS = [
-    "METROPLEX_MAX_APPROVE_PER_CYCLE",
-    "METROPLEX_CYCLE_SLEEP_SECONDS",
-    "METROPLEX_MAX_CONCURRENT_BUILDS",
-    "METROPLEX_APPROVE_THRESHOLD",
-    "METROPLEX_MAX_DEFERRALS",
-]
+from cos.store import LocalStore  # noqa: E402
+from cos.teletraan_client import TeletraanClient  # noqa: E402
+
+TELETRAAN_ROOT = Path(os.environ.get("METROPLEX_TELETRAAN_ROOT", str(Path.home() / "projects/worktrees/teletraan-continuity-pair")))
+MATTHEW = "7001"
 
 
 @pytest.fixture
-def test_config():
-    """Provide a test configuration with safe defaults (env vars stripped)."""
-    clean_env = {k: v for k, v in os.environ.items() if k not in _OVERRIDE_VARS}
-    with patch.dict(os.environ, clean_env, clear=True):
-        return Config()
+def store():
+    s = LocalStore(":memory:")
+    yield s
+    s.close()
+
+
+class Work:
+    """Handle to a live test Teletraan with one client per principal."""
+
+    def __init__(self, socket: Path, tokens: dict[str, str]):
+        self.socket = socket
+        self.clients = {name: TeletraanClient(socket, token) for name, token in tokens.items()}
+
+    def __getitem__(self, principal: str) -> TeletraanClient:
+        return self.clients[principal]
+
+    def rev(self, kind: str, object_id: str) -> int:
+        row = next((o for o in self["operator"].snapshot().get(kind, []) if o["id"] == object_id), None)
+        return row["revision"] if row else 0
+
+    def cmd(self, principal: str, op: str, object_id: str, payload: dict | None = None, kind: str | None = None):
+        return self[principal].command(op, object_id, self.rev(kind or op.split(".")[0], object_id), payload or {})
+
+    def get(self, kind: str, object_id: str):
+        return next((o for o in self["operator"].snapshot().get(kind, []) if o["id"] == object_id), None)
 
 
 @pytest.fixture
-def in_memory_db():
-    """Provide an in-memory database for testing."""
-    db = StateDB(":memory:")
-    db.init_db()
-    yield db
-    db.close()
-
-
-@pytest.fixture
-def temp_db():
-    """Provide a temporary file-based database for testing."""
-    with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
-        db_path = f.name
-
-    db = StateDB(db_path)
-    db.init_db()
-    yield db
-    db.close()
-
-    # Clean up
-    Path(db_path).unlink(missing_ok=True)
-
-
-@pytest.fixture
-def temp_audit_log():
-    """Provide a temporary audit log file."""
-    with tempfile.NamedTemporaryFile(suffix=".log", delete=False, mode="w") as f:
-        log_path = f.name
-
-    yield log_path
-
-    # Clean up
-    Path(log_path).unlink(missing_ok=True)
+def work(tmp_path):
+    node = shutil.which("node")
+    if not node or not (TELETRAAN_ROOT / "src/domain/work.mjs").exists():
+        pytest.skip("Teletraan pilot checkout or node not available")
+    proc = subprocess.Popen([node, str(ROOT / "tests/fixtures/work_service.mjs"), str(TELETRAAN_ROOT), str(tmp_path), MATTHEW], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    line = proc.stdout.readline()
+    if not line:
+        proc.kill()
+        pytest.fail("work service did not start: " + proc.stderr.read())
+    ready = json.loads(line)
+    w = Work(Path(ready["socket"]), ready["tokens"])
+    for agent in ("owner", "worker"):
+        w.cmd("operator", "agent.create", agent, {"name": agent, "capabilities": ["code"] if agent == "worker" else ["lead"]})
+    yield w
+    proc.terminate()
+    proc.wait(timeout=10)
