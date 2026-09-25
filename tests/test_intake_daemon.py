@@ -19,7 +19,7 @@ class ScriptedReasoner:
     def __init__(self, label="new_objective", question=None, decompose=True):
         self.label, self.question, self.decompose_ok, self.prompts = label, question, decompose, []
 
-    def complete_json(self, system, user):
+    def complete_json(self, system, user, max_tokens=None):
         self.prompts.append(system[:20])
         if system.startswith("You triage"):
             return {"label": self.label, "question": self.question, "title": "Build the thing"}

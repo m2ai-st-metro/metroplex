@@ -278,7 +278,7 @@ class Router:
                   "or 'wait', or 'none_fit'. Never invent an agent. JSON: {\"choice\": str, \"reason\": str}.")
         user = json.dumps({"task": {k: task.get(k) for k in ("title", "objective", "acceptance", "spec")}, "projectObjective": project["objective"], "candidates": cands, "jev": judgment and {k: judgment.get(k) for k in ("status", "answers", "error")}})
         try:
-            result = reasoner.complete_json(system, user)
+            result = reasoner.complete_json(system, user, max_tokens=256)
             self.breaker.record_success("reasoning")
         except ReasoningUnavailable as e:
             if self.breaker.record_failure("reasoning", now=self.clock()):

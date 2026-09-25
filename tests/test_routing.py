@@ -70,7 +70,7 @@ class FakeReasoner:
     def __init__(self, choice="worker"):
         self.choice, self.calls = choice, 0
 
-    def complete_json(self, system, user):
+    def complete_json(self, system, user, max_tokens=None):
         self.calls += 1
         if self.choice is None:
             raise ReasoningUnavailable("down")

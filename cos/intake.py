@@ -30,8 +30,29 @@ CARD_SYSTEM = ("Draft a project card for Matthew's approval. Fields: title (<=80
                "doneWhen (observable by an outsider without asking Matthew), scopeIn (list), scopeOut (list), goals (1-7 of "
                "{goalId: 'g1'.., statement, doneWhen}), owner (one id from the agents list), kill (condition that ends the project). "
                "Keep it small. JSON object only.")
-DECOMPOSE_SYSTEM = ("Break an approved project into at most {max} tasks. Each task: {{goalId, title, objective, acceptance, dependsOn: [indexes of earlier tasks]}}. "
-                    "Every task must serve exactly one listed goal. JSON: {{\"tasks\": [...]}}.")
+DECOMPOSE_SYSTEM = ("Break an approved project into the smallest set of tasks that covers every goal: usually one to three per goal, "
+                    "never more than {max} in total. Each task: {{goalId, title, objective, acceptance, dependsOn: [indexes of earlier tasks], "
+                    "reservedAction: null | publish_push_deploy | external_contact | live_fleet_config}}. Prefer tasks that can run in parallel; "
+                    "use dependsOn only when a task truly needs another task's output. Set reservedAction when the step publishes, pushes, "
+                    "deploys, contacts anyone outside, or changes live systems. Every task must serve exactly one listed goal. "
+                    "JSON: {{\"tasks\": [...]}}.")
+
+# Code-side backstop for reserved steps the model did not tag. When unsure,
+# err toward reserved: a wrong tag costs Matthew one tap, a missed one costs
+# the approval gate (live E2E finding 4).
+_RESERVED_WORDS = {
+    "publish_push_deploy": ("publish", "deploy", "release", "git push", "push to", "pypi", "npm publish", "ship to", "go live", "upload to"),
+    "external_contact": ("email", "e-mail", "send a message", "message the", "contact", "post to", "post on", "post the", "tweet", "slack", "notify customer", "reach out"),
+    "live_fleet_config": ("systemd", "crontab", "cron job", "restart the", "restart service", "live config", "production config", "credential", "env.shared", "pm2"),
+}
+
+
+def infer_reserved(title: str, objective: str) -> str | None:
+    text = f"{title} {objective}".lower()
+    for action, words in _RESERVED_WORDS.items():
+        if any(w in text for w in words):
+            return action
+    return None
 
 
 def _slug(text: str, n: int = 24) -> str:
@@ -60,7 +81,7 @@ class Intake:
             if card and card["status"] == "drafting":
                 return self._draft(card["card_id"], card["source"] or "", answer=text)
         try:
-            result = self.reasoner.complete_json(CLASSIFY_SYSTEM, text)
+            result = self.reasoner.complete_json(CLASSIFY_SYSTEM, text, max_tokens=256)
         except ReasoningUnavailable:
             return self._file_note(text, message_id, "classification unavailable, kept as a proposal")
         if result.get("label") != "new_objective":
@@ -119,11 +140,12 @@ class Intake:
             self.store.set_card_status(card_id, "dropped")
             self.send("I cannot draft a card: no persistent agents exist in Teletraan to own it.", None)
             return "no_agents"
+        self.send("Drafting a card for this on the local model; it usually takes a minute or two.", None)
         prompt = json.dumps({"idea": source, "answer": answer, "feedback": feedback, "agents": agents, "reservedActionsDefault": list(RESERVED_ACTIONS)})
         card, problems = None, ["no draft"]
         for attempt in range(2):
             try:
-                draft = self.reasoner.complete_json(CARD_SYSTEM, prompt if attempt == 0 else prompt + "\nFix these problems: " + "; ".join(problems))
+                draft = self.reasoner.complete_json(CARD_SYSTEM, prompt if attempt == 0 else prompt + "\nFix these problems: " + "; ".join(problems), max_tokens=1024)
             except ReasoningUnavailable as e:
                 self.send(f"Card drafting is unavailable right now ({e}). Your idea is kept; say 'card {card_id}' to retry.", None)
                 return "unavailable"
@@ -235,6 +257,8 @@ class Intake:
                 # Proven no-effect domain rejection: the yes did not take; ask again.
                 self.store.set_card_status(card_id, "awaiting_yes")
             raise
+        if self.store.get(f"plan:{project_id}") is None:
+            self.send(f"Approved. Setting up {project_id}: breaking it into tasks takes a minute or two.", None)
         created = self.decompose(project_id, card)
         self.store.set_card_status(card_id, "granted", project_id)
         return f"Granted {project_id}. {created} tasks created and queued for routing."
@@ -261,15 +285,18 @@ class Intake:
         limit = self.config.caps.max_decompose_tasks
         tasks: list[dict[str, Any]] = []
         try:
-            raw = self.reasoner.complete_json(DECOMPOSE_SYSTEM.format(max=limit), json.dumps({"card": card}))
+            raw = self.reasoner.complete_json(DECOMPOSE_SYSTEM.format(max=limit), json.dumps({"card": card}), max_tokens=2048)
             items = raw.get("tasks") if isinstance(raw, dict) else None
             for t in items if isinstance(items, list) else []:
                 if not isinstance(t, dict) or not isinstance(t.get("goalId"), str) or t["goalId"] not in goals:
                     continue
                 goal = goals[t["goalId"]]
                 deps = t.get("dependsOn") if isinstance(t.get("dependsOn"), list) else []
-                tasks.append({"goalId": goal["goalId"], "title": str(t.get("title") or goal["statement"])[:120], "objective": str(t.get("objective") or goal["statement"]),
-                              "acceptance": str(t.get("acceptance") or goal["doneWhen"]), "dependsOn": [j for j in deps if isinstance(j, int) and not isinstance(j, bool) and 0 <= j < len(tasks)]})
+                title, objective = str(t.get("title") or goal["statement"])[:120], str(t.get("objective") or goal["statement"])
+                tagged = t.get("reservedAction") if t.get("reservedAction") in RESERVED_ACTIONS else None  # invented names are dropped
+                tasks.append({"goalId": goal["goalId"], "title": title, "objective": objective,
+                              "acceptance": str(t.get("acceptance") or goal["doneWhen"]), "dependsOn": [j for j in deps if isinstance(j, int) and not isinstance(j, bool) and 0 <= j < len(tasks)],
+                              "reservedAction": tagged or infer_reserved(title, objective)})
                 if len(tasks) >= limit:
                     break
         except ReasoningUnavailable:
@@ -277,7 +304,7 @@ class Intake:
         covered = {t["goalId"] for t in tasks}
         for g in card["goals"]:
             if g["goalId"] not in covered:
-                tasks.append({"goalId": g["goalId"], "title": g["statement"][:120], "objective": g["statement"], "acceptance": g["doneWhen"], "dependsOn": []})
+                tasks.append({"goalId": g["goalId"], "title": g["statement"][:120], "objective": g["statement"], "acceptance": g["doneWhen"], "dependsOn": [], "reservedAction": infer_reserved(g["statement"], g["doneWhen"])})
         return tasks
 
     def decompose(self, project_id: str, card: dict[str, Any]) -> int:
@@ -293,7 +320,7 @@ class Intake:
         for task_id, t in zip(ids, tasks):
             if task_id not in existing:
                 checkpoints, quality = default_checks(goals[t["goalId"]])
-                spec = validate_task_spec({"cardGoalId": t["goalId"], "doneWhen": t["acceptance"], "checkpoints": checkpoints, "qualityChecks": quality, "reservedAction": None, "humanOnly": False, "synthetic": False})
+                spec = validate_task_spec({"cardGoalId": t["goalId"], "doneWhen": t["acceptance"], "checkpoints": checkpoints, "qualityChecks": quality, "reservedAction": t.get("reservedAction"), "humanOnly": False, "synthetic": False})
                 receipt = self.client.command("task.create", task_id, 0, {"projectId": project_id, "owner": card["owner"], "title": t["title"], "objective": t["objective"], "acceptance": spec["doneWhen"], "spec": spec}, command_id=f"cos:decompose:{task_id}")
                 existing[task_id] = next(o for o in receipt["objects"] if o.get("kind") == "task" and o["id"] == task_id)
             # Dependencies right after each task, not in a second pass: dependsOn

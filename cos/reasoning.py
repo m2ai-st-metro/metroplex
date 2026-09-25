@@ -20,7 +20,7 @@ class ReasoningUnavailable(RuntimeError):
 
 
 class Reasoner(Protocol):
-    def complete_json(self, system: str, user: str) -> dict[str, Any]: ...
+    def complete_json(self, system: str, user: str, max_tokens: int = 2048) -> dict[str, Any]: ...
 
 
 def parse_json_object(text: str) -> dict[str, Any]:
@@ -48,7 +48,9 @@ class OpenAICompatibleReasoner:
     temperature: float = 0.2
     max_input_chars: int = 40_000  # ~10k tokens, inside the 16k context with room to answer
 
-    def complete_json(self, system: str, user: str) -> dict[str, Any]:
+    def complete_json(self, system: str, user: str, max_tokens: int = 2048) -> dict[str, Any]:
+        """`max_tokens` is sized per call: at ~24 tok/s on the M5, output length
+        is the latency (live E2E 2026-09-25: three 2048-token calls took ~5 min)."""
         try:
             from openai import OpenAI
         except ImportError as e:  # pragma: no cover - dependency is in requirements.txt
@@ -60,7 +62,7 @@ class OpenAICompatibleReasoner:
             resp = client.chat.completions.create(
                 model=self.model,
                 temperature=self.temperature,
-                max_tokens=2048,
+                max_tokens=max_tokens,
                 messages=[{"role": "system", "content": system + "\nRespond with one JSON object and nothing else."}, {"role": "user", "content": user}],
                 extra_body={"chat_template_kwargs": {"enable_thinking": False}},
             )
@@ -74,7 +76,7 @@ class NoReasoner:
     """Used when no model is configured: every turn is unavailable, so callers
     take their safe fallback (wait or escalate) instead of guessing."""
 
-    def complete_json(self, system: str, user: str) -> dict[str, Any]:
+    def complete_json(self, system: str, user: str, max_tokens: int = 2048) -> dict[str, Any]:
         raise ReasoningUnavailable("REASONING_NOT_CONFIGURED")
 
 

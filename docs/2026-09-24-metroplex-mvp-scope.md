@@ -120,3 +120,23 @@ Accepted residuals, deliberately not fixed:
   one later retry of that reserved action runs without asking again.
 - The cos principal attests Matthew's Telegram yes itself (spec T2 honest limit): the cos
   token is approval-equivalent and must be protected like an operator key.
+
+## Live end-to-end run (2026-09-25)
+
+Isolated: separate Teletraan work service (`~/.local/state/metroplex-e2e/`, not the live
+`teletraan.service`), fixture agents `pilot-owner` and `pilot-contributor`, the real
+`@m2ai_metroplex_bot`, real Jev (TypeSafe `jev-1.13.0`) and local Qwen on the M5.
+
+Proven: Matthew's idea -> card -> Yes -> approval bound to his Telegram id and the card hash
+(used once) -> project with 3 goals and 12 goal-cited, checkpointed tasks with valid
+dependencies -> Jev routed t1 to `pilot-contributor` (0.99, ready 0.86) with the judgment linked
+on the contribution and the owner unchanged -> dependent tasks waited -> after an owner-style
+member add, the motion sweep raised an `unassigned` wake for idle t9 and it was routed to
+`pilot-owner` via the Qwen fallback after Jev returned `needs_review` (0.56). Both processes
+stopped cleanly. Not in scope: execution of queued attempts (no worker runtime attached).
+
+Findings fixed in the commit after 257d3c8: button taps answered before slow work (Telegram
+rejected the late answer); per-call output budgets and progress messages (three 2048-token Qwen
+calls took ~5 minutes); decomposition asks for the smallest parallel plan (the run produced 12
+mostly serial tasks); reserved actions tagged by the model and backstopped by code keywords,
+defaulting to reserved when unsure (decomposition never tagged any before).

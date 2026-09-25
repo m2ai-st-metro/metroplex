@@ -87,9 +87,11 @@ class Daemon:
             return
         try:
             if item.kind == "callback":
-                reply = self._callback(item)
+                # Answer the tap first: Telegram expires unanswered taps within
+                # seconds, and approval can take minutes (live E2E finding 1).
                 if item.callback_id:
-                    self.bot.answer(item.callback_id, reply[:200])
+                    self.bot.answer(item.callback_id, "Working on it")
+                reply = self._callback(item)
                 self.bot.send(reply)
                 return
             text = item.text.strip()
@@ -113,8 +115,6 @@ class Daemon:
             log.exception("inbound failed")
             # Never fail silently: say what broke and that a retry is safe
             # (every step is replay-safe, nothing is duplicated).
-            if item.kind == "callback" and item.callback_id:
-                self.bot.answer(item.callback_id, "That did not finish")
             if isinstance(e, WorkError) and e.code == "COMMAND_ID_CONFLICT":
                 self.bot.send("That conflicts with an earlier action on the same item; nothing new was done. Send /status, or start the item over.")
             else:
