@@ -6,7 +6,7 @@ import pytest
 from unittest.mock import patch, MagicMock
 import urllib.error
 
-from notifier import LogNotifier, TelegramNotifier, create_notifier, FilteredNotifier, Notifier
+from notifier import LogNotifier, TelegramNotifier, create_notifier, FilteredNotifier
 
 
 class TestLogNotifier:

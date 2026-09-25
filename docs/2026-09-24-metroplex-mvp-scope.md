@@ -22,8 +22,9 @@ field is left untouched and never set by Metroplex.
 
 - Card `hosted_allowed` defaults to `true`, so Jev (TypeSafe hosted API) can route.
 - Metroplex drafts the first decomposition (S2); owners may refine within scope.
-- Reasoning turns default to DeepInfra (already wired in Metroplex); projects with
-  `hosted_allowed: false` use local reasoning only, with no Jev call.
+- Reasoning turns run on local Qwen only (`qwen3.5-122b-a10b` on the M5 llama-server),
+  decided by Matthew 2026-09-24. An earlier draft defaulted to DeepInfra without his
+  decision; that was wrong and is removed. Projects with `hosted_allowed: false` also skip Jev.
 - Jev thresholds v1: choice `minConfidence 0.60`, noul `readyThreshold 0.70`.
 - Stall thresholds v1: progress 45 min, heartbeat 10 min, unassigned 10 min, orphan 15 min.
 - Card expiry 7 days.
@@ -73,3 +74,69 @@ F1 to F3, J4, K3.
 5. `spec.py`, `cards.py`, `bot_intake.py`, decompose mode (C1 to C3, C6, P1 to P5).
 6. Escalation path (C4) and motion checks (K1, K2).
 7. Integrated isolated run against a separate Teletraan state dir and socket, then independent review.
+
+## Build status (2026-09-24)
+
+Built on branches, nothing pushed, nothing activated:
+- Teletraan pilot `feat/organization-continuity-pair`: `9b935bf` (stale test fix), `fc333f6`
+  (MVP deltas), `87050bd` (judgment on contribution), `415ffac` (motion timestamps),
+  `0178310` (cos agent visibility). Full suite 95/95. CCOS pilot Teletraan-backed tests 18/18.
+- Metroplex `feature/cos-mvp` (worktree `~/projects/worktrees/metroplex-cos-mvp`): `b077759`,
+  `75dc09b`, `2cfa07f`, `09d6921`. 68 tests against a real Teletraan work service, ruff clean.
+  mypy is not installed in the venv, so types were not checked.
+
+Deviations from the plan, each deliberate:
+- Routing creates a contribution for the chosen worker and never calls `task.assign`: the
+  owner stays accountable (continuity plan R2). The judgment link moved to
+  `contribution.create` (new Teletraan check).
+- D9 tightened: citing a card goal needs the `assign` grant; work-only agents add children
+  only under tasks they own.
+- Stalled attempts (M1/M2): owner and Matthew are notified once per stall episode; no assist
+  contributor is added in the MVP. Assist moves to after the MVP (K1 re-scoped).
+- Thrash cap is per task (3 routing turns per 15 minutes), not per project.
+- `cos` sees every active persistent agent (identities only) so it can name card owners.
+- Teletraan now records `raisedAt`/`acknowledgedAt` on wakes and `startedAt` on attempts.
+- Found in passing: the pilot's approval runs used selected test subsets only; one test in
+  the full suite was stale and failing. Fixed and committed separately.
+
+Not yet done (step 7): an integrated isolated run (real bot, real Jev, real reasoning model
+against a separate Teletraan state dir) and an independent review of both branches. Both
+need Matthew's go-ahead: the run sends Telegram messages and calls hosted APIs.
+
+## Independent review (2026-09-24/25)
+
+Three rounds, Codex (second vendor) and a fresh Claude reviewer each round, findings reproduced
+before fixing. Reports: `~/.claude/agents/.artifacts/{codex,claude}-review-cos-mvp.md`,
+`*-rereview-cos-mvp.md`, `*-rereview3-cos-mvp.md`. Round 3: Teletraan APPROVE (both); Metroplex
+APPROVE WITH FIXES (both, minors only), fixed in the commit after 4960e45.
+
+Accepted residuals, deliberately not fixed:
+- Teletraan allows concurrent contributions on one task by design (continuity plan KTD2).
+  Metroplex's fresh-snapshot guard refuses to add a worker to a task with any live attempt;
+  an owner queueing in the milliseconds between that snapshot and Metroplex's queue command
+  can still produce two attempts.
+- `approve_reserved` records the approval and then resumes the task. If the owner edits the
+  task in between, the resume fails and an extra approval (a real yes from Matthew) remains, so
+  one later retry of that reserved action runs without asking again.
+- The cos principal attests Matthew's Telegram yes itself (spec T2 honest limit): the cos
+  token is approval-equivalent and must be protected like an operator key.
+
+## Live end-to-end run (2026-09-25)
+
+Isolated: separate Teletraan work service (`~/.local/state/metroplex-e2e/`, not the live
+`teletraan.service`), fixture agents `pilot-owner` and `pilot-contributor`, the real
+`@m2ai_metroplex_bot`, real Jev (TypeSafe `jev-1.13.0`) and local Qwen on the M5.
+
+Proven: Matthew's idea -> card -> Yes -> approval bound to his Telegram id and the card hash
+(used once) -> project with 3 goals and 12 goal-cited, checkpointed tasks with valid
+dependencies -> Jev routed t1 to `pilot-contributor` (0.99, ready 0.86) with the judgment linked
+on the contribution and the owner unchanged -> dependent tasks waited -> after an owner-style
+member add, the motion sweep raised an `unassigned` wake for idle t9 and it was routed to
+`pilot-owner` via the Qwen fallback after Jev returned `needs_review` (0.56). Both processes
+stopped cleanly. Not in scope: execution of queued attempts (no worker runtime attached).
+
+Findings fixed in the commit after 257d3c8: button taps answered before slow work (Telegram
+rejected the late answer); per-call output budgets and progress messages (three 2048-token Qwen
+calls took ~5 minutes); decomposition asks for the smallest parallel plan (the run produced 12
+mostly serial tasks); reserved actions tagged by the model and backstopped by code keywords,
+defaulting to reserved when unsure (decomposition never tagged any before).
