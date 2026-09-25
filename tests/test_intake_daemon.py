@@ -171,3 +171,13 @@ def test_stop_pauses_then_requests_shutdown(work, store):
     d, transport = daemon(work, store, ScriptedReasoner())
     d.handle(text("/stop"))
     assert d.shutdown.requested and store.paused
+
+
+def test_first_start_skips_the_telegram_backlog():
+    calls = []
+    def transport(method, payload):
+        calls.append((method, payload))
+        return [{"update_id": 41, "message": {"message_id": 1, "text": "old idea", "from": {"id": MATTHEW}, "chat": {"id": MATTHEW}}}] if method == "getUpdates" else True
+    bot = Bot(transport, MATTHEW, (MATTHEW,))
+    assert bot.skip_backlog() == 42
+    assert calls == [("getUpdates", {"offset": -1, "timeout": 0})]

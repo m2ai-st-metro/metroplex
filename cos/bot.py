@@ -67,6 +67,12 @@ class Bot:
         except Exception as e:  # noqa: BLE001
             log.warning("telegram callback answer failed: %s", e)
 
+    def skip_backlog(self) -> int:
+        """Offset just past the newest pending update, without handling any:
+        messages sent before Metroplex first started are never taken as ideas."""
+        updates = self.call("getUpdates", {"offset": -1, "timeout": 0}) or []
+        return (updates[-1]["update_id"] + 1) if updates else 0
+
     def poll(self, offset: int, timeout: int = 25) -> tuple[list[Inbound], int]:
         updates = self.call("getUpdates", {"offset": offset, "timeout": timeout, "allowed_updates": ["message", "callback_query"]}) or []
         inbound: list[Inbound] = []

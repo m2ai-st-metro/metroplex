@@ -176,7 +176,11 @@ class Daemon:
 
     def run(self) -> None:
         self.shutdown.install()
-        offset = int(self.store.get("bot_offset", 0))
+        offset = self.store.get("bot_offset")
+        if offset is None:
+            offset = self.bot.skip_backlog()
+            self.store.set("bot_offset", offset)
+            log.info("first start: skipped Telegram backlog, offset %s", offset)
         self.bot.send("Metroplex is up. " + self.status())
         while not self.shutdown.requested:
             try:
