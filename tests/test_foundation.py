@@ -8,7 +8,7 @@ import subprocess
 
 import pytest
 
-from tests.conftest import MATTHEW, TELETRAAN_ROOT
+from tests.conftest import TELETRAAN_ROOT
 from cos.safety import CircuitBreaker, CycleCaps
 from cos.spec import SpecError, card_digest, validate_card, validate_task_spec
 from cos.teletraan_client import WorkError
@@ -71,7 +71,9 @@ def test_breaker_opens_once_and_jev_breaker_cools_down(store):
     b = CircuitBreaker(store, threshold=3, jev_cooldown_s=900)
     assert [b.record_failure("turn", now=1) for _ in range(4)] == [False, False, True, False]
     assert b.is_open("turn", now=10_000)
-    b.record_failure("jev", now=0); b.record_failure("jev", now=0); b.record_failure("jev", now=0)
+    b.record_failure("jev", now=0)
+    b.record_failure("jev", now=0)
+    b.record_failure("jev", now=0)
     assert b.is_open("jev", now=100)
     assert not b.is_open("jev", now=1000), "jev retries after the cooldown"
     b.reset("all")

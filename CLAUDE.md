@@ -36,7 +36,23 @@ preserved at git tag `archive/gate-pipeline-2026-09-24`. Do not restore it.
 | `cos/spec.py` | Card and task spec validation; `card_digest` matches Teletraan |
 | `cos/safety.py` | Circuit breakers, cycle caps, shutdown |
 | `cos/store.py` | Local state: cards, breakers, counters, pause (never work state) |
+| `cos/jev_client.py` | Jev judgments (port of the pilot jev-adapter); evidence only |
+| `cos/reasoning.py` | Reasoning turns via OpenAI-compatible endpoints; no hardcoded model |
+| `cos/routing.py` | Path 2: one turn per wake (candidates, Jev, fallback, assign, escalate) |
+| `cos/motion.py` | Sweeps M1-M5 that raise fenced wakes; never act directly |
+| `cos/intake.py` | Path 1: idea, card, yes, decomposition; reserved-action approvals |
+| `cos/bot.py` | `@m2ai_metroplex_bot` transport, approver-only |
+| `cos/daemon.py` | One loop: bot poll, wake routing, sweep, card expiry, pause/stop |
+| `metroplex.py` | CLI: run, status, pause, resume, reset, sweep --dry-run |
 | `notifier.py`, `audit.py`, `event_emitter.py` | Kept from the gate era, standalone |
+
+## Running (isolated pilot only until Matthew approves live use)
+
+Required env: `METROPLEX_TELEGRAM_BOT_TOKEN`, `METROPLEX_TELEGRAM_CHAT_ID`,
+`METROPLEX_APPROVER_IDS` (Matthew's Telegram user id), `METROPLEX_WORK_SOCKET`,
+`METROPLEX_COS_TOKEN_FILE` (the `cos` credential for the Teletraan work service, which
+must also set `TELETRAAN_WORK_APPROVER_IDS`), `TYPESAFE_API_KEY`, `DEEPINFRA_API_KEY`.
+Reasoning model: `METROPLEX_REASONING_MODEL`, else the existing `METROPLEX_SPEC_LLM_MODEL`.
 
 ## Testing
 

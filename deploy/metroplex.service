@@ -1,24 +1,20 @@
 [Unit]
-Description=Metroplex - ST Metro Autonomous Build Layer
-After=network.target
+Description=Metroplex CoS - intake, delegation and routing over Teletraan
+After=network-online.target
 
 [Service]
 Type=simple
-ExecStartPre=-/usr/bin/pkill -TERM -f "python metroplex.py run-all"
-ExecStartPre=/bin/sleep 2
-ExecStart=%h/projects/metroplex/venv/bin/python %h/projects/metroplex/metroplex.py run-all --cycles 0
-WorkingDirectory=%h/projects/metroplex
+ExecStart=%h/projects/st-metro/metroplex/venv/bin/python %h/projects/st-metro/metroplex/metroplex.py run
+WorkingDirectory=%h/projects/st-metro/metroplex
 EnvironmentFile=-%h/.env.shared
+Environment=METROPLEX_ENV=pilot
 
-# Shutdown: SIGTERM → ShutdownHandler → finish current cycle + git ops
+# /stop pauses Metroplex projects and exits 0: no restart. Crashes restart.
 KillSignal=SIGTERM
-TimeoutStopSec=90
-
-# Restart on crashes, but not on clean SIGTERM exit
+TimeoutStopSec=60
 Restart=on-failure
 RestartSec=30
 
-# Logging to journalctl
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=metroplex

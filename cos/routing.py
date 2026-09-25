@@ -247,7 +247,7 @@ class Router:
     def _escalate(self, wake, key, task, project, kind: str, need: str, out: Outcome, approve_reserved: str | None = None) -> Outcome:
         reason = f"{kind}: {need}"
         self._cmd(out, "task.block", task["id"], task["revision"], {"reason": reason}, f"cos:{key}:block")
-        buttons = [[{"text": "Approve", "callback_data": f"reserved:{task['id']}:{approve_reserved}:{task['scopeRevision']}"}, {"text": "Hold", "callback_data": f"hold:{task['id']}"}]] if approve_reserved else None
+        buttons = [[{"text": "Approve", "callback_data": f"r:{task['id']}:{task['scopeRevision']}"}, {"text": "Hold", "callback_data": f"hold:{task['id']}"}]] if approve_reserved else None
         self.notify(f"{project['title']}: {task['title']}\nNeeds you ({kind}): {need}.\nOther work continues.", buttons)
         return self._ack(wake, key, f"escalate: {reason}", out)
 

@@ -1,0 +1,228 @@
+"""Path 1: idea -> card -> Matthew's yes -> granted, decomposed project (I1-I4, S1-S4).
+
+Authority is created in exactly one place: `approve`, on Matthew's Yes for the
+exact card hash he was shown. Everything before it is inert (a card in the
+local store, or a Teletraan proposal). Decomposition then creates uniform,
+spec'd tasks that each trace to an approved goal.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import logging
+import re
+import time
+from typing import Any, Callable
+
+from cos.reasoning import Reasoner, ReasoningUnavailable
+from cos.spec import RESERVED_ACTIONS, SPEC_TEMPLATE_VERSION, card_digest, default_checks, validate_card, validate_task_spec
+from cos.store import LocalStore
+from cos.teletraan_client import TeletraanClient, WorkError
+
+log = logging.getLogger(__name__)
+Send = Callable[[str, list[list[dict[str, str]]] | None], Any]
+
+CLASSIFY_SYSTEM = ("You triage one message Matthew sent to his chief of staff. Label it 'note' (an idea to keep, not work to start now) "
+                   "or 'new_objective' (he wants a project done). If new_objective and you cannot write an observable done-when "
+                   "without asking him, give exactly one short question. JSON: {\"label\": \"note\"|\"new_objective\", \"question\": str|null, \"title\": str}.")
+CARD_SYSTEM = ("Draft a project card for Matthew's approval. Fields: title (<=80 chars), objective (one imperative paragraph), "
+               "doneWhen (observable by an outsider without asking Matthew), scopeIn (list), scopeOut (list), goals (1-7 of "
+               "{goalId: 'g1'.., statement, doneWhen}), owner (one id from the agents list), kill (condition that ends the project). "
+               "Keep it small. JSON object only.")
+DECOMPOSE_SYSTEM = ("Break an approved project into at most {max} tasks. Each task: {{goalId, title, objective, acceptance, dependsOn: [indexes of earlier tasks]}}. "
+                    "Every task must serve exactly one listed goal. JSON: {{\"tasks\": [...]}}.")
+
+
+def _slug(text: str, n: int = 24) -> str:
+    return re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")[:n] or "project"
+
+
+def _short(value: str) -> str:
+    return hashlib.sha256(value.encode()).hexdigest()[:8]
+
+
+class Intake:
+    def __init__(self, client: TeletraanClient, store: LocalStore, reasoner: Reasoner, send: Send, config: Any, clock: Callable[[], float] = time.time):
+        self.client, self.store, self.reasoner, self.send, self.config, self.clock = client, store, reasoner, send, config, clock
+
+    # ------------------------------------------------------------------ I1/I2
+    def handle_text(self, text: str, message_id: str) -> str:
+        open_card = self.store.get("open_question")
+        if open_card:
+            self.store.set("open_question", None)
+            card = self.store.get_card(open_card)
+            if card and card["status"] == "drafting":
+                return self._draft(card["card_id"], card["source"] or "", answer=text)
+        try:
+            result = self.reasoner.complete_json(CLASSIFY_SYSTEM, text)
+        except ReasoningUnavailable:
+            return self._file_note(text, message_id, "classification unavailable, kept as a proposal")
+        if result.get("label") != "new_objective":
+            return self._file_note(text, message_id, "kept as a proposal")
+        card_id = f"card-{_short(message_id + text)}"
+        question = result.get("question")
+        self.store.put_card(card_id, {"title": result.get("title") or text[:80]}, "", "drafting", source=text, question=question)
+        if question:
+            self.store.set("open_question", card_id)
+            self.send(f"One question before I draft the card:\n{question}", None)
+            return "asked"
+        return self._draft(card_id, text)
+
+    def _file_note(self, text: str, message_id: str, why: str) -> str:
+        pid = f"Q-metroplex-{_short(message_id + text)}"
+        try:
+            self.client.command("proposal.file", pid, 0, {"title": text[:80], "body": text, "source": {"type": "metroplex-bot", "ref": f"telegram:{message_id}"}}, command_id=f"cos:proposal:{pid}")
+        except WorkError as e:
+            if e.code != "ALREADY_EXISTS":
+                raise
+        self.send(f"Noted ({why}): {pid}. Say 'card {pid}' when you want it turned into a project.", None)
+        return "note"
+
+    # ------------------------------------------------------------------ I3/S1
+    def _agents(self) -> list[dict[str, Any]]:
+        return [{"id": a["id"], "name": a.get("name"), "capabilities": a.get("capabilities", [])} for a in self.client.snapshot().get("agent", []) if a.get("lifecycle", "persistent") == "persistent" and a.get("status") != "retired"]
+
+    def _draft(self, card_id: str, source: str, answer: str | None = None, feedback: str | None = None) -> str:
+        agents = self._agents()
+        if not agents:
+            self.store.set_card_status(card_id, "dropped")
+            self.send("I cannot draft a card: no persistent agents exist in Teletraan to own it.", None)
+            return "no_agents"
+        prompt = json.dumps({"idea": source, "answer": answer, "feedback": feedback, "agents": agents, "reservedActionsDefault": list(RESERVED_ACTIONS)})
+        card, problems = None, ["no draft"]
+        for attempt in range(2):
+            try:
+                draft = self.reasoner.complete_json(CARD_SYSTEM, prompt if attempt == 0 else prompt + "\nFix these problems: " + "; ".join(problems))
+            except ReasoningUnavailable as e:
+                self.send(f"Card drafting is unavailable right now ({e}). Your idea is kept; say 'card {card_id}' to retry.", None)
+                return "unavailable"
+            card = self._normalize(draft, agents)
+            problems = validate_card(card)
+            if not problems:
+                break
+        if problems:
+            self.send("I could not draft a complete card: " + "; ".join(problems) + ". Reply with more detail to retry.", None)
+            self.store.set("open_question", card_id)
+            return "incomplete"
+        digest = card_digest(card)
+        self.store.put_card(card_id, card, digest, "awaiting_yes", source=source)
+        self.send(self.render(card), [[{"text": "Yes", "callback_data": f"yes:{card_id}:{digest[:16]}"}, {"text": "Edit", "callback_data": f"edit:{card_id}"}, {"text": "Drop", "callback_data": f"drop:{card_id}"}]])
+        return "card"
+
+    def _normalize(self, draft: dict[str, Any], agents: list[dict[str, Any]]) -> dict[str, Any]:
+        """Fields Metroplex controls are set here, not by the model: defaults
+        for reserved actions and hosted processing (MVP scope defaults)."""
+        goals = [{"goalId": str(g.get("goalId") or f"g{i + 1}"), "statement": str(g.get("statement", "")).strip(), "doneWhen": str(g.get("doneWhen", "")).strip()} for i, g in enumerate(draft.get("goals") or []) if isinstance(g, dict)]
+        owner = draft.get("owner") if draft.get("owner") in {a["id"] for a in agents} else agents[0]["id"]
+        return {
+            "title": str(draft.get("title", "")).strip()[:80],
+            "objective": str(draft.get("objective", "")).strip(),
+            "doneWhen": str(draft.get("doneWhen", "")).strip(),
+            "scopeIn": [str(s) for s in draft.get("scopeIn") or []],
+            "scopeOut": [str(s) for s in draft.get("scopeOut") or []],
+            "goals": goals,
+            "owner": owner,
+            "kill": str(draft.get("kill") or "Matthew cancels, or 30 days pass with no accepted contribution").strip(),
+            "reservedActions": list(RESERVED_ACTIONS),
+            "hostedAllowed": True,
+            "humanOnly": False,
+            "specTemplate": SPEC_TEMPLATE_VERSION,
+        }
+
+    @staticmethod
+    def render(card: dict[str, Any]) -> str:
+        goals = "\n".join(f"  {g['goalId']}. {g['statement']} (done: {g['doneWhen']})" for g in card["goals"])
+        out = "\n".join(f"  - {s}" for s in card.get("scopeOut", [])) or "  - (none listed)"
+        return (f"CARD: {card['title']}\n{card['objective']}\n\nDone when: {card['doneWhen']}\nOwner: {card['owner']}\nGoals:\n{goals}\n"
+                f"Out of scope:\n{out}\nReserved for you: {', '.join(a.replace('_', ' ') for a in card['reservedActions'])}\nKill: {card['kill']}\n\nYes grants this project. Nothing runs before you tap it.")
+
+    # ------------------------------------------------------------------ I4
+    def approve(self, card_id: str, hash_prefix: str, from_id: str, chat_id: str, message_id: str) -> str:
+        stored = self.store.get_card(card_id)
+        if not stored or stored["status"] != "awaiting_yes":
+            return "That card is no longer waiting for a yes."
+        if not stored["card_hash"].startswith(hash_prefix):
+            return "That button belongs to an older version of the card."
+        if self.clock() - stored["created_at"] > self.config.thresholds.card_expiry_s:
+            self.store.set_card_status(card_id, "expired")
+            return "That card expired. Send the idea again for a fresh card."
+        card = stored["card"]
+        if card_digest(card) != stored["card_hash"]:
+            return "The stored card changed after drafting; not approving."
+        approval_id = f"approval-{card_id}"
+        project_id = f"p-{_slug(card['title'])}-{card_id[-4:]}"
+        self.client.command("approval.record", approval_id, 0, {"scope": "project", "cardHash": stored["card_hash"], "fromId": from_id, "chatId": chat_id, "messageId": message_id}, command_id=f"cos:approval:{card_id}")
+        self.client.command("project.create", project_id, 0, {"card": card, "approvalId": approval_id}, command_id=f"cos:project:{card_id}")
+        self.store.set_card_status(card_id, "granted", project_id)
+        created = self.decompose(project_id, card)
+        return f"Granted {project_id}. {created} tasks created and queued for routing."
+
+    # ------------------------------------------------------------------ S2-S4
+    def decompose(self, project_id: str, card: dict[str, Any]) -> int:
+        """One reasoning pass bounded to max tasks; deterministic fallback is one
+        task per goal, so an outage never blocks an approved project."""
+        goals = {g["goalId"]: g for g in card["goals"]}
+        limit = self.config.caps.max_decompose_tasks
+        try:
+            plan = self.reasoner.complete_json(DECOMPOSE_SYSTEM.format(max=limit), json.dumps({"card": card}))
+            tasks = [t for t in plan.get("tasks", []) if isinstance(t, dict) and t.get("goalId") in goals][:limit]
+        except ReasoningUnavailable:
+            tasks = []
+        if not tasks:
+            tasks = [{"goalId": g["goalId"], "title": g["statement"][:80], "objective": g["statement"], "acceptance": g["doneWhen"], "dependsOn": []} for g in card["goals"]]
+        ids: list[str] = []
+        for i, t in enumerate(tasks):
+            goal = goals[t["goalId"]]
+            checkpoints, quality = default_checks(goal)
+            spec = validate_task_spec({"cardGoalId": goal["goalId"], "doneWhen": str(t.get("acceptance") or goal["doneWhen"]), "checkpoints": checkpoints, "qualityChecks": quality, "reservedAction": None, "humanOnly": False, "synthetic": False})
+            task_id = f"{project_id}:t{i + 1}"
+            self.client.command("task.create", task_id, 0, {"projectId": project_id, "owner": card["owner"], "title": str(t.get("title") or goal["statement"])[:120], "objective": str(t.get("objective") or goal["statement"]), "acceptance": spec["doneWhen"], "spec": spec}, command_id=f"cos:decompose:{task_id}")
+            ids.append(task_id)
+        snap = self.client.snapshot()
+        revisions = {t["id"]: t["revision"] for t in snap.get("task", [])}
+        for i, t in enumerate(tasks):
+            deps = [ids[j] for j in t.get("dependsOn") or [] if isinstance(j, int) and 0 <= j < i]
+            if deps:
+                self.client.command("task.dependencies", ids[i], revisions[ids[i]], {"dependencies": deps}, command_id=f"cos:deps:{ids[i]}")
+        return len(ids)
+
+    # ------------------------------------------------------------------ Edit / Drop / expiry
+    def edit(self, card_id: str) -> str:
+        stored = self.store.get_card(card_id)
+        if not stored or stored["status"] != "awaiting_yes":
+            return "That card is not editable."
+        self.store.set_card_status(card_id, "drafting")
+        self.store.set("open_question", card_id)
+        return "Send the change you want; I will redraft the card."
+
+    def drop(self, card_id: str) -> str:
+        stored = self.store.get_card(card_id)
+        if not stored or stored["status"] not in ("drafting", "awaiting_yes"):
+            return "That card is already closed."
+        self.store.set_card_status(card_id, "dropped")
+        return "Dropped. Nothing was created."
+
+    def expire_cards(self) -> list[str]:
+        expired = []
+        for c in self.store.cards_in("awaiting_yes"):
+            if self.clock() - c["created_at"] > self.config.thresholds.card_expiry_s:
+                self.store.set_card_status(c["card_id"], "expired")
+                self._file_note(c["source"] or c["card"].get("title", ""), c["card_id"], "card expired unapproved")
+                expired.append(c["card_id"])
+        return expired
+
+    # ------------------------------------------------------------------ reserved actions (C4)
+    def approve_reserved(self, task_id: str, scope_revision: int, from_id: str, chat_id: str, message_id: str) -> str:
+        """The button carries only task and scope revision (Telegram's 64-byte
+        limit); the action approved is read from the task spec, never the button."""
+        task = next((t for t in self.client.snapshot().get("task", []) if t["id"] == task_id), None)
+        if not task or task["scopeRevision"] != scope_revision:
+            return "That task changed since you were asked; I will ask again if it still needs you."
+        action = (task.get("spec") or {}).get("reservedAction")
+        if not action:
+            return "That task no longer needs a reserved action."
+        self.client.command("approval.record", f"reserved-{task_id}-{scope_revision}", 0, {"scope": "reserved_action", "taskId": task_id, "action": action, "scopeRevision": scope_revision, "fromId": from_id, "chatId": chat_id, "messageId": message_id}, command_id=f"cos:reserved:{task_id}:{scope_revision}")
+        if task["status"] == "blocked":
+            self.client.command("task.resume", task_id, task["revision"], {}, command_id=f"cos:reserved-resume:{task_id}:{scope_revision}")
+        return f"Approved {action.replace('_', ' ')} for {task['title']}. Routing it now."

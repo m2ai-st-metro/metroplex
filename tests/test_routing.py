@@ -47,7 +47,7 @@ def add_task(work, tid, pid="p", **spec_overrides):
 def jev_answer(choice="worker", confidence=0.9, ready=0.9, labels=("owner", "worker", "wait", "none_fit")):
     rest = (1 - confidence) / (len(labels) - 1)
     return {"model": "jev-latest", "answers": {
-        "route": {"type": "choice", "choice": choice, "confidence": confidence, "probabilities": {l: (confidence if l == choice else rest) for l in labels}},
+        "route": {"type": "choice", "choice": choice, "confidence": confidence, "probabilities": {label: (confidence if label == choice else rest) for label in labels}},
         "ready": {"type": "noul", "noul": ready}}, "usage": {"input_tokens": 100}}
 
 
@@ -86,7 +86,8 @@ def router(work, store, jev=None, reasoner=None, **cfg):
 
 
 def test_j1_confident_jev_assigns_a_contributor_and_links_the_judgment(work, store):
-    grant_project(work); add_task(work, "t1")
+    grant_project(work)
+    add_task(work, "t1")
     jev = FakeJev()
     r, _ = router(work, store, jev=jev)
     [out] = route_pending(r, work["cos"])
@@ -104,7 +105,8 @@ def test_j1_confident_jev_assigns_a_contributor_and_links_the_judgment(work, sto
 
 
 def test_j2_low_confidence_falls_back_to_a_reasoning_turn(work, store):
-    grant_project(work); add_task(work, "t1")
+    grant_project(work)
+    add_task(work, "t1")
     reasoner = FakeReasoner("worker")
     r, _ = router(work, store, jev=FakeJev(jev_answer(confidence=0.41)), reasoner=reasoner)
     [out] = route_pending(r, work["cos"])
@@ -113,7 +115,8 @@ def test_j2_low_confidence_falls_back_to_a_reasoning_turn(work, store):
 
 
 def test_j3_jev_outage_is_recorded_once_and_routing_still_decides(work, store):
-    grant_project(work); add_task(work, "t1")
+    grant_project(work)
+    add_task(work, "t1")
     jev = FakeJev(error="JEV_HTTP_503")
     r, _ = router(work, store, jev=jev, reasoner=FakeReasoner("worker"))
     [out] = route_pending(r, work["cos"])
@@ -124,7 +127,8 @@ def test_j3_jev_outage_is_recorded_once_and_routing_still_decides(work, store):
 
 
 def test_j5_hosted_disallowed_never_calls_jev(work, store):
-    grant_project(work, hosted=False); add_task(work, "t1")
+    grant_project(work, hosted=False)
+    add_task(work, "t1")
     jev = FakeJev()
     r, _ = router(work, store, jev=jev, reasoner=FakeReasoner("worker"))
     [out] = route_pending(r, work["cos"])
@@ -132,7 +136,8 @@ def test_j5_hosted_disallowed_never_calls_jev(work, store):
 
 
 def test_no_verdict_and_no_reasoning_waits_instead_of_guessing(work, store):
-    grant_project(work); add_task(work, "t1")
+    grant_project(work)
+    add_task(work, "t1")
     r, _ = router(work, store, jev=FakeJev(error="JEV_HTTP_503"), reasoner=FakeReasoner(None))
     [out] = route_pending(r, work["cos"])
     assert out.decision.startswith("wait: no Jev verdict")
@@ -140,7 +145,8 @@ def test_no_verdict_and_no_reasoning_waits_instead_of_guessing(work, store):
 
 
 def test_ae6_crash_between_contribution_and_queue_recovers_without_a_duplicate(work, store):
-    grant_project(work); add_task(work, "t1")
+    grant_project(work)
+    add_task(work, "t1")
     r, _ = router(work, store)
     real = r._cmd
     def crash_on_queue(out, op, *a, **k):
@@ -162,7 +168,9 @@ def test_ae6_crash_between_contribution_and_queue_recovers_without_a_duplicate(w
 
 
 def test_none_fit_escalates_once_and_unrelated_work_continues(work, store):
-    grant_project(work); add_task(work, "t1"); add_task(work, "t2")
+    grant_project(work)
+    add_task(work, "t1")
+    add_task(work, "t2")
     answers = {"t1": "none_fit", "t2": "worker"}
     class PerTask(FakeJev):
         def __call__(self, key, request):
@@ -178,18 +186,20 @@ def test_none_fit_escalates_once_and_unrelated_work_continues(work, store):
 
 
 def test_c4_reserved_action_blocks_with_an_approve_button_before_any_agent_starts(work, store):
-    grant_project(work); add_task(work, "ship", reservedAction="publish_push_deploy")
+    grant_project(work)
+    add_task(work, "ship", reservedAction="publish_push_deploy")
     jev = FakeJev()
     r, notes = router(work, store, jev=jev)
     [out] = route_pending(r, work["cos"])
     assert out.decision.startswith("escalate: reserved")
     assert jev.calls == [] and work.get("attempt", "ship:created:1:a1") is None
     buttons = notes[0][1]
-    assert buttons[0][0]["callback_data"] == "reserved:ship:publish_push_deploy:1"
+    assert buttons[0][0]["callback_data"] == "r:ship:1"
 
 
 def test_paused_project_holds_its_wakes_unacknowledged(work, store):
-    grant_project(work); add_task(work, "t1")
+    grant_project(work)
+    add_task(work, "t1")
     work.cmd("cos", "project.pause", "p", {"reason": "/pause"})
     r, _ = router(work, store)
     [out] = route_pending(r, work["cos"])

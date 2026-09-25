@@ -70,7 +70,8 @@ def test_guard_human_only_synthetic_and_paused_are_invisible():
 
 
 def test_live_sweep_raises_a_fenced_unassigned_wake(work, store):
-    grant_project(work); add_task(work, "t1")
+    grant_project(work)
+    add_task(work, "t1")
     work.cmd("cos", "wake.ack", "p:t1:created", {"decision": "wait: test"})
     notes = []
     later = datetime.fromisoformat(work.get("wake", "p:t1:created")["acknowledgedAt"].replace("Z", "+00:00")).timestamp() + 11 * 60
