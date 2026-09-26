@@ -136,13 +136,21 @@ class Intake:
 
     # ------------------------------------------------------------------ I3/S1
     def _agents(self) -> list[dict[str, Any]]:
-        return [{"id": a["id"], "name": a.get("name"), "capabilities": a.get("capabilities", [])} for a in self.client.snapshot().get("agent", []) if a.get("lifecycle", "persistent") == "persistent" and a.get("status") != "retired"]
+        return [{"id": a["id"], "name": a.get("name"), "capabilities": a.get("capabilities", []), "reportsTo": a.get("reportsTo")} for a in self.client.snapshot().get("agent", []) if a.get("lifecycle", "persistent") == "persistent" and a.get("status") != "retired"]
+
+    @staticmethod
+    def _owners(agents: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Owner candidates: agents that report to no one. A worker (reportsTo
+        set) never owns, so it can never accept its own contribution. The
+        model only picks among these; it cannot name a worker (2026-09-26:
+        Qwen named worker kup as owner and the card was approved)."""
+        return [a for a in agents if not a.get("reportsTo")]
 
     def _draft(self, card_id: str, source: str, answer: str | None = None, feedback: str | None = None) -> str:
-        agents = self._agents()
+        agents = self._owners(self._agents())
         if not agents:
             self.store.set_card_status(card_id, "dropped")
-            self.send("I cannot draft a card: no persistent agents exist in Teletraan to own it.", None)
+            self.send("I cannot draft a card: no persistent agent that reports to no one exists in Teletraan to own it.", None)
             return "no_agents"
         self.send("Drafting a card for this on the local model; it usually takes a minute or two.", None)
         prompt = json.dumps({"idea": source, "answer": answer, "feedback": feedback, "agents": agents, "reservedActionsDefault": list(RESERVED_ACTIONS)})

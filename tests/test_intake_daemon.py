@@ -87,6 +87,29 @@ def test_c1_idea_question_card_yes_creates_a_granted_decomposed_project(work, st
     assert "Granted" in transport.sent[-1]["text"]
 
 
+class WorkerOwnerReasoner(ScriptedReasoner):
+    """Reproduces 2026-09-26: the model names a worker as card owner."""
+
+    def complete_json(self, system, user, max_tokens=None):
+        out = super().complete_json(system, user, max_tokens)
+        if system.startswith("Draft a project card"):
+            self.card_prompt = user
+            out["owner"] = "kup"
+        return out
+
+
+def test_a_worker_never_owns_a_card_even_when_the_model_names_it(work, store):
+    work.cmd("operator", "agent.create", "kup", {"name": "Kup", "reportsTo": "owner", "capabilities": ["code"]})
+    reasoner = WorkerOwnerReasoner()
+    d, transport = daemon(work, store, reasoner)
+    d.handle(text("build the thing"))
+    assert '"kup"' not in reasoner.card_prompt, "workers are not offered to the model as owners"
+    assert "Owner: kup" not in transport.sent[-1]["text"]
+    d.handle(button(yes_button(transport)))
+    [project] = work["operator"].snapshot()["project"]
+    assert project["owner"] != "kup"
+
+
 def test_decompose_outage_falls_back_to_one_task_per_goal(work, store):
     d, transport = daemon(work, store, ScriptedReasoner(decompose=False))
     d.handle(text("build the thing"))
