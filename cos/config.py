@@ -69,7 +69,10 @@ class Config:
     def from_env(cls) -> "Config":
         home = Path.home()
         data_dir = Path(os.environ.get("METROPLEX_DATA_DIR", str(Path(__file__).resolve().parent.parent / "data")))
-        approvers = tuple(s.strip() for s in os.environ.get("METROPLEX_APPROVER_IDS", "").split(",") if s.strip())
+        # One approver list for both sides of the Yes: the unit reads the work
+        # service's work.env, so the bot and Teletraan cannot disagree.
+        raw_approvers = os.environ.get("METROPLEX_APPROVER_IDS") or os.environ.get("TELETRAAN_WORK_APPROVER_IDS", "")
+        approvers = tuple(s.strip() for s in raw_approvers.split(",") if s.strip())
         return cls(
             data_dir=data_dir,
             work_socket=Path(os.environ.get("METROPLEX_WORK_SOCKET", str(home / ".local/state/teletraan-work/work.sock"))),

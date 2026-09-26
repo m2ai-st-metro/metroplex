@@ -1,13 +1,19 @@
 [Unit]
 Description=Metroplex CoS - intake, delegation and routing over Teletraan
-After=network-online.target
+After=network-online.target teletraan-work.service
+Wants=teletraan-work.service
 
 [Service]
 Type=simple
 ExecStart=%h/projects/st-metro/metroplex/venv/bin/python %h/projects/st-metro/metroplex/metroplex.py run
 WorkingDirectory=%h/projects/st-metro/metroplex
 EnvironmentFile=-%h/.env.shared
+# Approver ids shared with teletraan-work (TELETRAAN_WORK_APPROVER_IDS). Not
+# optional: without it Metroplex refuses to start rather than accept any Yes.
+EnvironmentFile=%h/.config/teletraan/work.env
 Environment=METROPLEX_ENV=pilot
+Environment=METROPLEX_WORK_SOCKET=%h/.local/state/teletraan-work/work.sock
+Environment=METROPLEX_COS_TOKEN_FILE=%h/.config/metroplex/cos.token
 
 # /stop pauses Metroplex projects and exits 0: no restart. Crashes restart.
 KillSignal=SIGTERM
