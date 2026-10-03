@@ -101,3 +101,31 @@ def test_a_stall_episode_raises_once_until_progress_moves(store):
     a["progressAt"] = iso(50 * 60 - 1)  # a later checkpoint, still stale: a new episode
     sweep(client, store, T, 10, lambda *x: None, now=NOW + 10 * 60)
     assert len(client.raised) == 2
+
+
+# ---------------------------------------------------------------- Fix B (2026-10-02)
+# No dispatcher starts "api" attempts since 2026-10-01; only `ttn run` does.
+
+def test_m6_api_attempt_notice_names_the_ttn_run_command_not_a_runtime():
+    queued = {"id": "t2:created:1:a1", "taskId": "t2", "status": "queued", "queuedAt": iso(16 * 60), "runtime": "api"}
+    [f] = find(snap([task("t2", status="active", title="Build the view")], [queued]), T, NOW)
+    assert f.check == "M6 queued" and f.reason is None and f.ref == "queued:t2:created:1:a1"
+    assert "waiting for you to run `ttn run t2:created:1:a1`" in f.detail and "Build the view" in f.detail
+    assert "is its runtime" not in f.detail
+    other = {**queued, "runtime": "t3"}
+    [g] = find(snap([task("t2", status="active")], [other]), T, NOW)
+    assert "is its runtime (t3) running?" in g.detail, "a runtime that does start attempts keeps the old question"
+
+
+def test_m6_notice_is_sent_once_per_attempt(store):
+    queued = {"id": "a2", "taskId": "t2", "status": "queued", "queuedAt": iso(16 * 60), "runtime": "api"}
+    s = snap([task("t2", status="active")], [queued])
+
+    class C:
+        def snapshot(self):
+            return s
+    sent = []
+    for i in range(3):
+        sweep(C(), store, T, 10, lambda text, b=None: sent.append(text) or "ok", now=NOW + i * 300)
+    assert len(sent) == 1 and "`ttn run a2`" in sent[0] and "queued attempts not started yet" in sent[0]
+    assert store.get("sent:queued:a2") is True

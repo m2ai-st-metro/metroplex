@@ -58,11 +58,19 @@ def find(snap: dict[str, Any], thresholds: Any, now: float) -> list[Finding]:
         t = tasks.get(a["taskId"])
         if not t or not routable(t):
             continue
-        # M6 queued too long: the runtime never picked it up. A wake cannot help
-        # (the task has a live attempt), so this is a notice.
+        # M6 queued too long. A wake cannot help (the task has a live attempt),
+        # so this is a notice. An "api" attempt has no dispatcher since
+        # 2026-10-01: only `ttn run <attemptId>` (operator, attended or
+        # --headless) records attempt.started, so the notice says that rather
+        # than asking whether a runtime is up. Other runtimes keep the old ask.
         queued = _ts(a.get("queuedAt"))
         if a["status"] == "queued" and queued is not None and now - queued > QUEUED_TOO_LONG_S:
-            findings.append(Finding("M6 queued", t["id"], None, f"attempt {a['id']} queued {int((now - queued) // 60)} min and never started; is its runtime ({a.get('runtime')}) running?", f"queued:{a['id']}"))
+            minutes = int((now - queued) // 60)
+            if a.get("runtime") == "api":
+                detail = f"{t.get('title') or t['id']}: attempt {a['id']} queued {minutes} min, waiting for you to run `ttn run {a['id']}`"
+            else:
+                detail = f"attempt {a['id']} queued {minutes} min and never started; is its runtime ({a.get('runtime')}) running?"
+            findings.append(Finding("M6 queued", t["id"], None, detail, f"queued:{a['id']}"))
             continue
         # M1 stalled / M2 dead: judged on observed times, never on silence alone.
         if a["status"] != "running" or (t["id"], "stalled") in pending:
@@ -156,7 +164,7 @@ def sweep(client: TeletraanClient, store: LocalStore, thresholds: Any, max_wakes
         except WorkError as e:
             log.info("wake.raise %s %s skipped: %s", f.task_id, f.reason, e.code)
     # One batched message per sweep for new notice-only findings, never one each.
-    for label, batch in (("stuck wakes (routing loop failing)", orphans), ("attempts never started", queued), ("results awaiting owner review", reviews)):
+    for label, batch in (("stuck wakes (routing loop failing)", orphans), ("queued attempts not started yet", queued), ("results awaiting owner review", reviews)):
         if batch and not dry_run:
             lines = "\n".join(f"- {f.detail}" for f in batch[:10]) + (f"\n...and {len(batch) - 10} more" if len(batch) > 10 else "")
             if notify(f"Metroplex: {len(batch)} {label}.\n{lines}\nCheck `metroplex status`.", None):
