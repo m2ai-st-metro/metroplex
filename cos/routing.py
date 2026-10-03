@@ -36,6 +36,11 @@ Notify = Callable[[str, list[list[dict[str, str]]] | None], Any]
 ESCALATION_KINDS = ("intent", "authority", "reserved")
 # Teletraan rejections that mean "not now", not "broken": the turn waits.
 NOT_NOW = {"PROJECT_CAPACITY_EXHAUSTED", "WRITABLE_SCOPE_CONFLICT", "BINDING_BUSY", "DEPENDENCY_NOT_DONE", "RESERVED_ACTION_REQUIRES_APPROVAL", "PROJECT_PAUSED", "ATTEMPT_STILL_LIVE"}
+# Wakes Teletraan raises when an attempt ends (result, stopped/failed) or a
+# task completes (done). Each frees a worker or a dependency, but Teletraan
+# wakes only the task that changed, so the turn hands off to the tasks that
+# were waiting (work.mjs wake(t, "result"|"stopped"|"done")).
+FREEING_REASONS = {"result", "stopped", "done"}
 
 
 def notice_key(task: dict[str, Any], kind: str) -> str:
@@ -61,6 +66,30 @@ def awaiting_review(snap: dict[str, Any], task: dict[str, Any]) -> bool:
         if a and a["status"] == "completed" and a.get("resultCurrent") and a.get("scopeRevision") == rev:
             return True
     return False
+
+
+def routable(task: dict[str, Any], projects: dict[str, dict[str, Any]]) -> bool:
+    """Visible to routing at all: a granted, unpaused project, and neither the
+    project nor the task is human-only or synthetic."""
+    p = projects.get(task["projectId"])
+    spec = task.get("spec") or {}
+    return bool(p) and not p.get("paused") and not p.get("humanOnly") and not spec.get("humanOnly") and not spec.get("synthetic")
+
+
+def waiting_to_route(snap: dict[str, Any], task: dict[str, Any], tasks: dict[str, dict[str, Any]]) -> bool:
+    """Ready, or active with nothing live (an attempt ended and the retry
+    waited); dependencies done; no live attempt; no pending wake; not the
+    owner's to review. The M3 sweep and the hand-off share this, so they agree
+    on which tasks are waiting for an agent."""
+    if task["status"] not in ("ready", "active"):
+        return False
+    if not all(tasks.get(d, {}).get("status") == "done" for d in task.get("dependencies", [])):
+        return False
+    if any(a["taskId"] == task["id"] and a["status"] in LIVE for a in snap.get("attempt", [])):
+        return False
+    if any(w["taskId"] == task["id"] and not w.get("acknowledged") for w in snap.get("wake", [])):
+        return False
+    return not awaiting_review(snap, task)
 
 
 def escalation_notice(store: LocalStore, task: dict[str, Any], project: dict[str, Any], kind: str, need: str) -> tuple[str, list[list[dict[str, str]]] | None]:
@@ -173,6 +202,10 @@ class Router:
         if project["id"] in {c["project_id"] for c in self.store.cards_in("granting")}:
             out.decision = "hold: project setup not finished"
             return out  # decomposition and dependencies are not all in place yet
+        if wake["reason"] in FREEING_REASONS:
+            # Before the ack, so a crash replays it; already-raised tasks then
+            # have a pending wake and are skipped.
+            self.hand_off(wake, snap)
         spec = task.get("spec") or {}
         if task["status"] in TERMINAL:
             return self._ack(wake, key, f"noop: task {task['status']}", out)
@@ -232,6 +265,37 @@ class Router:
         if not fresh_task or fresh_task["scopeRevision"] != task["scopeRevision"] or busy:
             return self._ack(wake, key, f"wait: guard_override ({choice} busy or task changed)", out)
         return self._assign(wake, key, task, project, choice, judgment_id, why, fresh, out)
+
+    # ------------------------------------------------------------------ hand-off
+    def hand_off(self, wake: dict[str, Any], snap: dict[str, Any]) -> list[str]:
+        """An attempt ended or a task finished, so a worker or a dependency is
+        free. Raise a fenced 'unassigned' wake for every task still waiting to be
+        routed, in this project and in any project the freed worker belongs to,
+        so it is routed on the next poll instead of after the M3 window
+        (2026-10-02: t3 waited ~15 min for rodimus after t2 finished).
+
+        Bounded: fires only on Teletraan's own freeing wakes, at most
+        caps.wakes_per_sweep raises per project per cycle, and each raised task
+        still passes the turn's thrash guard. A failed raise is skipped, never a
+        failed turn; the M3 sweep remains the backstop."""
+        tasks, projects = _by_id(snap.get("task", [])), _by_id(snap.get("project", []))
+        freed = {a["worker"] for a in snap.get("attempt", []) if a["taskId"] == wake["taskId"] and a["status"] not in LIVE}
+        scope = {wake["projectId"]} | {p["id"] for p in projects.values() if freed & set(p.get("members", []))}
+        raised: list[str] = []
+        for t in sorted(tasks.values(), key=lambda t: (t["projectId"], t["id"])):
+            if t["id"] == wake["taskId"] or t["projectId"] not in scope or not routable(t, projects) or not waiting_to_route(snap, t, tasks):
+                continue
+            if not self.caps.take(f"handoff:{t['projectId']}", self.config.caps.wakes_per_sweep, now=self.clock()):
+                log.info("hand-off cap reached for %s; %s waits for the sweep", t["projectId"], t["id"])
+                continue
+            try:
+                self.client.command("wake.raise", t["id"], t["revision"], {"reason": "unassigned"}, command_id=f"cos:{wake['id']}:{wake['cycle']}:handoff:{t['id']}")
+                raised.append(t["id"])
+            except WorkError as e:
+                log.info("hand-off wake for %s skipped: %s", t["id"], e.code)
+        if raised:
+            log.info("%s %s freed work; woke %s", wake["taskId"], wake["reason"], ", ".join(raised))
+        return raised
 
     # ------------------------------------------------------------------ R2
     def _decide(self, wake, key, task, project, cands, snap) -> tuple[str, str | None, str]:

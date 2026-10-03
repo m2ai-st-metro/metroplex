@@ -18,12 +18,11 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Callable
 
-from cos.routing import ESCALATION_KINDS, awaiting_review, escalation_notice, notice_key
+from cos.routing import ESCALATION_KINDS, awaiting_review, escalation_notice, notice_key, routable as _routable, waiting_to_route
 from cos.store import LocalStore
 from cos.teletraan_client import TeletraanClient, WorkError
 
 log = logging.getLogger(__name__)
-LIVE = {"queued", "running", "stopping"}
 QUEUED_TOO_LONG_S = 15 * 60
 
 
@@ -50,9 +49,7 @@ def find(snap: dict[str, Any], thresholds: Any, now: float) -> list[Finding]:
     findings: list[Finding] = []
 
     def routable(t: dict[str, Any]) -> bool:
-        p = projects.get(t["projectId"])
-        spec = t.get("spec") or {}
-        return bool(p) and not p.get("paused") and not p.get("humanOnly") and not spec.get("humanOnly") and not spec.get("synthetic")
+        return _routable(t, projects)
 
     for a in snap.get("attempt", []):
         t = tasks.get(a["taskId"])
@@ -82,7 +79,6 @@ def find(snap: dict[str, Any], thresholds: Any, now: float) -> list[Finding]:
         elif progress is not None and now - progress > thresholds.stall_progress_s:
             findings.append(Finding("M1 stalled", t["id"], "stalled", f"attempt {a['id']} alive but no checkpoint for {int((now - progress) // 60)} min", f"stalled:{a['id']}:{a.get('progressAt') or a.get('startedAt')}"))
 
-    live_tasks = {a["taskId"] for a in snap.get("attempt", []) if a["status"] in LIVE}
     last_ack: dict[str, float] = {}
     for w in wakes:
         acked = _ts(w.get("acknowledgedAt"))
@@ -93,9 +89,10 @@ def find(snap: dict[str, Any], thresholds: Any, now: float) -> list[Finding]:
         if not routable(t):
             continue
         deps_done = all(tasks.get(d, {}).get("status") == "done" for d in t.get("dependencies", []))
-        # M3 unassigned: ready OR active with nothing live (an attempt failed and
-        # the retry waited), unblocked, nothing pending, quiet for the window.
-        if t["status"] in ("ready", "active") and deps_done and t["id"] not in live_tasks and not any(k[0] == t["id"] for k in pending) and not awaiting_review(snap, t):
+        # M3 unassigned: waiting to be routed and quiet for the window. Agents
+        # freeing up are handed off at once by the routing turn; this is the
+        # backstop for anything that hand-off missed.
+        if waiting_to_route(snap, t, tasks):
             quiet_since = last_ack.get(t["id"])
             if quiet_since is not None and now - quiet_since > thresholds.unassigned_s:
                 findings.append(Finding("M3 unassigned", t["id"], "unassigned", f"{t['status']} with nothing running for {int((now - quiet_since) // 60)} min"))

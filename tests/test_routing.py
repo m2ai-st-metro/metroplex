@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from cos.config import Config
+from cos.config import Caps, Config
 from cos.reasoning import NoReasoner, ReasoningUnavailable
 from cos.routing import Router, route_pending
 from cos.safety import CircuitBreaker, CycleCaps
@@ -206,3 +206,77 @@ def test_paused_project_holds_its_wakes_unacknowledged(work, store):
     r, _ = router(work, store)
     [out] = route_pending(r, work["cos"])
     assert out.decision == "hold: project paused" and not work.get("wake", "p:t1:created")["acknowledged"]
+
+
+# ---------------------------------------------------------------- Fix C (2026-10-02)
+# p-add-read-only-teletraan--2e56: t3 waited "every eligible agent is busy"
+# for rodimus, and after t2 finished it was re-routed only by the M3 sweep
+# (~15 min). Teletraan wakes only the task that changed, so the turn that
+# handles the freeing wake hands off to the waiting tasks.
+
+
+
+def grant_owner_only(work, pid="p"):
+    """Like the live project: the owner is the only member who can work."""
+    c = card()
+    work.cmd("cos", "approval.record", f"ap-{pid}", {"scope": "project", "cardHash": card_digest(c), "chatId": MATTHEW, "fromId": MATTHEW, "messageId": "1"})
+    work.cmd("cos", "project.create", pid, {"card": c, "approvalId": f"ap-{pid}"})
+
+
+def finish(work, attempt_id, worker="owner"):
+    work.cmd("runtime", "attempt.started", attempt_id, {"receipt": {"id": "r"}}, kind="attempt")
+    work.cmd(worker, "attempt.result", attempt_id, {"result": {"summary": "done"}}, kind="attempt")
+
+
+def decisions(outs):
+    return [o.decision for o in outs]
+
+
+def test_a_finished_attempt_hands_off_to_the_task_waiting_for_its_agent(work, store):
+    grant_owner_only(work)
+    add_task(work, "t1")
+    add_task(work, "t2")
+    r, _ = router(work, store, jev=FakeJev(jev_answer(choice="owner")))
+    assert decisions(route_pending(r, work["cos"])) == ["assign: owner (Jev chose owner (0.90))", "wait: every eligible agent is busy"]
+    assert route_pending(r, work["cos"]) == [], "nothing re-routes t2 on its own"
+    finish(work, "t1:created:1:a1")
+    [out] = route_pending(r, work["cos"])
+    assert out.decision.startswith("await: owner")
+    handed = work.get("wake", "p:t2:unassigned")
+    assert handed and not handed["acknowledged"], "t2 is woken by the turn, not left for the M3 window"
+    [out] = route_pending(r, work["cos"])
+    assert out.decision.startswith("assign: owner") and work.get("attempt", "t2:unassigned:1:a1")["status"] == "queued"
+
+
+def test_a_completed_dependency_hands_off_to_its_dependent(work, store):
+    grant_owner_only(work)
+    add_task(work, "t1")
+    add_task(work, "t3")
+    work.cmd("cos", "task.dependencies", "t3", {"dependencies": ["t1"]}, kind="task")
+    r, _ = router(work, store, jev=FakeJev(jev_answer(choice="owner")))
+    route_pending(r, work["cos"])
+    assert work.get("wake", "p:t3:created")["decision"] == "wait: dependencies not done"
+    finish(work, "t1:created:1:a1")
+    route_pending(r, work["cos"])
+    assert work.get("wake", "p:t3:unassigned") is None, "the result alone does not satisfy the dependency"
+    work.cmd("owner", "contribution.accept", "t1:created:1", {"evidence": "reviewed"})
+    work.cmd("owner", "task.complete", "t1", {"evidence": "accepted"})
+    [out] = route_pending(r, work["cos"])
+    assert out.decision == "noop: task done" and not work.get("wake", "p:t3:unassigned")["acknowledged"]
+    [out] = route_pending(r, work["cos"])
+    assert out.decision.startswith("assign: owner") and work.get("attempt", "t3:unassigned:1:a1")
+
+
+def test_hand_off_respects_the_per_cycle_cap_and_skips_live_pending_and_paused_work(work, store):
+    grant_owner_only(work)
+    for tid in ("t1", "t2", "t3"):
+        add_task(work, tid)
+    grant_owner_only(work, "q")
+    add_task(work, "q1", pid="q")
+    work.cmd("cos", "project.pause", "q", {"reason": "/pause"})
+    r, _ = router(work, store, jev=FakeJev(jev_answer(choice="owner")), caps=Caps(wakes_per_sweep=1))
+    route_pending(r, work["cos"])
+    finish(work, "t1:created:1:a1")
+    route_pending(r, work["cos"])
+    woken = sorted(w["taskId"] for w in work["operator"].snapshot()["wake"] if w["reason"] == "unassigned")
+    assert woken == ["t2"], "one raise per project per cycle at cap 1 (t3 waits for the next cycle or the sweep); q1 in the paused project is never woken"
