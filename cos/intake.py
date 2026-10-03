@@ -24,10 +24,14 @@ log = logging.getLogger(__name__)
 Send = Callable[[str, list[list[dict[str, str]]] | None], Any]
 
 CLASSIFY_SYSTEM = ("You triage one message Matthew sent to his chief of staff. Label it 'note' (an idea to keep, not work to start now) "
-                   "or 'new_objective' (he wants a project done). If new_objective and you cannot write an observable done-when "
-                   "without asking him, give exactly one short question. JSON: {\"label\": \"note\"|\"new_objective\", \"question\": str|null, \"title\": str}.")
+                   "or 'new_objective' (he wants a project done). Default question to null. Ask exactly one short question only when "
+                   "the message is new_objective and no observable done-when can be inferred from it at all (for example it points at "
+                   "something he did not attach, or names no outcome). Never ask about implementation details such as fixtures, test "
+                   "data, file names, libraries or approach: the card and its owner decide those. If he states a done-when, question "
+                   "must be null. JSON: {\"label\": \"note\"|\"new_objective\", \"question\": str|null, \"title\": str}.")
 CARD_SYSTEM = ("Draft a project card for Matthew's approval. Fields: title (<=80 chars), objective (one imperative paragraph), "
-               "doneWhen (observable by an outsider without asking Matthew), scopeIn (list), scopeOut (list), goals (1-7 of "
+               "doneWhen (observable by an outsider without asking Matthew; when statedDoneWhen is given, use it as written), "
+               "scopeIn (list), scopeOut (list), goals (1-7 of "
                "{goalId: 'g1'.., statement, doneWhen}), owner (one id from the agents list), kill (condition that ends the project). "
                "Keep it small. JSON object only.")
 DECOMPOSE_SYSTEM = ("Break an approved project into the smallest set of tasks that covers every goal: usually one to three per goal, "
@@ -49,6 +53,22 @@ _RESERVED_WORDS = {
     "external_contact": ("email", "e-mail", "send the", "send a", "message the", "contact", "post to", "post on", "post the", "tweet",
                          "slack", "notify customer", "reach out", "reply to", "newsletter", "announce", "invite", "sms", "whatsapp"),
 }
+
+
+# A line that starts with "done when" (or done-when, donewhen, doneWhen, with an
+# optional bullet, bold markers and colon) followed by real text, on the same
+# line or the line after the colon, is Matthew stating the done-when himself. Line start only, so "I'll be done when..." mid-sentence
+# does not count; a bare "Done when?" does not count either.
+_DONE_WHEN = re.compile(r"^[ \t]*(?:[-*>][ \t]*)?\**done[ _-]?when\**(?:[ \t]*:\**\s*|[ \t]+)(?P<text>[^\s?].{2,})", re.I | re.M)
+
+
+def stated_done_when(text: str) -> str | None:
+    """The done-when Matthew wrote into the message, or None. Code-side backstop
+    for the classifier: a stated done-when means drafting never stops to ask
+    (2026-10-02: he wrote 'Done when: node --test ... passes' and was still
+    asked which fixture to use)."""
+    m = _DONE_WHEN.search(text or "")
+    return m.group("text").strip() if m else None
 
 
 def infer_reserved(title: str, objective: str, acceptance: str = "") -> str | None:
@@ -92,6 +112,9 @@ class Intake:
             return self._file_note(text, message_id, "kept as a proposal")
         card_id = f"card-{_short(message_id + text)}"
         question = result.get("question")
+        if question and stated_done_when(text):
+            log.info("dropping classifier question %r: the message states its done-when", question)
+            question = None
         self.store.put_card(card_id, {"title": result.get("title") or text[:80]}, "", "drafting", source=text, question=question)
         if question:
             self.store.set("open_question", card_id)
@@ -153,7 +176,7 @@ class Intake:
             self.send("I cannot draft a card: no persistent agent that reports to no one exists in Teletraan to own it.", None)
             return "no_agents"
         self.send("Drafting a card for this on the local model; it usually takes a minute or two.", None)
-        prompt = json.dumps({"idea": source, "answer": answer, "feedback": feedback, "agents": agents, "reservedActionsDefault": list(RESERVED_ACTIONS)})
+        prompt = json.dumps({"idea": source, "statedDoneWhen": stated_done_when(source), "answer": answer, "feedback": feedback, "agents": agents, "reservedActionsDefault": list(RESERVED_ACTIONS)})
         card, problems = None, ["no draft"]
         for attempt in range(2):
             try:

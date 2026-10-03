@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import json
 
 from cos.bot import Bot, Inbound
 from cos.daemon import Daemon
-from cos.intake import Intake
+from cos.intake import Intake, stated_done_when
 from cos.reasoning import ReasoningUnavailable
 from cos.routing import Router, route_pending
 from cos.safety import CircuitBreaker, CycleCaps, ShutdownHandler
@@ -204,3 +205,44 @@ def test_first_start_skips_the_telegram_backlog():
     bot = Bot(transport, MATTHEW, (MATTHEW,))
     assert bot.skip_backlog()[0] == 42
     assert ("getUpdates", {"offset": -1, "timeout": 0}) in calls
+
+
+# ---------------------------------------------------------------- Fix A (2026-10-02)
+# Matthew wrote an explicit done-when and the classifier still asked about a
+# fixture. A stated done-when is now a code-side backstop: no question.
+
+
+OBSERVED = ("Add a read-only Teletraan view to the dashboard.\n"
+            "Done when: node --test web/src/lib/teletraan-view.test.ts passes offline, npm run typecheck still passes, and the page renders the fixture.")
+
+
+def test_stated_done_when_is_recognized_only_at_a_line_start_with_real_text():
+    assert stated_done_when(OBSERVED).startswith("node --test web/src/lib/teletraan-view.test.ts passes offline")
+    for stated in ("done-when: tests pass", "DoneWhen: x passes", "- Done when the README exists", "**Done when:** it renders", "Done when:\n- tests pass"):
+        assert stated_done_when(stated), stated
+    for not_stated in ("I will be done when I get home", "Done whenever you like", "Done when?", "Done when: ?", "done when ",
+                       "review the transcripts from this video and create a verification loop"):
+        assert stated_done_when(not_stated) is None, not_stated
+
+
+class RecordingReasoner(ScriptedReasoner):
+    def complete_json(self, system, user, max_tokens=None):
+        if system.startswith("Draft a project card"):
+            self.card_prompt = user
+        return super().complete_json(system, user, max_tokens)
+
+
+def test_a_stated_done_when_drafts_the_card_even_if_the_model_asks(work, store):
+    reasoner = RecordingReasoner(question="Should the fixture snapshot be generated from a specific historical Teletraan state or a synthetic example?")
+    d, transport = daemon(work, store, reasoner)
+    d.handle(text(OBSERVED))
+    assert not any("One question" in m["text"] for m in transport.sent), "a stated done-when is never second-guessed"
+    assert transport.sent[-1]["text"].startswith("CARD: ") and store.get("open_question") is None
+    assert "teletraan-view.test.ts passes offline" in json.loads(reasoner.card_prompt)["statedDoneWhen"]
+
+
+def test_a_vague_idea_without_a_done_when_still_gets_one_question(work, store):
+    d, transport = daemon(work, store, ScriptedReasoner(question="Which video do you mean? None was attached."))
+    d.handle(text("review the transcripts from this video and create a verification loop"))
+    assert transport.sent[-1]["text"].startswith("One question before I draft the card:")
+    assert work["operator"].snapshot()["project"] == [] and store.get("open_question")
