@@ -12,6 +12,7 @@ import hashlib
 import json
 import logging
 import re
+import textwrap
 import time
 from collections.abc import Callable
 from typing import Any
@@ -55,36 +56,81 @@ DECOMPOSE_SYSTEM = ("Break an approved project into the smallest set of tasks th
 _RESERVED_WORDS = {
     "live_fleet_config": ("systemd", "systemctl", "crontab", "cron job", "restart", "credential", "api key", "secret", "rotate",
                           "env.shared", "pm2", "kubectl", "helm", "ansible", "live config", "production config"),
-    "publish_push_deploy": ("publish", "deploy", "release", "roll out", "rollout", "git push", "push the", "push to", "docker push",
+    "publish_push_deploy": ("publish", "republish", "deploy", "redeploy", "release", "roll out", "rollout", "git push", "push the", "push to", "docker push",
                             "merge", "pull request", "open a pr", "pypi", "npm publish", "ship to", "go live", "go-live", "upload to",
                             "terraform", "dns", "production"),
     "external_contact": ("email", "e-mail", "send the", "send a", "message the", "contact", "post to", "post on", "post the", "tweet",
                          "slack", "notify customer", "reach out", "reply to", "newsletter", "announce", "invite", "sms", "whatsapp"),
 }
 
+# Keywords match at the start of a word, with any ending: "deploys" and
+# "emailing" still count, but "mechanisms" is not "sms" and "emergency" is not
+# "merge" (2026-10-05: a build task on card-cc97709c was tagged external_contact).
+_RESERVED_PATTERNS = {action: tuple(re.compile(r"(?<![a-z0-9])" + re.escape(w)) for w in words) for action, words in _RESERVED_WORDS.items()}
+
 
 # A line that starts with "done when" (or done-when, donewhen, doneWhen, with an
-# optional bullet, bold markers and colon) followed by real text, on the same
-# line or the line after the colon, is Matthew stating the done-when himself. Line start only, so "I'll be done when..." mid-sentence
-# does not count; a bare "Done when?" does not count either.
-_DONE_WHEN = re.compile(r"^[ \t]*(?:[-*>][ \t]*)?\**done[ _-]?when\**(?:[ \t]*:\**\s*|[ \t]+)(?P<text>[^\s?].{2,})", re.IGNORECASE | re.MULTILINE)
+# optional bullet, bold markers and colon) is Matthew stating the done-when
+# himself. Line start only, so "I'll be done when..." mid-sentence does not
+# count; a bare "Done when?" does not count either.
+_DONE_WHEN = re.compile(r"^(?P<indent>[ \t]*)(?P<bullet>[-*>][ \t]+|[->])?\**done[ _-]?when\**(?:[ \t]*:\**[ \t]*|[ \t]+)(?P<first>.*)$", re.IGNORECASE | re.MULTILINE)
+_LIST_ITEM = re.compile(r"^[ \t]*(?:[-*+]|\d+[.)])[ \t]+")
+
+
+def _indent(line: str) -> int:
+    return len(line) - len(line.lstrip(" \t"))
 
 
 def stated_done_when(text: str) -> str | None:
     """The done-when Matthew wrote into the message, or None. Code-side backstop
     for the classifier: a stated done-when means drafting never stops to ask
     (2026-10-02: he wrote 'Done when: node --test ... passes' and was still
-    asked which fixture to use)."""
+    asked which fixture to use).
+
+    The whole block is returned: the header's own text (or the first line after
+    it), then every following list item or indented line up to a blank line or
+    an unindented line of prose. Under a bulleted header only deeper-indented
+    lines belong to it, so a sibling bullet is not swallowed. 2026-10-05: a
+    'Done when:' header over five bullets kept only the first, and the card
+    Matthew approved dropped the other four."""
     m = _DONE_WHEN.search(text or "")
-    return m.group("text").strip() if m else None
+    if not m:
+        return None
+    nested, header_indent = bool(m.group("bullet")), _indent(m.group("indent"))
+    first, lines = m.group("first").strip(), (text[m.end():].split("\n")[1:])
+    if not first:
+        while lines and not lines[0].strip():
+            lines.pop(0)
+        if lines and not nested and not _LIST_ITEM.match(lines[0]):
+            first = lines.pop(0).strip()
+    block: list[str] = []
+    for line in lines:
+        if not line.strip() or (_indent(line) <= header_indent if nested else _indent(line) == 0 and not _LIST_ITEM.match(line)):
+            break
+        block.append(line.rstrip())
+    stated = "\n".join(([first] if first else []) + textwrap.dedent("\n".join(block)).splitlines()).strip()
+    core = _LIST_ITEM.sub("", stated, count=1).strip()
+    return stated if len(core) >= 3 and not core.startswith("?") else None
 
 
 def infer_reserved(title: str, objective: str, acceptance: str = "") -> str | None:
     text = f"{title} {objective} {acceptance}".lower()
-    for action, words in _RESERVED_WORDS.items():
-        if any(w in text for w in words):
+    for action, patterns in _RESERVED_PATTERNS.items():
+        if any(p.search(text) for p in patterns):
             return action
     return None
+
+
+def _clip(value: str, n: int) -> str:
+    """At most n characters, cut at a word boundary and marked with an ellipsis
+    so a shortened title never ends mid-word ('...(Devastato', 2026-10-05)."""
+    value = value.strip()
+    if len(value) <= n:
+        return value
+    head = value[: n - 1]
+    if not value[n - 1].isspace() and re.search(r"\s", head):
+        head = head.rsplit(None, 1)[0]
+    return (head.rstrip(" \t-:;,(/[{") or value[: n - 1]) + "\u2026"
 
 
 def _slug(text: str, n: int = 24) -> str:
@@ -184,7 +230,8 @@ class Intake:
             self.send("I cannot draft a card: no persistent agent that reports to no one exists in Teletraan to own it.", None)
             return "no_agents"
         self.send("Drafting a card for this on the local model; it usually takes a minute or two.", None)
-        prompt = json.dumps({"idea": source, "statedDoneWhen": stated_done_when(source), "answer": answer, "feedback": feedback, "agents": agents, "reservedActionsDefault": list(RESERVED_ACTIONS)})
+        stated = stated_done_when(source)
+        prompt = json.dumps({"idea": source, "statedDoneWhen": stated, "answer": answer, "feedback": feedback, "agents": agents, "reservedActionsDefault": list(RESERVED_ACTIONS)})
         card, problems = None, ["no draft"]
         for attempt in range(2):
             try:
@@ -193,6 +240,11 @@ class Intake:
                 self.send(f"Card drafting is unavailable right now ({e}). Your idea is kept; say 'card {card_id}' to retry.", None)
                 return "unavailable"
             card = self._normalize(draft, agents)
+            if stated and answer is None:
+                # "Use it as written" is enforced here, not trusted to the model:
+                # the card carries Matthew's stated block verbatim. An answer
+                # (an Edit) may change it, so the model's draft wins then.
+                card["doneWhen"] = stated
             problems = validate_card(card)
             if not problems:
                 break
@@ -205,13 +257,14 @@ class Intake:
         self.send(self.render(card), [[{"text": "Yes", "callback_data": f"yes:{card_id}:{digest[:16]}"}, {"text": "Edit", "callback_data": f"edit:{card_id}"}, {"text": "Drop", "callback_data": f"drop:{card_id}"}]])
         return "card"
 
-    def _normalize(self, draft: dict[str, Any], agents: list[dict[str, Any]]) -> dict[str, Any]:
+    @staticmethod
+    def _normalize(draft: dict[str, Any], agents: list[dict[str, Any]]) -> dict[str, Any]:
         """Fields Metroplex controls are set here, not by the model: defaults
         for reserved actions and hosted processing (MVP scope defaults)."""
         goals = [{"goalId": str(g.get("goalId") or f"g{i + 1}"), "statement": str(g.get("statement", "")).strip(), "doneWhen": str(g.get("doneWhen", "")).strip()} for i, g in enumerate(draft.get("goals") or []) if isinstance(g, dict)]
         owner = draft.get("owner") if draft.get("owner") in {a["id"] for a in agents} else agents[0]["id"]
         return {
-            "title": str(draft.get("title", "")).strip()[:80],
+            "title": _clip(str(draft.get("title", "")), 80),
             "objective": str(draft.get("objective", "")).strip(),
             "doneWhen": str(draft.get("doneWhen", "")).strip(),
             "scopeIn": [str(s) for s in draft.get("scopeIn") or []],
@@ -335,7 +388,7 @@ class Intake:
                     continue
                 goal = goals[t["goalId"]]
                 deps = t.get("dependsOn") if isinstance(t.get("dependsOn"), list) else []
-                title, objective = str(t.get("title") or goal["statement"])[:120], str(t.get("objective") or goal["statement"])
+                title, objective = _clip(str(t.get("title") or goal["statement"]), 120), str(t.get("objective") or goal["statement"])
                 acceptance = str(t.get("acceptance") or goal["doneWhen"])
                 raw_tag = t.get("reservedAction")
                 if raw_tag in RESERVED_ACTIONS:
@@ -355,7 +408,7 @@ class Intake:
         covered = {t["goalId"] for t in tasks}
         for g in card["goals"]:
             if g["goalId"] not in covered:
-                tasks.append({"goalId": g["goalId"], "title": g["statement"][:120], "objective": g["statement"], "acceptance": g["doneWhen"], "dependsOn": [], "reservedAction": infer_reserved(g["statement"], "", g["doneWhen"])})
+                tasks.append({"goalId": g["goalId"], "title": _clip(g["statement"], 120), "objective": g["statement"], "acceptance": g["doneWhen"], "dependsOn": [], "reservedAction": infer_reserved(g["statement"], "", g["doneWhen"])})
         return tasks
 
     def decompose(self, project_id: str, card: dict[str, Any]) -> int:
