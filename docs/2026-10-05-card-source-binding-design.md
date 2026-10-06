@@ -98,8 +98,21 @@ scopes between live attempts in one project (`work.mjs:487-490`). So:
 
 ## Decisions for Matthew
 
-1. File every Telegram objective as a proposal before drafting (A, second bullet)? Recommended.
-2. When decomposition omits a task's `writableScope`: unrestricted (today) or the card-wide scope (safer, serializes)?
+1. File every Telegram objective as a proposal before drafting (A, second bullet)?
+   **Decided 2026-10-06: yes, always file first.**
+2. When decomposition omits a task's `writableScope`: unrestricted (today) or the card-wide scope?
+   **Decided 2026-10-06: the card-wide scope.** A task is never unbounded.
+
+## Built 2026-10-06 (A, B, C)
+
+The plan was agreed with Codex over 4 `/checkmate` rounds. Beyond this note, those rounds added:
+
+- **Amendments become source.** An answer or Edit files an immutable "effective" proposal: the source, the amendment verbatim, and a line saying the amendment wins. The card binds that proposal's hash.
+- **Verbatim carry and amendments.** An amended source skips verbatim field carry on every drafting path, including `card <id>` recovery.
+- **First filing wins.** The source hash comes from the stored proposal body, re-read after filing, so a retry binds the first filing.
+- **Scopes only narrow.** A child task's scope must sit inside its parent's and the card's. An omitted or empty contribution scope under a scoped task takes the task's scope.
+- **Review backstop.** `ttn review` fails any change outside the pinned `writableScope`. It uses `--no-renames` and untrimmed `-z` paths, so neither a rename into scope nor a newline in a filename hides an out-of-scope write.
+- **Matching teletraan-core change.** It lives on the `feat/card-source-scope` branch: card validation, the source hash check at `project.create`, scope containment, the attempt context card and goal, `source.md` pinning with `TTN_SOURCE_DRIFT`, and the review scope gate.
 3. `p-where-the-side-walk-retu-709c` was granted from the lossy card. A grant is
    never silently expanded, so carrying the full source there needs a fresh card
    and Yes once A and B land. Its t2 still carries the wrong `external_contact`

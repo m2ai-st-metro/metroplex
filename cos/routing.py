@@ -358,6 +358,10 @@ class Router:
     def _assign(self, wake, key, task, project, agent, judgment_id, why, snap, out: Outcome) -> Outcome:
         contribution_id = f"{task['id']}:{wake['reason']}:{wake['cycle']}"
         payload: dict[str, Any] = {"taskId": task["id"], "worker": agent, "deliverable": (task.get("spec") or {}).get("doneWhen") or task["acceptance"]}
+        scope = (task.get("spec") or {}).get("writableScope")
+        if scope:
+            # The task's approved paths travel to the attempt; Teletraan refuses wider.
+            payload["writableScope"] = scope
         judgment = _by_id(snap.get("judgment", [])).get(judgment_id) if judgment_id else None
         if judgment and judgment.get("current"):
             payload["judgmentId"] = judgment_id
