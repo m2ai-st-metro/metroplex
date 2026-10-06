@@ -28,7 +28,7 @@ def parse_json_object(text: str) -> dict[str, Any]:
     JSON object (chain-of-thought mixed into output is a known failure mode)."""
     if not isinstance(text, str) or not text.strip():
         raise ReasoningUnavailable("REASONING_EMPTY")
-    fenced = re.search(r"```(?:json)?\s*(\{.*\})\s*```", text, re.S)
+    fenced = re.search(r"```(?:json)?\s*(\{.*\})\s*```", text, re.DOTALL)
     candidate = fenced.group(1) if fenced else text[text.find("{"): text.rfind("}") + 1]
     try:
         value = json.loads(candidate)
@@ -66,7 +66,7 @@ class OpenAICompatibleReasoner:
                 messages=[{"role": "system", "content": system + "\nRespond with one JSON object and nothing else."}, {"role": "user", "content": user}],
                 extra_body={"chat_template_kwargs": {"enable_thinking": False}},
             )
-        except Exception as e:  # noqa: BLE001 - any transport/provider failure is unavailability
+        except Exception as e:  # any transport/provider failure is unavailability
             raise ReasoningUnavailable(f"REASONING_PROVIDER_ERROR: {type(e).__name__}") from e
         content = (resp.choices[0].message.content or "") if resp.choices else ""
         return parse_json_object(content)

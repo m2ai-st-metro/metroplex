@@ -8,10 +8,10 @@ import subprocess
 
 import pytest
 
-from tests.conftest import TELETRAAN_ROOT
 from cos.safety import CircuitBreaker, CycleCaps
 from cos.spec import SpecError, card_digest, validate_card, validate_task_spec
 from cos.teletraan_client import WorkError
+from tests.conftest import TELETRAAN_ROOT
 
 
 def make_card(**overrides):

@@ -14,11 +14,19 @@ from __future__ import annotations
 
 import logging
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Callable
+from typing import Any
 
-from cos.routing import ESCALATION_KINDS, awaiting_review, escalation_notice, notice_key, routable as _routable, waiting_to_route
+from cos.routing import (
+    ESCALATION_KINDS,
+    awaiting_review,
+    escalation_notice,
+    notice_key,
+    waiting_to_route,
+)
+from cos.routing import routable as _routable
 from cos.store import LocalStore
 from cos.teletraan_client import TeletraanClient, WorkError
 

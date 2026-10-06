@@ -66,7 +66,7 @@ class Config:
         return self.env == "live"
 
     @classmethod
-    def from_env(cls) -> "Config":
+    def from_env(cls) -> Config:
         home = Path.home()
         data_dir = Path(os.environ.get("METROPLEX_DATA_DIR", str(Path(__file__).resolve().parent.parent / "data")))
         # One approver list for both sides of the Yes: the unit reads the work

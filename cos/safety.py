@@ -45,7 +45,7 @@ class CircuitBreaker:
         return opened_now
 
     def is_open(self, loop: Loop, now: float | None = None) -> bool:
-        failures, opened_at = self.store.get_breaker(loop)
+        _failures, opened_at = self.store.get_breaker(loop)
         if opened_at is None:
             return False
         if loop == "jev" and (time.time() if now is None else now) - opened_at >= self.jev_cooldown_s:

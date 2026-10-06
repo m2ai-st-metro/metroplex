@@ -11,7 +11,14 @@ from cos.motion import sweep
 from cos.routing import route_pending
 from cos.teletraan_client import WorkError
 from tests.test_intake_daemon import ScriptedReasoner, button, daemon, text, yes_button
-from tests.test_routing import FakeJev, add_task, config, grant_project, jev_answer, router
+from tests.test_routing import (
+    FakeJev,
+    add_task,
+    config,
+    grant_project,
+    jev_answer,
+    router,
+)
 
 T = Thresholds()
 

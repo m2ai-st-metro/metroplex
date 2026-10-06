@@ -49,7 +49,7 @@ class FakeTransport:
 def daemon(work, store, reasoner):
     transport = FakeTransport()
     bot = Bot(transport, MATTHEW, (MATTHEW,))
-    send = lambda text, buttons=None: bot.send(text, buttons)  # noqa: E731
+    send = lambda text, buttons=None: bot.send(text, buttons)
     cfg = config()
     breaker = CircuitBreaker(store)
     router = Router(work["cos"], cfg, store, breaker, CycleCaps(store, 900), notify=send, jev_post=FakeJev(), reasoner_factory=lambda c, h: FakeReasoner("worker"))
@@ -150,7 +150,7 @@ def test_c3_bot_drops_updates_from_anyone_but_matthew_in_his_chat():
 
 
 def test_note_is_filed_as_an_inert_proposal(work, store):
-    d, transport = daemon(work, store, ScriptedReasoner(label="note"))
+    d, _transport = daemon(work, store, ScriptedReasoner(label="note"))
     d.handle(text("maybe someday: a thing"))
     snap = work["operator"].snapshot()
     assert len(snap["proposal"]) == 1 and snap["proposal"][0]["status"] == "inert"
@@ -192,7 +192,7 @@ def test_c4_reserved_action_approval_resumes_and_routes(work, store):
 
 
 def test_stop_pauses_then_requests_shutdown(work, store):
-    d, transport = daemon(work, store, ScriptedReasoner())
+    d, _transport = daemon(work, store, ScriptedReasoner())
     d.handle(text("/stop"))
     assert d.shutdown.requested and store.paused
 

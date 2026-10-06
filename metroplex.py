@@ -18,16 +18,16 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from audit import AuditLogger  # noqa: E402
-from cos.bot import Bot, http_transport  # noqa: E402
-from cos.config import Config  # noqa: E402
-from cos.intake import Intake  # noqa: E402
-from cos.motion import find  # noqa: E402
-from cos.reasoning import reasoner_for  # noqa: E402
-from cos.routing import Router  # noqa: E402
-from cos.safety import LOOPS, CircuitBreaker, CycleCaps, ShutdownHandler  # noqa: E402
-from cos.store import LocalStore  # noqa: E402
-from cos.teletraan_client import TeletraanClient  # noqa: E402
+from audit import AuditLogger
+from cos.bot import Bot, http_transport
+from cos.config import Config
+from cos.intake import Intake
+from cos.motion import find
+from cos.reasoning import reasoner_for
+from cos.routing import Router
+from cos.safety import LOOPS, CircuitBreaker, CycleCaps, ShutdownHandler
+from cos.store import LocalStore
+from cos.teletraan_client import TeletraanClient
 
 
 def build(config: Config):
@@ -38,7 +38,7 @@ def build(config: Config):
     if not (config.bot_token and config.chat_id and config.approver_ids):
         raise SystemExit("METROPLEX_TELEGRAM_BOT_TOKEN, METROPLEX_TELEGRAM_CHAT_ID and METROPLEX_APPROVER_IDS are required")
     bot = Bot(http_transport(config.bot_token), config.chat_id, config.approver_ids)
-    send = lambda text, buttons=None: bot.send(text, buttons)  # noqa: E731
+    send = lambda text, buttons=None: bot.send(text, buttons)
     router = Router(client, config, store, breaker, caps, notify=send)
     intake = Intake(client, store, reasoner_for(config, True), send, config)
     return store, client, bot, intake, router, breaker

@@ -12,8 +12,9 @@ import hashlib
 import json
 import logging
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Any, Callable
+from typing import Any
 
 from cos import jev_client
 from cos.reasoning import ReasoningUnavailable, reasoner_for
@@ -314,7 +315,7 @@ class Router:
             # a second call: mark in flight first; a replay records "unknown".
             post = self.jev_post
             if inflight:
-                def post(key, req):  # noqa: ARG001 - replay never calls the provider
+                def post(key, req):  # replay never calls the provider
                     raise RuntimeError("JEV_OUTCOME_UNKNOWN_AFTER_RESTART")
             self.store.set(f"jev_inflight:{jid}", True)
             judgment = jev_client.evaluate(

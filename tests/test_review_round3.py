@@ -17,7 +17,7 @@ T = Thresholds()
 def test_r1_failed_rework_on_the_same_contribution_is_routed_again(work, store):
     grant_project(work)
     add_task(work, "t1")
-    r, notes = router(work, store, jev=FakeJev())
+    r, _notes = router(work, store, jev=FakeJev())
     route_pending(r, work["cos"])
     a1 = "t1:created:1:a1"
     work.cmd("runtime", "attempt.started", a1, {"receipt": {"id": "r"}}, kind="attempt")
@@ -86,7 +86,7 @@ def test_r3_card_command_accepts_any_known_proposal_id(work, store):
 
 
 def test_r4_control_commands_do_not_close_the_intake_breaker_and_locked_buttons_are_answered(work, store):
-    d, transport = daemon(work, store, ScriptedReasoner())
+    d, _transport = daemon(work, store, ScriptedReasoner())
     for _ in range(3):
         d.breaker.record_failure("intake")
     d.handle(text("/status"))
@@ -122,7 +122,7 @@ def test_q1_a_rejected_first_yes_is_not_replayed_forever(work, store):
 
 
 def test_q2_control_command_failures_do_not_lock_intake(work, store):
-    d, transport = daemon(work, store, ScriptedReasoner())
+    d, _transport = daemon(work, store, ScriptedReasoner())
     real = work.clients["cos"].wake_pending
     work.clients["cos"].wake_pending = lambda: (_ for _ in ()).throw(WorkError("SOCKET_DOWN"))
     for _ in range(3):
