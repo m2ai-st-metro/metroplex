@@ -8,7 +8,15 @@ from cos.intake import Intake
 from cos.routing import route_pending
 from tests.test_intake_daemon import ScriptedReasoner
 from tests.test_review_round2 import fail_attempt, token_from
-from tests.test_routing import FakeJev, add_task, config, decisions, finish, grant_project, router
+from tests.test_routing import (
+    FakeJev,
+    add_task,
+    config,
+    decisions,
+    finish,
+    grant_project,
+    router,
+)
 
 A1 = "ship:ready:1:a1"
 
