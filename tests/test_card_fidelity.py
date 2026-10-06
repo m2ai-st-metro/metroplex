@@ -52,7 +52,7 @@ def test_done_when_still_rejects_non_statements():
 class RecordingCard(ScriptedReasoner):
     """Card drafts that paraphrase the done-when, as Qwen did."""
 
-    def complete_json(self, system, user, max_tokens=None):
+    def complete_json(self, system, user, max_tokens=None, schema=None):
         if system.startswith("Draft a project card"):
             self.card_prompt = user
             draft = super().complete_json(system, user, max_tokens)

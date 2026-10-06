@@ -27,7 +27,7 @@ T = Thresholds()
 class PartialPlan(ScriptedReasoner):
     """Covers only g1, and returns malformed dependsOn values."""
 
-    def complete_json(self, system, user, max_tokens=None):
+    def complete_json(self, system, user, max_tokens=None, schema=None):
         if system.startswith("Break an approved project"):
             return {"tasks": [{"goalId": "g1", "title": "Code", "objective": "o", "acceptance": "a", "dependsOn": 0},
                               {"goalId": "g1", "title": "More code", "objective": "o", "acceptance": "a", "dependsOn": [0, "x", 9, True]}]}

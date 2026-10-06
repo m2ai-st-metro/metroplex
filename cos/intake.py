@@ -50,6 +50,26 @@ DECOMPOSE_SYSTEM = ("Break an approved project into the smallest set of tasks th
                     "deploys, contacts anyone outside, or changes live systems. Every task must serve exactly one listed goal. "
                     "JSON: {{\"tasks\": [...]}}.")
 
+_S = {"type": "string"}
+# Grammar for the card and decompose turns (llama-server `json_schema`): the
+# output is valid JSON with these fields, so a proposal that quotes code can
+# no longer turn a draft into REASONING_NOT_JSON (2026-10-06).
+CARD_SCHEMA = {
+    "type": "object",
+    "properties": {"title": _S, "objective": _S, "doneWhen": _S, "scopeIn": {"type": "array", "items": _S}, "scopeOut": {"type": "array", "items": _S},
+                   "goals": {"type": "array", "items": {"type": "object", "properties": {"goalId": _S, "statement": _S, "doneWhen": _S}, "required": ["goalId", "statement", "doneWhen"]}},
+                   "owner": _S, "kill": _S},
+    "required": ["title", "objective", "doneWhen", "scopeIn", "scopeOut", "goals", "owner", "kill"],
+}
+DECOMPOSE_SCHEMA = {
+    "type": "object",
+    "properties": {"tasks": {"type": "array", "items": {"type": "object", "properties": {
+        "goalId": _S, "title": _S, "objective": _S, "acceptance": _S, "dependsOn": {"type": "array", "items": {"type": "integer"}},
+        "reservedAction": {"anyOf": [{"type": "null"}, {"enum": ["publish_push_deploy", "external_contact", "live_fleet_config"]}]},
+    }, "required": ["goalId", "title", "objective", "acceptance", "dependsOn", "reservedAction"]}}},
+    "required": ["tasks"],
+}
+
 # Code-side backstop for reserved steps the model did not tag. When unsure,
 # err toward reserved: a wrong tag costs Matthew one tap, a missed one costs
 # the approval gate (live E2E finding 4).
@@ -111,6 +131,70 @@ def stated_done_when(text: str) -> str | None:
     stated = "\n".join(([first] if first else []) + textwrap.dedent("\n".join(block)).splitlines()).strip()
     core = _LIST_ITEM.sub("", stated, count=1).strip()
     return stated if len(core) >= 3 and not core.startswith("?") else None
+
+
+# Labels a proposal or message can state a card field with, at a line start
+# (optional bullet and bold). "Done when" is listed only so it ends the block
+# above it; stated_done_when owns that field.
+_FIELD = re.compile(
+    r"^[ \t]*(?:[-*>][ \t]+)?\**(?P<label>title|objective|goal[ \t]*(?P<n>\d+)|writable[ \t]+scope|scope[ \t]+in|in[ \t]+scope"
+    r"|out[ \t]+of[ \t]+scope|scope[ \t]+out|done[ _-]?when)\**[ \t]*:\**[ \t]*(?P<first>.*)$",
+    re.IGNORECASE,
+)
+_FIELD_KEYS = {"title": "title", "objective": "objective", "writable scope": "scopeIn", "scope in": "scopeIn", "in scope": "scopeIn",
+               "out of scope": "scopeOut", "scope out": "scopeOut"}
+
+
+def _items(first: str, lines: list[str]) -> list[str]:
+    """A block as items: one per list bullet (wrapped lines joined), or the
+    whole paragraph as one item when it has no bullets."""
+    if not any(_LIST_ITEM.match(line) for line in lines):
+        return [" ".join(" ".join([first, *lines]).split())]
+    items = [first] if first else []
+    for line in lines:
+        if _LIST_ITEM.match(line):
+            items.append(_LIST_ITEM.sub("", line, count=1))
+        elif items:
+            items[-1] += " " + line.strip()
+    return [" ".join(i.split()) for i in items]
+
+
+def stated_fields(text: str) -> dict[str, Any]:
+    """Card fields the text states itself: title, objective, goals (by number),
+    scopeIn, scopeOut. The card carries them as written; the model fills only
+    what is unstated. 2026-10-06: a live run of the side-walk proposal kept the
+    stated done-when but paraphrased these in 3 of 6 drafts (the repo path left
+    scopeIn, 'original attachments' left scopeOut, the app's name left the
+    objective). A block runs to a blank line or the next label."""
+    lines = (text or "").split("\n")
+    found: dict[str, Any] = {}
+    goals: dict[int, str] = {}
+    for i, line in enumerate(lines):
+        m = _FIELD.match(line)
+        if not m:
+            continue
+        label = " ".join(m.group("label").lower().split())
+        first, rest = m.group("first").strip(), lines[i + 1:]
+        if not first:
+            while rest and not rest[0].strip():
+                rest = rest[1:]
+        block: list[str] = []
+        for nxt in rest:
+            if not nxt.strip() or _FIELD.match(nxt):
+                break
+            block.append(nxt.strip() if not _LIST_ITEM.match(nxt) else nxt.lstrip())
+        items = [x for x in _items(first, block) if len(x) >= 3 and not x.startswith("?")]
+        if not items:
+            continue
+        if m.group("n"):
+            goals.setdefault(int(m.group("n")), " ".join(items))
+        elif label in _FIELD_KEYS:
+            key = _FIELD_KEYS[label]
+            if key not in found:
+                found[key] = items if key.startswith("scope") else " ".join(items)
+    if goals:
+        found["goals"] = [goals[n] for n in sorted(goals)]
+    return found
 
 
 def infer_reserved(title: str, objective: str, acceptance: str = "") -> str | None:
@@ -199,7 +283,7 @@ class Intake:
             return "unknown"
         card_id = f"card-{_short(ref)}"
         self.store.put_card(card_id, {"title": proposal["title"]}, "", "drafting", source=proposal["body"])
-        return self._draft(card_id, proposal["body"])
+        return self._draft(card_id, proposal["body"], title=proposal["title"])
 
     def _file_note(self, text: str, message_id: str, why: str) -> str:
         pid = f"Q-metroplex-{_short(message_id + text)}"
@@ -223,7 +307,7 @@ class Intake:
         Qwen named worker kup as owner and the card was approved)."""
         return [a for a in agents if not a.get("reportsTo")]
 
-    def _draft(self, card_id: str, source: str, answer: str | None = None, feedback: str | None = None) -> str:
+    def _draft(self, card_id: str, source: str, answer: str | None = None, feedback: str | None = None, title: str | None = None) -> str:
         agents = self._owners(self._agents())
         if not agents:
             self.store.set_card_status(card_id, "dropped")
@@ -235,16 +319,16 @@ class Intake:
         card, problems = None, ["no draft"]
         for attempt in range(2):
             try:
-                draft = self.reasoner.complete_json(CARD_SYSTEM, prompt if attempt == 0 else prompt + "\nFix these problems: " + "; ".join(problems), max_tokens=1024)
+                draft = self.reasoner.complete_json(CARD_SYSTEM, prompt if attempt == 0 else prompt + "\nFix these problems: " + "; ".join(problems), max_tokens=1024, schema=CARD_SCHEMA)
             except ReasoningUnavailable as e:
                 self.send(f"Card drafting is unavailable right now ({e}). Your idea is kept; say 'card {card_id}' to retry.", None)
                 return "unavailable"
             card = self._normalize(draft, agents)
-            if stated and answer is None:
+            if answer is None:
                 # "Use it as written" is enforced here, not trusted to the model:
-                # the card carries Matthew's stated block verbatim. An answer
-                # (an Edit) may change it, so the model's draft wins then.
-                card["doneWhen"] = stated
+                # the card carries every field the source states verbatim. An
+                # answer (an Edit) may change them, so the model's draft wins then.
+                self._carry_stated(card, source, stated, title)
             problems = validate_card(card)
             if not problems:
                 break
@@ -256,6 +340,24 @@ class Intake:
         self.store.put_card(card_id, card, digest, "awaiting_yes", source=source)
         self.send(self.render(card), [[{"text": "Yes", "callback_data": f"yes:{card_id}:{digest[:16]}"}, {"text": "Edit", "callback_data": f"edit:{card_id}"}, {"text": "Drop", "callback_data": f"drop:{card_id}"}]])
         return "card"
+
+    @staticmethod
+    def _carry_stated(card: dict[str, Any], source: str, stated_done: str | None, title: str | None) -> None:
+        fixed = stated_fields(source)
+        if stated_done:
+            card["doneWhen"] = stated_done
+        if fixed.get("title") or title:
+            card["title"] = _clip(fixed.get("title") or title or "", 80)
+        for key in ("objective", "scopeIn", "scopeOut"):
+            if key in fixed:
+                card[key] = fixed[key]
+        if "goals" in fixed:
+            # Stated goal statements win; the model's per-goal done-when is
+            # kept by position, and a goal it skipped falls back to the card's.
+            model = card["goals"]
+            card["goals"] = [{"goalId": f"g{i + 1}", "statement": s,
+                              "doneWhen": (model[i]["doneWhen"] if i < len(model) and model[i]["doneWhen"] else card["doneWhen"])}
+                             for i, s in enumerate(fixed["goals"][:7])]
 
     @staticmethod
     def _normalize(draft: dict[str, Any], agents: list[dict[str, Any]]) -> dict[str, Any]:
@@ -381,7 +483,7 @@ class Intake:
         limit = self.config.caps.max_decompose_tasks
         tasks: list[dict[str, Any]] = []
         try:
-            raw = self.reasoner.complete_json(DECOMPOSE_SYSTEM.format(max=limit), json.dumps({"card": card}), max_tokens=2048)
+            raw = self.reasoner.complete_json(DECOMPOSE_SYSTEM.format(max=limit), json.dumps({"card": card}), max_tokens=2048, schema=DECOMPOSE_SCHEMA)
             items = raw.get("tasks") if isinstance(raw, dict) else None
             for t in items if isinstance(items, list) else []:
                 if not isinstance(t, dict) or not isinstance(t.get("goalId"), str) or t["goalId"] not in goals:
