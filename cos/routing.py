@@ -226,6 +226,18 @@ class Router:
                 self.notify(f"Stalled: {task['title']} ({project['title']}). Attempt {live[0]['id']} is alive but has not checkpointed. Owner {task['owner']} should look; Metroplex will not replace a live worker.", None)
                 return self._ack(wake, key, f"wait: attempt {live[0]['id']} live but stalled; owner and Matthew notified", out)
             return self._ack(wake, key, "wait: live attempt on task", out)
+        if wake["reason"] == "rework":
+            # The owner wants to rework a reviewed result; a reserved action needs
+            # Matthew's fresh approval for that one attempt. Ask, never route: after
+            # the tap the task is still awaiting review, and `ttn rework` queues it.
+            reserved = spec.get("reservedAction")
+            if not reserved:
+                return self._ack(wake, key, "noop: rework needs no reserved approval", out)
+            if not awaiting_review(snap, task):
+                return self._ack(wake, key, "noop: nothing awaiting review to rework", out)
+            if self._reserved_approved(snap, task, reserved):
+                return self._ack(wake, key, "noop: rework approval already recorded", out)
+            return self._escalate(wake, key, task, project, "reserved", f"needs your approval for {reserved.replace('_', ' ')} before the rework starts", out, approve_reserved=reserved)
         if wake["reason"] == "result" or awaiting_review(snap, task):
             return self._ack(wake, key, f"await: owner {task['owner']} reviews the result", out)
         if wake["reason"] not in ROUTABLE_REASONS:
