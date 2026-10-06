@@ -17,7 +17,8 @@ import json
 import math
 import urllib.error
 import urllib.request
-from typing import Any, Callable
+from collections.abc import Callable
+from typing import Any
 
 ENDPOINT = "https://api.typesafe.ai/v1/systemone"
 TIMEOUT_S = 30

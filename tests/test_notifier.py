@@ -2,11 +2,12 @@
 Tests for Metroplex Notifier - Telegram + LogNotifier
 """
 import json
-import pytest
-from unittest.mock import patch, MagicMock
 import urllib.error
+from unittest.mock import MagicMock, patch
 
-from notifier import LogNotifier, TelegramNotifier, create_notifier, FilteredNotifier
+import pytest
+
+from notifier import FilteredNotifier, LogNotifier, TelegramNotifier, create_notifier
 
 
 class TestLogNotifier:

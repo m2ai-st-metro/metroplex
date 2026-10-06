@@ -13,7 +13,8 @@ from __future__ import annotations
 
 import logging
 import time
-from typing import Any, Callable
+from collections.abc import Callable
+from typing import Any
 
 from audit import AuditLogger
 from cos.bot import Bot, Inbound
@@ -111,7 +112,7 @@ class Daemon:
                 self.intake.handle_text(text, item.message_id)
             if command not in CONTROL:
                 self.breaker.record_success("intake")  # control commands never close it (R4)
-        except Exception as e:  # noqa: BLE001 - one bad message must not stop the bot
+        except Exception as e:  # one bad message must not stop the bot
             log.exception("inbound failed")
             # Never fail silently: say what broke and that a retry is safe
             # (every step is replay-safe, nothing is duplicated).
@@ -153,7 +154,7 @@ class Daemon:
                 try:
                     for out in route_pending(self.router, self.client):
                         self._log("turn", decision=out.decision, commands=out.commands)
-                except Exception as e:  # noqa: BLE001
+                except Exception as e:
                     log.exception("wake loop failed")
                     if self.breaker.record_failure("turn", now=now):
                         self.bot.send(f"Metroplex routing stopped after 3 failures ({e}). `metroplex reset turn` after fixing.")
@@ -165,7 +166,7 @@ class Daemon:
                     if found:
                         self._log("sweep", findings=[f"{f.check} {f.task_id}" for f in found])
                     self.breaker.record_success("motion")
-                except Exception as e:  # noqa: BLE001
+                except Exception as e:
                     log.exception("sweep failed")
                     if self.breaker.record_failure("motion", now=now):
                         self.bot.send(f"Metroplex motion checks stopped after 3 failures ({e}). `metroplex reset motion` after fixing.")
@@ -191,7 +192,7 @@ class Daemon:
                 self.store.set("bot_offset", offset)
                 for item in items:
                     self.handle(item)
-            except Exception:  # noqa: BLE001 - network blips must not kill the daemon
+            except Exception:  # network blips must not kill the daemon
                 log.exception("bot poll failed")
                 self.shutdown.wait(5)
             self.tick()

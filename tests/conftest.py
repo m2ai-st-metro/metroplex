@@ -15,8 +15,9 @@ import pytest
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from cos.store import LocalStore  # noqa: E402
-from cos.teletraan_client import TeletraanClient  # noqa: E402
+from cos.store import LocalStore
+from cos.teletraan_client import TeletraanClient
+
 
 def _teletraan_root() -> Path:
     """The first checkout that has the work service with the CoS deltas. Before

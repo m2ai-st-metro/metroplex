@@ -36,7 +36,7 @@ class TeletraanClient:
         self.timeout_s = timeout_s
 
     @classmethod
-    def from_token_file(cls, socket_path: Path, token_file: Path) -> "TeletraanClient":
+    def from_token_file(cls, socket_path: Path, token_file: Path) -> TeletraanClient:
         return cls(socket_path, Path(token_file).read_text().strip())
 
     def call(self, request: dict[str, Any]) -> Any:

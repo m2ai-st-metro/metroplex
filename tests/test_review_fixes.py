@@ -12,7 +12,14 @@ from cos.spec import validate_card
 from cos.teletraan_client import WorkError
 from tests.test_intake_daemon import ScriptedReasoner, button, daemon, text, yes_button
 from tests.test_motion import NOW, iso, snap, task
-from tests.test_routing import FakeJev, FakeReasoner, add_task, grant_project, jev_answer, router
+from tests.test_routing import (
+    FakeJev,
+    FakeReasoner,
+    add_task,
+    grant_project,
+    jev_answer,
+    router,
+)
 
 T = Thresholds()
 
@@ -78,7 +85,7 @@ def test_b3_hourly_resume_finishes_granting_cards(work, store):
 def test_b5_failed_escalation_notice_is_resent_by_the_sweep(work, store):
     grant_project(work)
     add_task(work, "t1")
-    r, notes = router(work, store, jev=FakeJev(jev_answer(choice="none_fit")))
+    r, _notes = router(work, store, jev=FakeJev(jev_answer(choice="none_fit")))
     r.notify = lambda text, buttons=None: None  # Telegram down: send fails
     route_pending(r, work["cos"])
     assert work.get("task", "t1")["status"] == "blocked"

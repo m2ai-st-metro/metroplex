@@ -13,10 +13,18 @@ import json
 import logging
 import re
 import time
-from typing import Any, Callable
+from collections.abc import Callable
+from typing import Any
 
 from cos.reasoning import Reasoner, ReasoningUnavailable
-from cos.spec import RESERVED_ACTIONS, SPEC_TEMPLATE_VERSION, card_digest, default_checks, validate_card, validate_task_spec
+from cos.spec import (
+    RESERVED_ACTIONS,
+    SPEC_TEMPLATE_VERSION,
+    card_digest,
+    default_checks,
+    validate_card,
+    validate_task_spec,
+)
 from cos.store import LocalStore
 from cos.teletraan_client import TeletraanClient, WorkError
 
@@ -59,7 +67,7 @@ _RESERVED_WORDS = {
 # optional bullet, bold markers and colon) followed by real text, on the same
 # line or the line after the colon, is Matthew stating the done-when himself. Line start only, so "I'll be done when..." mid-sentence
 # does not count; a bare "Done when?" does not count either.
-_DONE_WHEN = re.compile(r"^[ \t]*(?:[-*>][ \t]*)?\**done[ _-]?when\**(?:[ \t]*:\**\s*|[ \t]+)(?P<text>[^\s?].{2,})", re.I | re.M)
+_DONE_WHEN = re.compile(r"^[ \t]*(?:[-*>][ \t]*)?\**done[ _-]?when\**(?:[ \t]*:\**\s*|[ \t]+)(?P<text>[^\s?].{2,})", re.IGNORECASE | re.MULTILINE)
 
 
 def stated_done_when(text: str) -> str | None:
@@ -95,7 +103,7 @@ class Intake:
     def handle_text(self, text: str, message_id: str) -> str:
         # "card <id>" is a command only when <id> resolves to a known card or
         # proposal (any tool's id format); anything else is an idea (N9, R3).
-        command = re.match(r"^\s*card\s+(\S+)\s*$", text, re.I)
+        command = re.match(r"^\s*card\s+(\S+)\s*$", text, re.IGNORECASE)
         if command and self._resolves(command.group(1)):
             return self.card_command(command.group(1))
         open_card = self.store.get("open_question")
@@ -227,7 +235,7 @@ class Intake:
         if unknown:
             raise ValueError(f"card has fields the approval screen does not show: {sorted(unknown)}")
         goals = "\n".join(f"  {g['goalId']}. {g['statement']} (done: {g['doneWhen']})" for g in card["goals"])
-        lst = lambda items: "\n".join(f"  - {i}" for i in items) or "  - (none listed)"  # noqa: E731
+        lst = lambda items: "\n".join(f"  - {i}" for i in items) or "  - (none listed)"
         return (f"CARD: {card['title']}\n{card['objective']}\n\nDone when: {card['doneWhen']}\nOwner: {card['owner']}\nGoals:\n{goals}\n"
                 f"In scope:\n{lst(card.get('scopeIn', []))}\nOut of scope:\n{lst(card.get('scopeOut', []))}\n"
                 f"Reserved for you: {', '.join(a.replace('_', ' ') for a in card['reservedActions']) or 'none'}\nKill: {card['kill']}\n"
