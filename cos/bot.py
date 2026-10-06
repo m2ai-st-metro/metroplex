@@ -45,6 +45,9 @@ class Inbound:
     callback_id: str | None = None
 
 
+_PART = 4000
+
+
 class Bot:
     def __init__(self, transport: Transport, chat_id: str, approver_ids: tuple[str, ...]):
         self.call = transport
@@ -52,15 +55,27 @@ class Bot:
         self.approvers = {str(a) for a in approver_ids}
 
     def send(self, text: str, buttons: list[list[dict[str, str]]] | None = None) -> str | None:
-        payload: dict[str, Any] = {"chat_id": self.chat_id, "text": text[:4000], "disable_web_page_preview": True}
-        if buttons:
-            payload["reply_markup"] = {"inline_keyboard": buttons}
-        try:
-            result = self.call("sendMessage", payload)
-            return str(result.get("message_id")) if isinstance(result, dict) else None
-        except Exception as e:  # noqa: BLE001 - a failed notice must not stop the loop
-            log.warning("telegram send failed: %s", e)
-            return None
+        """Long text goes out in parts at line breaks, buttons on the last, so a
+        card is never cut: a Yes approves the whole hash, and Matthew must see
+        all of it (Telegram caps one message at 4096). Returns the last part's id."""
+        parts, rest = [], text
+        while len(rest) > _PART:
+            cut = rest.rfind("\n", 0, _PART + 1)
+            parts.append(rest[:cut] if cut > 0 else rest[:_PART])
+            rest = rest[cut + 1:] if cut > 0 else rest[_PART:]
+        parts.append(rest)
+        message_id = None
+        for i, part in enumerate(parts):
+            payload: dict[str, Any] = {"chat_id": self.chat_id, "text": part, "disable_web_page_preview": True}
+            if buttons and i == len(parts) - 1:
+                payload["reply_markup"] = {"inline_keyboard": buttons}
+            try:
+                result = self.call("sendMessage", payload)
+                message_id = str(result.get("message_id")) if isinstance(result, dict) else None
+            except Exception as e:  # noqa: BLE001 - a failed notice must not stop the loop
+                log.warning("telegram send failed: %s", e)
+                return None
+        return message_id
 
     def answer(self, callback_id: str, text: str) -> None:
         try:

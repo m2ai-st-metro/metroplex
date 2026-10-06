@@ -23,7 +23,7 @@ class BudgetRecorder(ScriptedReasoner):
         super().__init__(**kw)
         self.budgets = {}
 
-    def complete_json(self, system, user, max_tokens=None):
+    def complete_json(self, system, user, max_tokens=None, schema=None):
         self.budgets[system[:12]] = max_tokens
         return super().complete_json(system, user, max_tokens)
 
@@ -45,7 +45,7 @@ def test_e3_decomposition_prompt_asks_for_the_smallest_parallel_plan():
 
 
 class TaggedPlan(ScriptedReasoner):
-    def complete_json(self, system, user, max_tokens=None):
+    def complete_json(self, system, user, max_tokens=None, schema=None):
         if system.startswith(DECOMPOSE_SYSTEM[:12]):
             return {"tasks": [
                 {"goalId": "g1", "title": "Write code", "objective": "o", "acceptance": "a", "dependsOn": []},
@@ -86,7 +86,7 @@ def test_e2_keyword_backstop_covers_the_reviewers_misses():
 
 
 class InventedTag(ScriptedReasoner):
-    def complete_json(self, system, user, max_tokens=None):
+    def complete_json(self, system, user, max_tokens=None, schema=None):
         if system.startswith(DECOMPOSE_SYSTEM[:12]):
             return {"tasks": [{"goalId": "g1", "title": "Roll it forward", "objective": "o", "acceptance": "a", "dependsOn": [], "reservedAction": "deploy"},
                               {"goalId": "g2", "title": "Docs", "objective": "o", "acceptance": "a", "dependsOn": []}]}

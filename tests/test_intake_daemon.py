@@ -20,7 +20,7 @@ class ScriptedReasoner:
     def __init__(self, label="new_objective", question=None, decompose=True):
         self.label, self.question, self.decompose_ok, self.prompts = label, question, decompose, []
 
-    def complete_json(self, system, user, max_tokens=None):
+    def complete_json(self, system, user, max_tokens=None, schema=None):
         self.prompts.append(system[:20])
         if system.startswith("You triage"):
             return {"label": self.label, "question": self.question, "title": "Build the thing"}
@@ -91,7 +91,7 @@ def test_c1_idea_question_card_yes_creates_a_granted_decomposed_project(work, st
 class WorkerOwnerReasoner(ScriptedReasoner):
     """Reproduces 2026-09-26: the model names a worker as card owner."""
 
-    def complete_json(self, system, user, max_tokens=None):
+    def complete_json(self, system, user, max_tokens=None, schema=None):
         out = super().complete_json(system, user, max_tokens)
         if system.startswith("Draft a project card"):
             self.card_prompt = user
@@ -226,7 +226,7 @@ def test_stated_done_when_is_recognized_only_at_a_line_start_with_real_text():
 
 
 class RecordingReasoner(ScriptedReasoner):
-    def complete_json(self, system, user, max_tokens=None):
+    def complete_json(self, system, user, max_tokens=None, schema=None):
         if system.startswith("Draft a project card"):
             self.card_prompt = user
         return super().complete_json(system, user, max_tokens)
