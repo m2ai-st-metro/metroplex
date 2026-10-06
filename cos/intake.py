@@ -15,6 +15,7 @@ import re
 import textwrap
 import time
 from collections.abc import Callable
+from datetime import datetime, timezone
 from typing import Any
 
 from cos.reasoning import Reasoner, ReasoningUnavailable
@@ -23,6 +24,9 @@ from cos.spec import (
     SPEC_TEMPLATE_VERSION,
     card_digest,
     default_checks,
+    scope_path,
+    scope_within,
+    source_ref,
     validate_card,
     validate_task_spec,
 )
@@ -41,11 +45,14 @@ CLASSIFY_SYSTEM = ("You triage one message Matthew sent to his chief of staff. L
 CARD_SYSTEM = ("Draft a project card for Matthew's approval. Fields: title (<=80 chars), objective (one imperative paragraph), "
                "doneWhen (observable by an outsider without asking Matthew; when statedDoneWhen is given, use it as written), "
                "scopeIn (list), scopeOut (list), goals (1-7 of "
-               "{goalId: 'g1'.., statement, doneWhen}), owner (one id from the agents list), kill (condition that ends the project). "
-               "Keep it small. JSON object only.")
+               "{goalId: 'g1'.., statement, doneWhen}), owner (one id from the agents list), kill (condition that ends the project), "
+               "writableScope (paths relative to the repository root that this work may change, taken from the idea's writable-scope text; "
+               "[\".\"] when it names no narrower area). Keep it small. JSON object only.")
 DECOMPOSE_SYSTEM = ("Break an approved project into the smallest set of tasks that covers every goal: usually one to three per goal, "
                     "never more than {max} in total. Each task: {{goalId, title, objective, acceptance, dependsOn: [indexes of earlier tasks], "
-                    "reservedAction: null | publish_push_deploy | external_contact | live_fleet_config}}. Prefer tasks that can run in parallel; "
+                    "reservedAction: null | publish_push_deploy | external_contact | live_fleet_config, writableScope: [paths inside the card's "
+                    "writableScope this task may change, or [] for the whole card scope]}}. `source` is the approved proposal: name its specific "
+                    "requirements in objectives and acceptance. Prefer tasks that can run in parallel; "
                     "use dependsOn only when a task truly needs another task's output. Set reservedAction when the step publishes, pushes, "
                     "deploys, contacts anyone outside, or changes live systems. Every task must serve exactly one listed goal. "
                     "JSON: {{\"tasks\": [...]}}.")
@@ -58,15 +65,16 @@ CARD_SCHEMA = {
     "type": "object",
     "properties": {"title": _S, "objective": _S, "doneWhen": _S, "scopeIn": {"type": "array", "items": _S}, "scopeOut": {"type": "array", "items": _S},
                    "goals": {"type": "array", "items": {"type": "object", "properties": {"goalId": _S, "statement": _S, "doneWhen": _S}, "required": ["goalId", "statement", "doneWhen"]}},
-                   "owner": _S, "kill": _S},
-    "required": ["title", "objective", "doneWhen", "scopeIn", "scopeOut", "goals", "owner", "kill"],
+                   "owner": _S, "kill": _S, "writableScope": {"type": "array", "items": _S}},
+    "required": ["title", "objective", "doneWhen", "scopeIn", "scopeOut", "goals", "owner", "kill", "writableScope"],
 }
 DECOMPOSE_SCHEMA = {
     "type": "object",
     "properties": {"tasks": {"type": "array", "items": {"type": "object", "properties": {
         "goalId": _S, "title": _S, "objective": _S, "acceptance": _S, "dependsOn": {"type": "array", "items": {"type": "integer"}},
         "reservedAction": {"anyOf": [{"type": "null"}, {"enum": ["publish_push_deploy", "external_contact", "live_fleet_config"]}]},
-    }, "required": ["goalId", "title", "objective", "acceptance", "dependsOn", "reservedAction"]}}},
+        "writableScope": {"type": "array", "items": _S},
+    }, "required": ["goalId", "title", "objective", "acceptance", "dependsOn", "reservedAction", "writableScope"]}}},
     "required": ["tasks"],
 }
 
@@ -197,6 +205,19 @@ def stated_fields(text: str) -> dict[str, Any]:
     return found
 
 
+# An effective proposal (source plus Matthew's amendments, newest last) is marked
+# by this header. Its precedence line says the amendment wins, so no field is
+# carried verbatim from the text above it (Codex F9).
+AMENDMENT_HEADER = "## Amendment from Matthew ("
+_AMENDMENT = re.compile(r"^" + re.escape(AMENDMENT_HEADER), re.MULTILINE)
+AMENDMENT_PRECEDENCE = "Where an amendment conflicts with the text above, the amendment wins."
+SOURCE_PROMPT_CHARS = 20_000
+
+
+def is_amended(text: str) -> bool:
+    return bool(_AMENDMENT.search(text or ""))
+
+
 def infer_reserved(title: str, objective: str, acceptance: str = "") -> str | None:
     text = f"{title} {objective} {acceptance}".lower()
     for action, patterns in _RESERVED_PATTERNS.items():
@@ -241,7 +262,7 @@ class Intake:
             self.store.set("open_question", None)
             card = self.store.get_card(open_card)
             if card and card["status"] == "drafting":
-                return self._draft(card["card_id"], card["source"] or "", answer=text)
+                return self._draft(card["card_id"], answer=text, message_id=message_id)
         try:
             result = self.reasoner.complete_json(CLASSIFY_SYSTEM, text, max_tokens=256)
         except ReasoningUnavailable:
@@ -253,12 +274,16 @@ class Intake:
         if question and stated_done_when(text):
             log.info("dropping classifier question %r: the message states its done-when", question)
             question = None
-        self.store.put_card(card_id, {"title": result.get("title") or text[:80]}, "", "drafting", source=text, question=question)
+        # Every card binds a filed proposal (decision 2026-10-06), so the source a
+        # worker later reads is exactly what Matthew's yes covered.
+        proposal = self._file_proposal(f"Q-metroplex-{_short(message_id + text)}", result.get("title") or text[:80], text, f"telegram:{message_id}")
+        self.store.set(f"card_source:{card_id}", proposal["id"])
+        self.store.put_card(card_id, {"title": result.get("title") or text[:80]}, "", "drafting", source=proposal["body"], question=question)
         if question:
             self.store.set("open_question", card_id)
             self.send(f"One question before I draft the card:\n{question}", None)
             return "asked"
-        return self._draft(card_id, text)
+        return self._draft(card_id)
 
     def _resolves(self, ref: str) -> bool:
         if self.store.get_card(ref):
@@ -272,7 +297,7 @@ class Intake:
         if stored is None and not ref.startswith("card-"):
             stored = self.store.get_card(f"card-{_short(ref)}")  # the card made from this proposal
         if stored and stored["status"] == "drafting":
-            return self._draft(stored["card_id"], stored["source"] or stored["card"].get("title", ""))
+            return self._draft(stored["card_id"])
         if stored:
             # Never rewrite a card that is waiting, granting, or granted (review N4).
             self.send(f"{ref} is already {stored['status']}; nothing to redraft.", None)
@@ -282,18 +307,59 @@ class Intake:
             self.send(f"No card or proposal named {ref}.", None)
             return "unknown"
         card_id = f"card-{_short(ref)}"
+        self.store.set(f"card_source:{card_id}", ref)
         self.store.put_card(card_id, {"title": proposal["title"]}, "", "drafting", source=proposal["body"])
-        return self._draft(card_id, proposal["body"], title=proposal["title"])
+        return self._draft(card_id, title=proposal["title"])
 
     def _file_note(self, text: str, message_id: str, why: str) -> str:
         pid = f"Q-metroplex-{_short(message_id + text)}"
-        try:
-            self.client.command("proposal.file", pid, 0, {"title": text[:80], "body": text, "source": {"type": "metroplex-bot", "ref": f"telegram:{message_id}"}}, command_id=f"cos:proposal:{pid}")
-        except WorkError as e:
-            if e.code != "ALREADY_EXISTS":
-                raise
+        self._file_proposal(pid, text[:80], text, f"telegram:{message_id}")
         self.send(f"Noted ({why}): {pid}. Say 'card {pid}' when you want it turned into a project.", None)
         return "note"
+
+    # ------------------------------------------------------------------ card sources (A)
+    def _proposal(self, pid: str) -> dict[str, Any] | None:
+        return next((p for p in self.client.snapshot().get("proposal", []) if p["id"] == pid), None)
+
+    def _file_proposal(self, pid: str, title: str, body: str, ref: str) -> dict[str, Any]:
+        """File a proposal (or find it already filed) and return the STORED one.
+        Its body, not the text sent, is what a card's source hash binds:
+        Teletraan trims bodies, and a retry may rebuild a body with a new
+        timestamp under the same id; the first filing wins (Codex F7)."""
+        try:
+            self.client.command("proposal.file", pid, 0, {"title": title, "body": body, "source": {"type": "metroplex-bot", "ref": ref}}, command_id=f"cos:proposal:{pid}")
+        except WorkError as e:
+            if e.code not in ("ALREADY_EXISTS", "COMMAND_ID_CONFLICT"):
+                raise
+        stored = self._proposal(pid)
+        if stored is None:
+            raise WorkError("SOURCE_PROPOSAL_MISSING")
+        return stored
+
+    def _source(self, card_id: str) -> tuple[str, str]:
+        """(proposal id, stored body) a card drafts from. A card left from before
+        source binding is filed first, so every card binds a proposal."""
+        pid = self.store.get(f"card_source:{card_id}")
+        proposal = self._proposal(pid) if pid else None
+        if proposal is None:
+            stored = self.store.get_card(card_id) or {"source": "", "card": {}}
+            text = stored["source"] or stored["card"].get("title", "") or card_id
+            proposal = self._file_proposal(f"Q-metroplex-{_short(card_id + text)}", text[:80], text, f"card:{card_id}")
+            self.store.set(f"card_source:{card_id}", proposal["id"])
+        return proposal["id"], proposal["body"]
+
+    def _amend(self, card_id: str, answer: str, message_id: str) -> tuple[str, str]:
+        """An answer or Edit that shapes the card becomes source too: a new
+        immutable proposal holding the current source, the amendment verbatim,
+        and its precedence rule. The yes then binds one document a worker can
+        read without guessing which text wins (Codex F3)."""
+        base_id, body = self._source(card_id)
+        base = self._proposal(base_id) or {"title": card_id}
+        when = datetime.fromtimestamp(self.clock(), timezone.utc).isoformat(timespec="seconds")
+        amended = f"{body}\n\n{AMENDMENT_HEADER}{when}, telegram:{message_id})\n{answer}\n\n{AMENDMENT_PRECEDENCE}"
+        proposal = self._file_proposal(f"Q-metroplex-{_short(base_id + answer)}", base["title"], amended, f"telegram:{message_id}")
+        self.store.set(f"card_source:{card_id}", proposal["id"])
+        return proposal["id"], proposal["body"]
 
     # ------------------------------------------------------------------ I3/S1
     def _agents(self) -> list[dict[str, Any]]:
@@ -307,15 +373,17 @@ class Intake:
         Qwen named worker kup as owner and the card was approved)."""
         return [a for a in agents if not a.get("reportsTo")]
 
-    def _draft(self, card_id: str, source: str, answer: str | None = None, feedback: str | None = None, title: str | None = None) -> str:
+    def _draft(self, card_id: str, answer: str | None = None, message_id: str = "", title: str | None = None) -> str:
         agents = self._owners(self._agents())
         if not agents:
             self.store.set_card_status(card_id, "dropped")
             self.send("I cannot draft a card: no persistent agent that reports to no one exists in Teletraan to own it.", None)
             return "no_agents"
+        source_id, source = self._amend(card_id, answer, message_id) if answer is not None else self._source(card_id)
         self.send("Drafting a card for this on the local model; it usually takes a minute or two.", None)
-        stated = stated_done_when(source)
-        prompt = json.dumps({"idea": source, "statedDoneWhen": stated, "answer": answer, "feedback": feedback, "agents": agents, "reservedActionsDefault": list(RESERVED_ACTIONS)})
+        amended = is_amended(source)
+        stated = None if amended else stated_done_when(source)
+        prompt = json.dumps({"idea": source, "statedDoneWhen": stated, "answer": answer, "agents": agents, "reservedActionsDefault": list(RESERVED_ACTIONS)})
         card, problems = None, ["no draft"]
         for attempt in range(2):
             try:
@@ -324,11 +392,13 @@ class Intake:
                 self.send(f"Card drafting is unavailable right now ({e}). Your idea is kept; say 'card {card_id}' to retry.", None)
                 return "unavailable"
             card = self._normalize(draft, agents)
-            if answer is None:
+            if not amended:
                 # "Use it as written" is enforced here, not trusted to the model:
                 # the card carries every field the source states verbatim. An
-                # answer (an Edit) may change them, so the model's draft wins then.
+                # amended source (an answer or Edit, on any drafting path) says
+                # the amendment wins, so the model's draft wins then.
                 self._carry_stated(card, source, stated, title)
+            card["source"] = source_ref(source_id, source)
             problems = validate_card(card)
             if not problems:
                 break
@@ -365,6 +435,13 @@ class Intake:
         for reserved actions and hosted processing (MVP scope defaults)."""
         goals = [{"goalId": str(g.get("goalId") or f"g{i + 1}"), "statement": str(g.get("statement", "")).strip(), "doneWhen": str(g.get("doneWhen", "")).strip()} for i, g in enumerate(draft.get("goals") or []) if isinstance(g, dict)]
         owner = draft.get("owner") if draft.get("owner") in {a["id"] for a in agents} else agents[0]["id"]
+        # Writable paths are cleaned like Teletraan's and never left empty: the
+        # card always shows Matthew an explicit list, "." meaning everything.
+        scope: list[str] = []
+        for value in draft.get("writableScope") or []:
+            path = scope_path(value)
+            if path and path not in scope:
+                scope.append(path)
         return {
             "title": _clip(str(draft.get("title", "")), 80),
             "objective": str(draft.get("objective", "")).strip(),
@@ -378,9 +455,10 @@ class Intake:
             "hostedAllowed": True,
             "humanOnly": False,
             "specTemplate": SPEC_TEMPLATE_VERSION,
+            "writableScope": ["."] if not scope or "." in scope else scope,
         }
 
-    RENDERED_KEYS = frozenset({"title", "objective", "doneWhen", "owner", "goals", "scopeIn", "scopeOut", "reservedActions", "kill", "hostedAllowed", "humanOnly", "specTemplate"})
+    RENDERED_KEYS = frozenset({"title", "objective", "doneWhen", "owner", "goals", "scopeIn", "scopeOut", "reservedActions", "kill", "hostedAllowed", "humanOnly", "specTemplate", "source", "writableScope"})
 
     @classmethod
     def render(cls, card: dict[str, Any]) -> str:
@@ -393,7 +471,9 @@ class Intake:
         lst = lambda items: "\n".join(f"  - {i}" for i in items) or "  - (none listed)"
         return (f"CARD: {card['title']}\n{card['objective']}\n\nDone when: {card['doneWhen']}\nOwner: {card['owner']}\nGoals:\n{goals}\n"
                 f"In scope:\n{lst(card.get('scopeIn', []))}\nOut of scope:\n{lst(card.get('scopeOut', []))}\n"
-                f"Reserved for you: {', '.join(a.replace('_', ' ') for a in card['reservedActions']) or 'none'}\nKill: {card['kill']}\n"
+                + (f"Writable paths: {', '.join(card['writableScope'])}{' (whole repository)' if card['writableScope'] == ['.'] else ''}\n" if "writableScope" in card else "")
+                + (f"Source: {card['source']['id']} (sha256 {card['source']['sha256'][:12]}); its full text binds the work.\n" if "source" in card else "")
+                + f"Reserved for you: {', '.join(a.replace('_', ' ') for a in card['reservedActions']) or 'none'}\nKill: {card['kill']}\n"
                 f"Hosted routing via Jev (TypeSafe): {'yes' if card.get('hostedAllowed') else 'no'}\n"
                 f"Human-only (never routed): {'yes' if card.get('humanOnly') else 'no'}\nSpec template: {card.get('specTemplate')}\n\n"
                 f"Yes grants this project. Nothing runs before you tap it.")
@@ -482,8 +562,10 @@ class Intake:
         goals = {g["goalId"]: g for g in card["goals"]}
         limit = self.config.caps.max_decompose_tasks
         tasks: list[dict[str, Any]] = []
+        source = self._proposal(card["source"]["id"]) if card.get("source") else None
+        user = {"card": card, **({"source": source["body"][:SOURCE_PROMPT_CHARS]} if source else {})}
         try:
-            raw = self.reasoner.complete_json(DECOMPOSE_SYSTEM.format(max=limit), json.dumps({"card": card}), max_tokens=2048, schema=DECOMPOSE_SCHEMA)
+            raw = self.reasoner.complete_json(DECOMPOSE_SYSTEM.format(max=limit), json.dumps(user), max_tokens=2048, schema=DECOMPOSE_SCHEMA)
             items = raw.get("tasks") if isinstance(raw, dict) else None
             for t in items if isinstance(items, list) else []:
                 if not isinstance(t, dict) or not isinstance(t.get("goalId"), str) or t["goalId"] not in goals:
@@ -502,7 +584,8 @@ class Intake:
                 else:
                     tagged = infer_reserved(title, objective, acceptance)
                 tasks.append({"goalId": goal["goalId"], "title": title, "objective": objective, "acceptance": acceptance,
-                              "dependsOn": [j for j in deps if isinstance(j, int) and not isinstance(j, bool) and 0 <= j < len(tasks)], "reservedAction": tagged})
+                              "dependsOn": [j for j in deps if isinstance(j, int) and not isinstance(j, bool) and 0 <= j < len(tasks)], "reservedAction": tagged,
+                              "writableScope": self._task_scope(t.get("writableScope"), card)})
                 if len(tasks) >= limit:
                     break
         except ReasoningUnavailable:
@@ -510,8 +593,24 @@ class Intake:
         covered = {t["goalId"] for t in tasks}
         for g in card["goals"]:
             if g["goalId"] not in covered:
-                tasks.append({"goalId": g["goalId"], "title": _clip(g["statement"], 120), "objective": g["statement"], "acceptance": g["doneWhen"], "dependsOn": [], "reservedAction": infer_reserved(g["statement"], "", g["doneWhen"])})
+                tasks.append({"goalId": g["goalId"], "title": _clip(g["statement"], 120), "objective": g["statement"], "acceptance": g["doneWhen"], "dependsOn": [], "reservedAction": infer_reserved(g["statement"], "", g["doneWhen"]),
+                              "writableScope": card.get("writableScope")})
         return tasks
+
+    @staticmethod
+    def _task_scope(raw: Any, card: dict[str, Any]) -> list[str] | None:
+        """A task's writable paths: the model's subset when every path sits inside
+        the card's, else the card-wide scope (Matthew's decision 2026-10-06: a
+        task is never unbounded). None only for legacy cards without a scope."""
+        card_scope = card.get("writableScope")
+        if not card_scope:
+            return None
+        paths: list[str] = []
+        for value in raw if isinstance(raw, list) else []:
+            path = scope_path(value)
+            if path and path not in paths:
+                paths.append(path)
+        return paths if paths and scope_within(paths, card_scope) else list(card_scope)
 
     def decompose(self, project_id: str, card: dict[str, Any]) -> int:
         """Create the planned tasks. The plan is stored before any task exists, so
@@ -526,7 +625,10 @@ class Intake:
         for task_id, t in zip(ids, tasks):
             if task_id not in existing:
                 checkpoints, quality = default_checks(goals[t["goalId"]])
-                spec = validate_task_spec({"cardGoalId": t["goalId"], "doneWhen": t["acceptance"], "checkpoints": checkpoints, "qualityChecks": quality, "reservedAction": t["reservedAction"] if "reservedAction" in t else infer_reserved(t["title"], t["objective"], t["acceptance"]), "humanOnly": False, "synthetic": False})
+                # Always explicit: a plan stored before scopes existed falls back to the card's.
+                scope = t.get("writableScope") or card.get("writableScope")
+                spec = validate_task_spec({"cardGoalId": t["goalId"], "doneWhen": t["acceptance"], "checkpoints": checkpoints, "qualityChecks": quality, "reservedAction": t["reservedAction"] if "reservedAction" in t else infer_reserved(t["title"], t["objective"], t["acceptance"]), "humanOnly": False, "synthetic": False,
+                                           **({"writableScope": scope} if scope else {})})
                 receipt = self.client.command("task.create", task_id, 0, {"projectId": project_id, "owner": card["owner"], "title": t["title"], "objective": t["objective"], "acceptance": spec["doneWhen"], "spec": spec}, command_id=f"cos:decompose:{task_id}")
                 existing[task_id] = next(o for o in receipt["objects"] if o.get("kind") == "task" and o["id"] == task_id)
             # Dependencies right after each task, not in a second pass: dependsOn

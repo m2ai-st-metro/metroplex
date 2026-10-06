@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import posixpath
+import re
 from typing import Any
 
 RESERVED_ACTIONS = ("publish_push_deploy", "external_contact", "live_fleet_config")
@@ -16,6 +18,35 @@ QUALITY_VERIFICATION = ("receipt", "test", "review")
 
 class SpecError(ValueError):
     pass
+
+
+_SHA256_HEX = re.compile(r"^[0-9a-f]{64}$")
+
+
+def scope_path(value: Any) -> str | None:
+    """A writable path relative to the clone root, normalized like Teletraan
+    (posix normalize, no trailing slash), or None when it is absolute, escapes
+    the repository, or is not text. "." is the whole repository."""
+    if not isinstance(value, str) or not value.strip():
+        return None
+    path = posixpath.normpath(value.strip()).rstrip("/")
+    if not path or path == ".." or path.startswith(("/", "../")):
+        return None
+    return path
+
+
+def within(path: str, base: str) -> bool:
+    return base == "." or path == base or path.startswith(base + "/")
+
+
+def scope_within(inner: list[str], outer: list[str]) -> bool:
+    return all(any(within(a, b) for b in outer) for a in inner)
+
+
+def source_ref(proposal_id: str, body: str) -> dict[str, str]:
+    """The card's binding to the proposal Matthew approves: Teletraan rehashes
+    the stored body (UTF-8) at project.create and refuses a mismatch."""
+    return {"kind": "proposal", "id": proposal_id, "sha256": hashlib.sha256(body.encode("utf-8")).hexdigest()}
 
 
 def _canonical(value: Any) -> Any:
@@ -75,6 +106,15 @@ def validate_card(card: dict[str, Any]) -> list[str]:
     for key in ("hostedAllowed", "humanOnly"):
         if key in card and not isinstance(card[key], bool):
             problems.append(f"{key} must be true or false")
+    if "source" in card:
+        s = card["source"]
+        if not (isinstance(s, dict) and set(s) == {"kind", "id", "sha256"} and s["kind"] == "proposal" and isinstance(s["id"], str) and s["id"].strip()
+                and isinstance(s["sha256"], str) and _SHA256_HEX.match(s["sha256"])):
+            problems.append("source must be {kind: proposal, id, sha256}")
+    if "writableScope" in card:
+        scope = card["writableScope"]
+        if not isinstance(scope, list) or not scope or any(scope_path(v) != v for v in scope) or len(set(scope)) != len(scope):
+            problems.append("writableScope must list unique, normalized paths relative to the repository")
     if not _hash_safe(card):
         problems.append("card must contain only text, true/false, whole numbers and lists (hash parity with Teletraan)")
     return problems
@@ -126,6 +166,10 @@ def validate_task_spec(spec: dict[str, Any]) -> dict[str, Any]:
         raise SpecError("INVALID_TASK_SPEC") from e
     for key in ("humanOnly", "synthetic"):
         if key in spec and not isinstance(spec[key], bool):
+            raise SpecError("INVALID_TASK_SPEC")
+    if "writableScope" in spec:
+        scope = spec["writableScope"]
+        if not isinstance(scope, list) or not scope or any(scope_path(v) != v for v in scope):
             raise SpecError("INVALID_TASK_SPEC")
     return spec
 
